@@ -35,6 +35,16 @@ def _doc(source_id: str, space: str, text: str) -> SourceDocument:
     )
 
 
+def _replace(store: PgVectorStore, embedder: HashedEmbedder, doc: SourceDocument) -> int:
+    chunks = chunk_document(doc)
+    return store.replace_source(
+        space_key=doc.space_key,
+        source_id=doc.source_id,
+        chunks=chunks,
+        embeddings=embedder.embed([c.embedding_text for c in chunks]),
+    )
+
+
 def test_upsert_search_and_space_isolation() -> None:
     store = PgVectorStore(DSN)
     store.ensure_schema()
@@ -46,9 +56,7 @@ def test_upsert_search_and_space_isolation() -> None:
         _doc("t-other", "SPACE_B", "rollback procedure in another space"),
     ]
     for doc in docs:
-        chunks = chunk_document(doc)
-        store.delete_source(doc.source_id)
-        store.upsert_chunks(chunks, embedder.embed([c.embedding_text for c in chunks]))
+        _replace(store, embedder, doc)
 
     query = embedder.embed(["how do I rollback a release"])[0]
 
@@ -59,9 +67,41 @@ def test_upsert_search_and_space_isolation() -> None:
     hits_all = store.search(query, top_k=3)
     assert {h.space_key for h in hits_all} == {"SPACE_A", "SPACE_B"}
 
-    # idempotent re-upsert keeps row count stable
-    doc = docs[0]
-    chunks = chunk_document(doc)
-    store.upsert_chunks(chunks, embedder.embed([c.embedding_text for c in chunks]))
+    # atomic replace is idempotent — row count stays stable
+    count = _replace(store, embedder, docs[0])
     hits_again = store.search(query, space_key="SPACE_A", top_k=5)
-    assert len([h for h in hits_again if h.source_id == "t-rollback"]) == len(chunks)
+    assert len([h for h in hits_again if h.source_id == "t-rollback"]) == count
+
+
+def test_same_source_id_in_two_spaces_do_not_clobber() -> None:
+    """Post-review P1: mutations honor space isolation (composite PK)."""
+    store = PgVectorStore(DSN)
+    store.ensure_schema()
+    embedder = HashedEmbedder()
+
+    doc_a = _doc("t-shared", "ISO_A", "alpha content about deployment")
+    doc_b = _doc("t-shared", "ISO_B", "beta content about pricing")
+    _replace(store, embedder, doc_a)
+    _replace(store, embedder, doc_b)
+
+    q = embedder.embed(["deployment"])[0]
+    hits_a = store.search(q, space_key="ISO_A", top_k=5)
+    hits_b = store.search(q, space_key="ISO_B", top_k=5)
+    assert {h.source_id for h in hits_a} == {"t-shared"}
+    assert {h.source_id for h in hits_b} == {"t-shared"}
+    assert hits_a[0].content != hits_b[0].content
+
+    # scoped delete removes only one space's copy
+    deleted = store.delete_source(space_key="ISO_A", source_id="t-shared")
+    assert deleted > 0
+    assert store.search(q, space_key="ISO_A", top_k=5) == []
+    assert store.search(q, space_key="ISO_B", top_k=5) != []
+
+
+def test_search_validates_inputs() -> None:
+    store = PgVectorStore(DSN)
+    store.ensure_schema()
+    with pytest.raises(ValueError, match="dimension"):
+        store.search([0.0] * 3, top_k=1)
+    with pytest.raises(ValueError, match="top_k"):
+        store.search([0.0] * 768, top_k=0)

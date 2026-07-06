@@ -65,20 +65,46 @@ def chunk_document(doc: SourceDocument, *, max_chars: int = _DEFAULT_MAX_CHARS) 
 
 
 def _split_sections(body: str) -> list[tuple[str | None, list[str]]]:
+    """Split on Markdown headings, ignoring heading-like lines inside fenced code.
+
+    The section label is the full heading path ("API > Retry"), so citations stay
+    verifiable when the same sub-heading appears under different parents (review P2).
+    """
     sections: list[tuple[str | None, list[str]]] = []
+    heading_stack: list[tuple[int, str]] = []
     current_heading: str | None = None
     current_lines: list[str] = []
+    in_fence = False
     for line in body.splitlines():
-        match = _HEADING_RE.match(line)
+        if line.lstrip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+        match = None if in_fence else _HEADING_RE.match(line)
         if match:
             if current_lines or current_heading is not None:
                 sections.append((current_heading, current_lines))
-            current_heading = match.group(2).strip()
+            level = len(match.group(1))
+            title = match.group(2).strip()
+            while heading_stack and heading_stack[-1][0] >= level:
+                heading_stack.pop()
+            heading_stack.append((level, title))
+            current_heading = " > ".join(t for _, t in heading_stack)
             current_lines = [line]
         else:
             current_lines.append(line)
     sections.append((current_heading, current_lines))
-    return [(h, lines) for h, lines in sections if any(ln.strip() for ln in lines)]
+    return [
+        (h, lines)
+        for h, lines in sections
+        if _has_body_beyond_heading(lines)
+    ]
+
+
+def _has_body_beyond_heading(lines: list[str]) -> bool:
+    """Drop heading-only sections — they cite nothing and add retrieval noise."""
+    non_empty = [ln for ln in lines if ln.strip()]
+    if not non_empty:
+        return False
+    return not (len(non_empty) == 1 and _HEADING_RE.match(non_empty[0]))
 
 
 def _split_oversized(lines: list[str], *, max_chars: int) -> list[list[str]]:

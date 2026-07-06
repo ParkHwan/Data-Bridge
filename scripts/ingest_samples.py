@@ -41,8 +41,12 @@ def main() -> int:
         doc = load_markdown_file(path)
         chunks = chunk_document(doc)
         embeddings = embedder.embed([c.embedding_text for c in chunks])
-        store.delete_source(doc.source_id)
-        total_chunks += store.upsert_chunks(chunks, embeddings)
+        total_chunks += store.replace_source(
+            space_key=doc.space_key,
+            source_id=doc.source_id,
+            chunks=chunks,
+            embeddings=embeddings,
+        )
         print(f"ingested {doc.source_id}: {len(chunks)} chunks")
     print(f"done: {total_chunks} chunks total")
     return 0

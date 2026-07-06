@@ -46,7 +46,49 @@ class PgVectorStore:
         with self._connect(register=False) as conn:
             conn.execute(schema)
 
+    def replace_source(
+        self,
+        *,
+        space_key: str,
+        source_id: str,
+        chunks: list[Chunk],
+        embeddings: list[list[float]],
+    ) -> int:
+        """Atomically replace all chunks of one source within one space.
+
+        Delete + insert run in a single transaction (post-review P1: separate
+        delete/upsert calls could leave a source empty on mid-ingest failure).
+        """
+        self._validate_batch(chunks, embeddings)
+        for chunk in chunks:
+            if chunk.space_key != space_key or chunk.source_id != source_id:
+                msg = f"chunk {chunk.chunk_id} does not belong to {space_key}/{source_id}"
+                raise ValueError(msg)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM chunks WHERE space_key = %s AND source_id = %s",
+                (space_key, source_id),
+            )
+            self._insert_rows(cur, chunks, embeddings)
+        return len(chunks)
+
     def upsert_chunks(self, chunks: list[Chunk], embeddings: list[list[float]]) -> int:
+        self._validate_batch(chunks, embeddings)
+        with self._connect() as conn, conn.cursor() as cur:
+            self._insert_rows(cur, chunks, embeddings)
+        return len(chunks)
+
+    def delete_source(self, *, space_key: str, source_id: str) -> int:
+        """Space-scoped delete — mutations honor space isolation (post-review P1)."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM chunks WHERE space_key = %s AND source_id = %s",
+                (space_key, source_id),
+            )
+            return cur.rowcount or 0
+
+    @staticmethod
+    def _validate_batch(chunks: list[Chunk], embeddings: list[list[float]]) -> None:
         if len(chunks) != len(embeddings):
             msg = f"chunks/embeddings length mismatch: {len(chunks)} != {len(embeddings)}"
             raise ValueError(msg)
@@ -54,41 +96,40 @@ class PgVectorStore:
             if len(emb) != EMBEDDING_DIM:
                 msg = f"embedding dimension {len(emb)} != {EMBEDDING_DIM}"
                 raise ValueError(msg)
-        with self._connect() as conn, conn.cursor() as cur:
-            for chunk, emb in zip(chunks, embeddings, strict=True):
-                cur.execute(
-                    """
-                    INSERT INTO chunks
-                        (chunk_id, source_id, space_key, title, heading, breadcrumb,
-                         content, embedding, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
-                    ON CONFLICT (chunk_id) DO UPDATE SET
-                        source_id = EXCLUDED.source_id,
-                        space_key = EXCLUDED.space_key,
-                        title = EXCLUDED.title,
-                        heading = EXCLUDED.heading,
-                        breadcrumb = EXCLUDED.breadcrumb,
-                        content = EXCLUDED.content,
-                        embedding = EXCLUDED.embedding,
-                        updated_at = now()
-                    """,
-                    (
-                        chunk.chunk_id,
-                        chunk.source_id,
-                        chunk.space_key,
-                        chunk.title,
-                        chunk.heading,
-                        chunk.breadcrumb,
-                        chunk.content,
-                        emb,
-                    ),
-                )
-        return len(chunks)
 
-    def delete_source(self, source_id: str) -> int:
-        with self._connect() as conn, conn.cursor() as cur:
-            cur.execute("DELETE FROM chunks WHERE source_id = %s", (source_id,))
-            return cur.rowcount or 0
+    @staticmethod
+    def _insert_rows(
+        cur: psycopg.Cursor,
+        chunks: list[Chunk],
+        embeddings: list[list[float]],
+    ) -> None:
+        for chunk, emb in zip(chunks, embeddings, strict=True):
+            cur.execute(
+                """
+                INSERT INTO chunks
+                    (space_key, chunk_id, source_id, title, heading, breadcrumb,
+                     content, embedding, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (space_key, chunk_id) DO UPDATE SET
+                    source_id = EXCLUDED.source_id,
+                    title = EXCLUDED.title,
+                    heading = EXCLUDED.heading,
+                    breadcrumb = EXCLUDED.breadcrumb,
+                    content = EXCLUDED.content,
+                    embedding = EXCLUDED.embedding,
+                    updated_at = now()
+                """,
+                (
+                    chunk.space_key,
+                    chunk.chunk_id,
+                    chunk.source_id,
+                    chunk.title,
+                    chunk.heading,
+                    chunk.breadcrumb,
+                    chunk.content,
+                    emb,
+                ),
+            )
 
     def search(
         self,
@@ -98,6 +139,12 @@ class PgVectorStore:
         top_k: int = 5,
     ) -> list[SearchHit]:
         """Cosine-distance search, optionally isolated to one space."""
+        if len(query_embedding) != EMBEDDING_DIM:
+            msg = f"query embedding dimension {len(query_embedding)} != {EMBEDDING_DIM}"
+            raise ValueError(msg)
+        if top_k < 1:
+            msg = f"top_k must be >= 1, got {top_k}"
+            raise ValueError(msg)
         where = "WHERE space_key = %(space)s" if space_key else ""
         sql = f"""
             SELECT chunk_id, source_id, space_key, title, heading, breadcrumb, content,

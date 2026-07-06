@@ -54,3 +54,25 @@ def test_oversized_section_splits_with_unique_ids() -> None:
     assert len(chunks) > 1
     assert len({c.chunk_id for c in chunks}) == len(chunks)
     assert all(c.heading == "Big" for c in chunks)
+
+
+def test_nested_headings_keep_parent_path() -> None:
+    body = "## API\nintro\n### Retry\napi retry\n## Worker\nintro\n### Retry\nworker retry"
+    doc = SourceDocument(source_id="d3", title="Doc", space_key="DEMO", body=body)
+    headings = [c.heading for c in chunk_document(doc)]
+    assert "API > Retry" in headings
+    assert "Worker > Retry" in headings
+
+
+def test_heading_inside_code_fence_is_not_a_section() -> None:
+    body = "## Real\ntext\n```\n## not a heading\n```\nmore text"
+    doc = SourceDocument(source_id="d4", title="Doc", space_key="DEMO", body=body)
+    chunks = chunk_document(doc)
+    assert [c.heading for c in chunks] == ["Real"]
+    assert "## not a heading" in chunks[0].content
+
+
+def test_heading_only_section_is_dropped() -> None:
+    body = "## Empty Section\n\n## Full\ncontent here"
+    doc = SourceDocument(source_id="d5", title="Doc", space_key="DEMO", body=body)
+    assert [c.heading for c in chunk_document(doc)] == ["Full"]

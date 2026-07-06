@@ -3,17 +3,19 @@
 CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS chunks (
-    chunk_id   TEXT PRIMARY KEY,          -- "<source_id>#<seq>"
-    source_id  TEXT NOT NULL,
     space_key  TEXT NOT NULL,
+    chunk_id   TEXT NOT NULL,             -- "<source_id>#<seq>"
+    source_id  TEXT NOT NULL,
     title      TEXT NOT NULL,
     heading    TEXT,
     breadcrumb TEXT,
     content    TEXT NOT NULL,
     embedding  vector(768) NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Composite PK: the same source_id may legitimately exist in different spaces —
+    -- space isolation applies to mutations, not only to search (post-review P1).
+    PRIMARY KEY (space_key, chunk_id)
 );
 
-CREATE INDEX IF NOT EXISTS chunks_space_key_idx ON chunks (space_key);
-CREATE INDEX IF NOT EXISTS chunks_source_id_idx ON chunks (source_id);
+CREATE INDEX IF NOT EXISTS chunks_space_source_idx ON chunks (space_key, source_id);
 -- Vector index deferred: MVP corpus is small; add HNSW when corpus grows.
