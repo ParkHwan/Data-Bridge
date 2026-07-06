@@ -11,6 +11,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+server = [
+    "fastapi>=0.111",
+    "uvicorn>=0.30",
+]
 gcp = [
     "google-genai>=1.0",
     "google-adk>=1.0",

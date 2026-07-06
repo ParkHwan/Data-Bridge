@@ -344,9 +344,14 @@ gcp = [
     { name = "google-cloud-bigquery" },
     { name = "google-genai" },
 ]
+server = [
+    { name = "fastapi" },
+    { name = "uvicorn" },
+]
 
 [package.metadata]
 requires-dist = [
+    { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.111" },
     { name = "google-adk", marker = "extra == 'gcp'", specifier = ">=1.0" },
     { name = "google-cloud-bigquery", marker = "extra == 'gcp'", specifier = ">=3.20" },
     { name = "google-genai", marker = "extra == 'gcp'", specifier = ">=1.0" },
@@ -358,8 +363,9 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
+    { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.30" },
 ]
-provides-extras = ["gcp", "dev"]
+provides-extras = ["server", "gcp", "dev"]
 
 [[package]]
 name = "distro"

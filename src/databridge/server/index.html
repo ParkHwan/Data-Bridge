@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data Bridge — AI Team</title>
+<style>
+  :root {
+    --bg: #0f1117; --panel: #171a23; --line: #262b38; --text: #e7eaf0;
+    --muted: #8b93a7; --accent: #6ea8fe; --ok: #4ade80; --chip: #232837;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--text);
+         font: 15px/1.55 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 28px 20px 60px; }
+  header h1 { font-size: 22px; letter-spacing: .2px; }
+  header p { color: var(--muted); margin-top: 4px; font-size: 13.5px; }
+  form { display: flex; gap: 10px; margin: 22px 0 18px; }
+  input { flex: 1; background: var(--panel); border: 1px solid var(--line);
+          border-radius: 10px; padding: 12px 14px; color: var(--text); font-size: 15px; }
+  input:focus { outline: none; border-color: var(--accent); }
+  button { background: var(--accent); color: #0b1020; border: 0; border-radius: 10px;
+           padding: 0 22px; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: wait; }
+  .cols { display: grid; grid-template-columns: 1fr 340px; gap: 16px; }
+  @media (max-width: 860px) { .cols { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line);
+          border-radius: 12px; padding: 16px 18px; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .12em;
+             color: var(--muted); margin-bottom: 10px; }
+  #answer { white-space: pre-wrap; overflow-x: auto; }
+  #answer table { border-collapse: collapse; margin: 8px 0; }
+  #answer td, #answer th { border: 1px solid var(--line); padding: 5px 10px; font-size: 13.5px; }
+  .cite { border-left: 3px solid var(--ok); background: var(--chip);
+          border-radius: 8px; padding: 9px 12px; margin-bottom: 9px; font-size: 13px; }
+  .cite .kind { color: var(--ok); font-weight: 700; font-size: 11px;
+                text-transform: uppercase; letter-spacing: .08em; }
+  .cite .path { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .cite pre { white-space: pre-wrap; word-break: break-all; color: var(--muted);
+              font-size: 11.5px; margin-top: 6px; }
+  .step { display: flex; align-items: center; gap: 8px; padding: 6px 0;
+          border-bottom: 1px dashed var(--line); font-size: 13px; }
+  .step:last-child { border-bottom: 0; }
+  .agent { background: var(--chip); border: 1px solid var(--line); border-radius: 999px;
+           padding: 2px 10px; font-size: 11.5px; color: var(--accent); white-space: nowrap; }
+  .k { color: var(--muted); font-size: 11.5px; width: 74px; }
+  .empty { color: var(--muted); font-size: 13.5px; }
+  .error { color: #f87171; }
+  .samples { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+  .samples button { background: var(--chip); color: var(--muted); font-weight: 400;
+                    border: 1px solid var(--line); padding: 6px 12px; font-size: 12.5px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Data Bridge <span style="color:var(--accent)">— AI Team</span></h1>
+    <p>Documents + BigQuery, one team of agents. Every claim carries a citation.</p>
+  </header>
+
+  <form id="form">
+    <input id="q" placeholder="Ask about documents, data, or request a report…" autocomplete="off">
+    <button id="go" type="submit">Ask</button>
+  </form>
+  <div class="samples">
+    <button type="button" data-q="What is the release cadence for production deploys?">docs: release cadence</button>
+    <button type="button" data-q="What are the top 3 product categories by number of order items?">data: top categories</button>
+    <button type="button" data-q="Create an action item list from the Atlas migration kickoff meeting.">report: action items</button>
+  </div>
+
+  <div class="cols">
+    <div>
+      <div class="card">
+        <h2>Answer</h2>
+        <div id="answer" class="empty">Ask something — the team will fetch evidence first.</div>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <h2>Team activity</h2>
+        <div id="trace" class="empty">—</div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Citations</h2>
+      <div id="cites" class="empty">—</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const form = document.getElementById("form");
+const q = document.getElementById("q");
+const go = document.getElementById("go");
+const answerEl = document.getElementById("answer");
+const citesEl = document.getElementById("cites");
+const traceEl = document.getElementById("trace");
+
+document.querySelectorAll(".samples button").forEach(b =>
+  b.addEventListener("click", () => { q.value = b.dataset.q; form.requestSubmit(); }));
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const question = q.value.trim();
+  if (!question) return;
+  go.disabled = true;
+  answerEl.className = ""; answerEl.textContent = "The team is working…";
+  citesEl.className = "empty"; citesEl.textContent = "—";
+  traceEl.className = "empty"; traceEl.textContent = "—";
+  try {
+    const res = await fetch("/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    renderAnswer(data.answer);
+    renderCitations(data.citations);
+    renderTrace(data.trace);
+  } catch (err) {
+    answerEl.className = "error";
+    answerEl.textContent = "Refused or failed: " + err.message;
+  } finally {
+    go.disabled = false;
+  }
+});
+
+function renderAnswer(text) {
+  answerEl.className = "";
+  if (text.includes("|")) { answerEl.innerHTML = mdTable(text); }
+  else { answerEl.textContent = text; }
+}
+
+function mdTable(text) {
+  const esc = s => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  const lines = text.split("\n");
+  let html = "", inTable = false;
+  for (const line of lines) {
+    const t = line.trim();
+    if (t.startsWith("|") && t.endsWith("|")) {
+      if (/^\|[\s\-:|]+\|$/.test(t)) continue;
+      const cells = t.slice(1, -1).split("|").map(c => `<td>${esc(c.trim())}</td>`).join("");
+      html += (inTable ? "" : "<table>") + `<tr>${cells}</tr>`;
+      inTable = true;
+    } else {
+      if (inTable) { html += "</table>"; inTable = false; }
+      if (t) html += esc(line) + "\n";
+    }
+  }
+  if (inTable) html += "</table>";
+  return html;
+}
+
+function renderCitations(citations) {
+  citesEl.className = "";
+  citesEl.innerHTML = citations.map(c => `
+    <div class="cite">
+      <div class="kind">${c.kind}</div>
+      <div><strong>${c.title || c.source_id}</strong>${c.heading ? " › " + c.heading : ""}</div>
+      ${c.breadcrumb ? `<div class="path">${c.breadcrumb}</div>` : ""}
+      ${c.sql ? `<pre>${c.sql.replace(/</g,"&lt;")}</pre>` : ""}
+    </div>`).join("");
+}
+
+function renderTrace(trace) {
+  traceEl.className = "";
+  traceEl.innerHTML = trace.map(s => `
+    <div class="step">
+      <span class="agent">${s.agent}</span>
+      <span class="k">${s.kind}</span>
+      <span>${s.detail.replace(/</g,"&lt;").slice(0, 70)}</span>
+    </div>`).join("");
+}
+</script>
+</body>
+</html>
