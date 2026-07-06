@@ -1,0 +1,17 @@
+# Local dev database — plain pgvector, matching the portable profile (design D-3):
+# the app owns embeddings and uses only standard pgvector operators, so this container,
+# Cloud SQL for PostgreSQL, and AlloyDB are interchangeable behind one connection string.
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: databridge
+      POSTGRES_PASSWORD: databridge  # local dev only
+      POSTGRES_DB: databridge
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

@@ -1,0 +1,51 @@
+[project]
+name = "databridge"
+version = "0.1.0"
+description = "Data Bridge — an AI team that connects scattered enterprise documents and data, with citations on every output."
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.7",
+    "psycopg[binary]>=3.1",
+    "pgvector>=0.3",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+gcp = [
+    "google-genai>=1.0",
+]
+dev = [
+    "pytest>=8.0",
+    "types-pyyaml>=6.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/databridge"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+strict = true
+packages = ["databridge"]
+mypy_path = "src"
+
+[[tool.mypy.overrides]]
+module = ["pgvector.*", "google.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: requires a running Postgres (docker compose up -d)",
+]
