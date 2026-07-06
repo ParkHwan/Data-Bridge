@@ -1,0 +1,33 @@
+# ---- Secrets / env ----
+.env
+.env.*
+*.key
+*service-account*.json
+credentials*.json
+
+# ---- Sibling-project data isolation (hard rule — see docs/design/architecture.md D-10/R-4) ----
+# Never commit corpus/eval data originating from the private sibling project.
+*questions*.yaml
+*snapshots*
+*.crowdy*
+corpus/
+*.sqlite
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Node / UI ----
+node_modules/
+dist/
+.next/
+
+# ---- OS / editor ----
+.DS_Store
+.idea/
+.vscode/
