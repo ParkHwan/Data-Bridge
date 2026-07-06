@@ -13,6 +13,7 @@ dependencies = [
 [project.optional-dependencies]
 gcp = [
     "google-genai>=1.0",
+    "google-adk>=1.0",
 ]
 dev = [
     "pytest>=8.0",

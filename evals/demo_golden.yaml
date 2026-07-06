@@ -1,0 +1,28 @@
+# Mini golden set — 5 questions over the self-authored demo corpus (design Phase 1).
+# Metrics (ported method): keyword_hit (any expected keyword in answer, OR-groups
+# supported) + source_hit (expected source_id appears in citations).
+items:
+  - id: DG-001
+    question: "What is the release cadence for production deploys?"
+    expected_source_id: doc-ops-runbook
+    expected_keywords: [["Tuesday", "Thursdays", "Tuesdays"], ["14:00", "UTC"]]
+
+  - id: DG-002
+    question: "When must we roll back a deploy, and does a rollback need approvals?"
+    expected_source_id: doc-ops-runbook
+    expected_keywords: [["2%", "error rate"], ["no", "not require", "without"]]
+
+  - id: DG-003
+    question: "Which module migrates first in the Atlas migration and why?"
+    expected_source_id: doc-meeting-atlas-kickoff
+    expected_keywords: [["Collector"], ["fewest", "downstream"]]
+
+  - id: DG-004
+    question: "What is the highest-severity risk if Warehouse Sync slips past August 20?"
+    expected_source_id: doc-risk-log
+    expected_keywords: [["freeze", "R-02"], ["Pulse", "September"]]
+
+  - id: DG-005
+    question: "How is Aurora Insights priced?"
+    expected_source_id: doc-product-overview
+    expected_keywords: [["seat"], ["50 million", "usage"]]

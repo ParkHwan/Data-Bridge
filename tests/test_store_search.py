@@ -64,8 +64,10 @@ def test_upsert_search_and_space_isolation() -> None:
     assert hits_a and hits_a[0].source_id == "t-rollback"
     assert all(h.space_key == "SPACE_A" for h in hits_a)
 
-    hits_all = store.search(query, top_k=3)
-    assert {h.space_key for h in hits_all} == {"SPACE_A", "SPACE_B"}
+    # Unfiltered search spans spaces. The shared dev DB may hold other corpora
+    # (e.g. DEMO samples), so assert superset membership, not equality.
+    hits_all = store.search(query, top_k=50)
+    assert {"SPACE_A", "SPACE_B"} <= {h.space_key for h in hits_all}
 
     # atomic replace is idempotent — row count stays stable
     count = _replace(store, embedder, docs[0])
