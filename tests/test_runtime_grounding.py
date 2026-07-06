@@ -82,3 +82,10 @@ def test_mixed_evidence_combines_citations() -> None:
 def test_parse_cited_refs_dedupes_and_orders() -> None:
     assert _parse_cited_refs("x SOURCES: [2][1] [2]") == [2, 1]
     assert _parse_cited_refs("no markers") == []
+
+
+def test_parse_cited_refs_tolerates_commas() -> None:
+    # Codex P2: models sometimes emit "SOURCES: [1], [3]" — tolerate separators
+    # while keeping the strict no-marker refusal.
+    assert _parse_cited_refs("SOURCES: [1], [3]") == [1, 3]
+    assert _parse_cited_refs("SOURCES: [2],[4]") == [2, 4]

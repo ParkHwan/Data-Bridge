@@ -27,7 +27,7 @@ from databridge.agents.team import build_root_agent
 from databridge.citations import Citation, GroundedAnswer
 
 _APP_NAME = "databridge"
-_SOURCES_RE = re.compile(r"SOURCES:\s*((?:\[\d+\]\s*)*)", re.IGNORECASE)
+_SOURCES_RE = re.compile(r"SOURCES:\s*((?:\[\d+\][,\s]*)*)", re.IGNORECASE)
 _REF_RE = re.compile(r"\[(\d+)\]")
 
 _REFUSAL = (
