@@ -44,8 +44,10 @@ class AskResponse(BaseModel):
     trace: list[TraceStepOut]
 
 
-@app.get("/healthz")
-def healthz() -> dict[str, Any]:
+# NOTE: /healthz is reserved/intercepted by Google Front End on run.app domains
+# (returns a GFE 404 before reaching the app) — hence /health.
+@app.get("/health")
+def health() -> dict[str, Any]:
     return {"ok": True}
 
 
