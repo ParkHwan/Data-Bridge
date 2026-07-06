@@ -38,7 +38,7 @@ def main() -> int:
     total_kw = 0.0
     source_hits = 0
     for item in items:
-        result = ask(item["question"])
+        result = ask(item["question"]).grounded
         kw = keyword_hit(result.answer, item["expected_keywords"])
         src = any(c.source_id == item["expected_source_id"] for c in result.citations)
         total_kw += kw
