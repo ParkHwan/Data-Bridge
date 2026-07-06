@@ -22,7 +22,7 @@ class VertexEmbedder:
         except ImportError as exc:  # pragma: no cover - env-dependent
             msg = "google-genai is required: pip install 'databridge[gcp]'"
             raise RuntimeError(msg) from exc
-        self._client: Any = genai.Client(  # type: ignore[attr-defined]
+        self._client: Any = genai.Client(
             vertexai=True,
             project=project or os.environ.get("GOOGLE_CLOUD_PROJECT"),
             location=location or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"),
