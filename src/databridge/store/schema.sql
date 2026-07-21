@@ -17,5 +17,9 @@ CREATE TABLE IF NOT EXISTS chunks (
     PRIMARY KEY (space_key, chunk_id)
 );
 
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS content_tsv tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
+
 CREATE INDEX IF NOT EXISTS chunks_space_source_idx ON chunks (space_key, source_id);
+CREATE INDEX IF NOT EXISTS chunks_content_tsv_idx ON chunks USING GIN (content_tsv);
 -- Vector index deferred: MVP corpus is small; add HNSW when corpus grows.

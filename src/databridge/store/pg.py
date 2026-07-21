@@ -1,14 +1,16 @@
-"""pgvector store: upsert + vector-similarity search with metadata filter.
+"""pgvector store: vector and RRF hybrid search with metadata filters.
 
-MVP search scope is deliberately vector + filter only (design D-11); RRF hybrid is a
-Phase-3 option. Space isolation is a plain ``WHERE space_key = %s`` — the reason this
-store replaces the sibling's source-prefix workaround.
+Hybrid full-text search uses PostgreSQL's stock ``english`` configuration. It improves
+English keyword retrieval but does not provide Korean-aware tokenization or stemming;
+that known limitation is deliberately scoped out of this phase. Space isolation is a
+plain ``WHERE space_key = %s``.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import resources
+from typing import Any
 
 import psycopg
 from pgvector.psycopg import register_vector
@@ -27,6 +29,8 @@ class SearchHit:
     breadcrumb: str | None
     content: str
     distance: float
+    rrf_score: float | None = None
+    fts_rank: int | None = None
 
 
 class PgVectorStore:
@@ -173,3 +177,109 @@ class PgVectorStore:
             )
             for row in rows
         ]
+
+    def search_hybrid(
+        self,
+        query_embedding: list[float],
+        query_text: str,
+        *,
+        space_key: str | None = None,
+        top_k: int = 5,
+        candidate_k: int = 20,
+        rrf_k: int = 60,
+    ) -> list[SearchHit]:
+        """Fuse vector and English full-text candidates with reciprocal rank fusion."""
+        if len(query_embedding) != EMBEDDING_DIM:
+            msg = f"query embedding dimension {len(query_embedding)} != {EMBEDDING_DIM}"
+            raise ValueError(msg)
+        if top_k < 1:
+            msg = f"top_k must be >= 1, got {top_k}"
+            raise ValueError(msg)
+        if candidate_k < top_k:
+            msg = f"candidate_k must be >= top_k, got {candidate_k} < {top_k}"
+            raise ValueError(msg)
+        if rrf_k <= 0:
+            msg = f"rrf_k must be > 0, got {rrf_k}"
+            raise ValueError(msg)
+
+        space_filter = "AND space_key = %(space)s" if space_key else ""
+        vector_sql = f"""
+            SELECT chunk_id, source_id, space_key, title, heading, breadcrumb, content,
+                   embedding <=> %(query)s::vector AS distance
+            FROM chunks
+            WHERE TRUE {space_filter}
+            ORDER BY distance
+            LIMIT %(candidate_k)s
+        """
+        fts_sql = f"""
+            SELECT chunk_id, source_id, space_key, title, heading, breadcrumb, content,
+                   embedding <=> %(query)s::vector AS distance,
+                   ts_rank_cd(
+                       content_tsv, websearch_to_tsquery('english', %(query_text)s)
+                   ) AS text_score
+            FROM chunks
+            WHERE content_tsv @@ websearch_to_tsquery('english', %(query_text)s)
+                  {space_filter}
+            ORDER BY text_score DESC
+            LIMIT %(candidate_k)s
+        """
+        params: dict[str, object] = {
+            "query": query_embedding,
+            "query_text": query_text,
+            "candidate_k": candidate_k,
+        }
+        if space_key:
+            params["space"] = space_key
+
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(vector_sql, params)
+            vector_rows = cur.fetchall()
+            cur.execute(fts_sql, params)
+            fts_rows = cur.fetchall()
+
+        # chunk_id is only unique within a space (the table has a composite PK).
+        # Keep both parts internally so unfiltered searches do not collapse rows.
+        def key_for(row: tuple[Any, ...]) -> tuple[str, str]:
+            return str(row[2]), str(row[0])
+
+        rows_by_key = {key_for(row): row for row in vector_rows}
+        rows_by_key.update({key_for(row): row for row in fts_rows})
+        vector_ranks = {
+            key_for(row): rank for rank, row in enumerate(vector_rows, start=1)
+        }
+        fts_ranks = {key_for(row): rank for rank, row in enumerate(fts_rows, start=1)}
+
+        scored: list[tuple[float, tuple[str, str]]] = []
+        for candidate_key in rows_by_key:
+            score = 0.0
+            if candidate_key in vector_ranks:
+                score += 1.0 / (rrf_k + vector_ranks[candidate_key])
+            if candidate_key in fts_ranks:
+                score += 1.0 / (rrf_k + fts_ranks[candidate_key])
+            scored.append((score, candidate_key))
+        scored.sort(
+            key=lambda item: (
+                -item[0],
+                float(rows_by_key[item[1]][7]),
+                item[1],
+            )
+        )
+
+        hits: list[SearchHit] = []
+        for score, candidate_key in scored[:top_k]:
+            row = rows_by_key[candidate_key]
+            hits.append(
+                SearchHit(
+                    chunk_id=row[0],
+                    source_id=row[1],
+                    space_key=row[2],
+                    title=row[3],
+                    heading=row[4],
+                    breadcrumb=row[5],
+                    content=row[6],
+                    distance=float(row[7]),
+                    rrf_score=score,
+                    fts_rank=fts_ranks.get(candidate_key),
+                )
+            )
+        return hits

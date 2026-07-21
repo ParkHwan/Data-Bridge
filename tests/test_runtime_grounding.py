@@ -1,4 +1,4 @@
-"""Unit tests for the strict grounding policy (no live LLM needed)."""
+"""Unit tests for line-level grounding (no live LLM needed)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ import pytest
 
 from databridge.agents.runtime import (
     NoEvidenceError,
-    _parse_cited_refs,
+    _bind_claims,
+    _ground_answer,
     _to_grounded_answer,
 )
 
@@ -31,26 +32,69 @@ DOC = {
 
 
 def test_markers_map_to_document_citations() -> None:
-    ga = _to_grounded_answer("Deploys are twice weekly.\nSOURCES: [1]", DOC, [])
+    ga = _to_grounded_answer("Deploys are twice weekly. [1]", DOC, [])
     assert [c.source_id for c in ga.citations] == ["doc-ops-runbook"]
-    assert "SOURCES" not in ga.answer
+    assert ga.answer == "Deploys are twice weekly."
 
 
-def test_no_markers_is_refused_not_padded() -> None:
-    # Strict policy (post-review P1): missing markers must not silently cite
-    # everything that was retrieved.
+def test_unmarked_claim_is_dropped_but_grounded_line_survives() -> None:
+    grounded, dropped = _ground_answer(
+        "Deploys are twice weekly. [1]\nThis line is unsupported.", DOC, []
+    )
+    assert grounded.answer == "Deploys are twice weekly."
+    assert dropped == ("This line is unsupported.",)
+    assert [c.source_id for c in grounded.citations] == ["doc-ops-runbook"]
+
+
+def test_all_unmarked_lines_are_refused() -> None:
     with pytest.raises(NoEvidenceError):
-        _to_grounded_answer("Confident but uncited claim.", DOC, [])
+        _to_grounded_answer("Confident but uncited claim.\nAnother claim.", DOC, [])
 
 
 def test_markers_referencing_unknown_refs_are_refused() -> None:
     with pytest.raises(NoEvidenceError):
-        _to_grounded_answer("Answer.\nSOURCES: [9]", DOC, [])
+        _to_grounded_answer("Answer. [9]", DOC, [])
 
 
 def test_no_evidence_at_all_is_refused() -> None:
     with pytest.raises(NoEvidenceError):
-        _to_grounded_answer("Answer.\nSOURCES: [1]", {}, [])
+        _to_grounded_answer("Answer. [1]", {}, [])
+
+
+def test_report_table_drops_unresolved_rows_and_keeps_structure() -> None:
+    text = "\n".join(
+        [
+            "## Action items",
+            "| Owner | Action | Due | Source |",
+            "| --- | --- | --- | --- |",
+            "| Alice | Fix retry logic | 2026-08-01 | [2] |",
+            "| Bob | Guess at a task | 2026-08-02 | [9] |",
+        ]
+    )
+    answer, citations, dropped = _bind_claims(text, DOC)
+    assert "## Action items" in answer
+    assert "| Owner | Action | Due | Source |" in answer
+    assert "| --- | --- | --- | --- |" in answer
+    assert "Alice" in answer
+    assert "[2]" not in answer
+    assert "Bob" not in answer
+    assert dropped == ("| Bob | Guess at a task | 2026-08-02 | [9] |",)
+    assert [c.source_id for c in citations] == ["doc-risk-log"]
+
+
+def test_table_scans_only_source_cell_and_preserves_brackets_in_other_cells() -> None:
+    text = "\n".join(
+        [
+            "| Owner | Action | Due | Source |",
+            "| --- | --- | --- | --- |",
+            "| Alice | Fix array access [1] | 2026-08-01 | [2] |",
+        ]
+    )
+    answer, citations, dropped = _bind_claims(text, DOC)
+    assert "Fix array access [1]" in answer
+    assert "| [2] |" not in answer
+    assert dropped == ()
+    assert [c.source_id for c in citations] == ["doc-risk-log"]
 
 
 def test_bigquery_evidence_cites_sql_automatically() -> None:
@@ -62,6 +106,7 @@ def test_bigquery_evidence_cites_sql_automatically() -> None:
         }
     ]
     ga = _to_grounded_answer("There are N orders.", {}, bq)
+    assert ga.answer == "There are N orders."
     assert ga.citations[0].kind == "bigquery"
     assert ga.citations[0].sql is not None and "SELECT" in ga.citations[0].sql
 
@@ -74,18 +119,90 @@ def test_mixed_evidence_combines_citations() -> None:
             "row_count_returned": 1,
         }
     ]
-    ga = _to_grounded_answer("Combined.\nSOURCES: [2]", DOC, bq)
-    kinds = sorted(c.kind for c in ga.citations)
+    grounded, dropped = _ground_answer(
+        "Document risk is high. [2]\nUnsupported document claim.", DOC, bq
+    )
+    kinds = sorted(c.kind for c in grounded.citations)
     assert kinds == ["bigquery", "document"]
+    assert grounded.answer == "Document risk is high."
+    assert dropped == ("Unsupported document claim.",)
 
 
-def test_parse_cited_refs_dedupes_and_orders() -> None:
-    assert _parse_cited_refs("x SOURCES: [2][1] [2]") == [2, 1]
-    assert _parse_cited_refs("no markers") == []
+def test_code_fence_is_preserved_but_quotes_and_lists_require_markers() -> None:
+    text = "\n".join(
+        [
+            "## Example",
+            "```python",
+            "print('literal [1] must survive')",
+            "```",
+            "> Supported quote. [1]",
+            "> Unsupported quote.",
+            "- Supported bullet. [1]",
+            "- Unsupported bullet.",
+            "* Supported bullet with punctuation [1]!",
+            "1. Supported ordered item [1]?",
+            "Grounded conclusion. [1]",
+        ]
+    )
+    answer, citations, dropped = _bind_claims(text, DOC)
+    assert "print('literal [1] must survive')" in answer
+    assert "> Supported quote." in answer
+    assert "> Unsupported quote." not in answer
+    assert "- Supported bullet." in answer
+    assert "- Unsupported bullet." not in answer
+    assert "* Supported bullet with punctuation!" in answer
+    assert "1. Supported ordered item?" in answer
+    assert "Grounded conclusion." in answer
+    assert dropped == ("> Unsupported quote.", "- Unsupported bullet.")
+    assert [c.source_id for c in citations] == ["doc-ops-runbook"]
 
 
-def test_parse_cited_refs_tolerates_commas() -> None:
-    # Codex P2: models sometimes emit "SOURCES: [1], [3]" — tolerate separators
-    # while keeping the strict no-marker refusal.
-    assert _parse_cited_refs("SOURCES: [1], [3]") == [1, 3]
-    assert _parse_cited_refs("SOURCES: [2],[4]") == [2, 4]
+def test_marker_before_sentence_punctuation_is_bound_and_punctuation_survives() -> None:
+    answer, citations, dropped = _bind_claims(
+        "Deploys happen twice weekly [1].", DOC
+    )
+    assert answer == "Deploys happen twice weekly."
+    assert dropped == ()
+    assert [c.source_id for c in citations] == ["doc-ops-runbook"]
+
+
+def test_multiple_claims_on_one_line_collect_and_remove_every_ref() -> None:
+    answer, citations, dropped = _bind_claims(
+        "Production deploys happen twice weekly. [1] Hotfix risk is high. [2]", DOC
+    )
+    assert answer == "Production deploys happen twice weekly. Hotfix risk is high."
+    assert "[" not in answer
+    assert dropped == ()
+    assert [c.source_id for c in citations] == ["doc-ops-runbook", "doc-risk-log"]
+
+
+def test_whole_line_refs_dedupe_in_first_seen_order_and_strip_unknown_refs() -> None:
+    answer, citations, dropped = _bind_claims(
+        "Risk first. [2] Deploy next. [1] Duplicate. [2] Unknown. [99]", DOC
+    )
+    assert answer == "Risk first. Deploy next. Duplicate. Unknown."
+    assert dropped == ()
+    assert [c.source_id for c in citations] == ["doc-risk-log", "doc-ops-runbook"]
+
+
+def test_marker_removal_normalizes_spaces_and_punctuation() -> None:
+    answer, citations, dropped = _bind_claims(
+        "First claim [1] .  Second claim [2] ,  third claim [1] !", DOC
+    )
+    assert answer == "First claim. Second claim, third claim!"
+    assert dropped == ()
+    assert [c.source_id for c in citations] == ["doc-ops-runbook", "doc-risk-log"]
+
+
+def test_inline_refs_dedupe_and_preserve_first_seen_order() -> None:
+    answer, citations, dropped = _bind_claims("Risk one. [2][1][2]\nRisk two. [1]", DOC)
+    assert answer == "Risk one.\nRisk two."
+    assert dropped == ()
+    assert [c.source_id for c in citations] == ["doc-risk-log", "doc-ops-runbook"]
+
+
+def test_inline_refs_tolerate_commas() -> None:
+    answer, citations, dropped = _bind_claims("Combined claim. [1], [2]", DOC)
+    assert answer == "Combined claim."
+    assert dropped == ()
+    assert len(citations) == 2

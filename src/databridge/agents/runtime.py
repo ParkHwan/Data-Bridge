@@ -1,10 +1,10 @@
 """Run the AI team and return a grounded result with a collaboration trace.
 
 Citation policy (strict — post-review):
-- Document evidence: the model must emit "SOURCES: [n]" markers naming the
-  search_knowledge refs it used. Markers referencing real evidence become document
-  citations. **No valid markers → NoEvidenceError** — silently citing everything that
-  was retrieved would dress an ungrounded answer in green checkmarks.
+- Document evidence: every factual line must end with inline ``[n]`` markers naming
+  the search_knowledge refs it used. Report-table rows put the markers in their final
+  Source cell. Lines without resolving evidence are removed; if nothing grounded
+  remains, the answer is refused.
 - BigQuery evidence: every successful query_bigquery call is deterministic evidence;
   the exact SQL + referenced tables become a bigquery citation automatically.
 
@@ -27,8 +27,17 @@ from databridge.agents.team import build_root_agent
 from databridge.citations import Citation, GroundedAnswer
 
 _APP_NAME = "databridge"
-_SOURCES_RE = re.compile(r"SOURCES:\s*((?:\[\d+\][,\s]*)*)", re.IGNORECASE)
 _REF_RE = re.compile(r"\[(\d+)\]")
+_SPACE_RUN_RE = re.compile(r"[ \t]{2,}")
+_SPACE_BEFORE_PUNCTUATION_RE = re.compile(r"[ \t]+([.,!?])")
+_REF_SEPARATOR_RE = re.compile(r"[ \t]*,[ \t]*")
+_TABLE_ROW_RE = re.compile(r"^(?P<prefix>\s*\|.*\|)(?P<cell>[^|]*)(?P<end>\|\s*)$")
+_TABLE_SEPARATOR_RE = re.compile(
+    r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$"
+)
+_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}(?:\s|$)")
+_HORIZONTAL_RULE_RE = re.compile(r"^\s{0,3}(?:-{3,}|\*{3,}|_{3,})\s*$")
+_CODE_FENCE_RE = re.compile(r"^\s{0,3}`{3,}")
 
 _REFUSAL = (
     "I could not find supporting evidence in the knowledge base, "
@@ -49,6 +58,7 @@ class TraceStep:
 class TeamResult:
     grounded: GroundedAnswer
     trace: tuple[TraceStep, ...]
+    dropped_claims: tuple[str, ...]
 
     @property
     def answer(self) -> str:
@@ -93,8 +103,12 @@ async def ask_async(question: str, *, user_id: str = "local") -> TeamResult:
             final_text = "".join(p.text or "" for p in event.content.parts)
             trace.append(TraceStep(agent=agent, kind="final", detail=final_text[:80]))
 
-    grounded = _to_grounded_answer(final_text, doc_evidence, bq_evidence)
-    return TeamResult(grounded=grounded, trace=tuple(trace))
+    grounded, dropped_claims = _ground_answer(final_text, doc_evidence, bq_evidence)
+    return TeamResult(
+        grounded=grounded,
+        trace=tuple(trace),
+        dropped_claims=dropped_claims,
+    )
 
 
 def _parts(event: Any) -> list[Any]:
@@ -122,6 +136,16 @@ def _to_grounded_answer(
     doc_evidence: dict[int, dict[str, Any]],
     bq_evidence: list[dict[str, Any]],
 ) -> GroundedAnswer:
+    """Build the public contract; retained for deterministic pure-function tests."""
+    grounded, _ = _ground_answer(text, doc_evidence, bq_evidence)
+    return grounded
+
+
+def _ground_answer(
+    text: str,
+    doc_evidence: dict[int, dict[str, Any]],
+    bq_evidence: list[dict[str, Any]],
+) -> tuple[GroundedAnswer, tuple[str, ...]]:
     citations: list[Citation] = []
 
     # BigQuery evidence is deterministic: the SQL that ran is the citation.
@@ -136,39 +160,114 @@ def _to_grounded_answer(
             )
         )
 
-    # Document evidence requires explicit SOURCES markers (strict — no fallback:
-    # citing all retrieved chunks would fabricate confidence, post-review P1).
-    cited_refs = [r for r in _parse_cited_refs(text) if r in doc_evidence]
-    for ref in cited_refs:
-        item = doc_evidence[ref]
-        citations.append(
-            Citation(
-                kind="document",
-                source_id=str(item["source_id"]),
-                title=item.get("title"),
-                heading=item.get("heading") or None,
-                breadcrumb=item.get("breadcrumb"),
-                snippet=(str(item.get("content", ""))[:200] or None),
-            )
-        )
+    answer, document_citations, dropped_claims = _bind_claims(
+        text,
+        doc_evidence,
+        # Only a true BigQuery-only response bypasses document-marker parsing. Mixed
+        # responses still drop unmarked lines whenever document evidence is present.
+        keep_unmarked=not doc_evidence,
+    )
+    citations.extend(document_citations)
 
     if not citations:
         raise NoEvidenceError(_REFUSAL)
 
-    answer = _SOURCES_RE.sub("", text).strip()
     if not answer:
         raise NoEvidenceError(_REFUSAL)
-    return GroundedAnswer(answer=answer, citations=tuple(citations))
+    return GroundedAnswer(answer=answer, citations=tuple(citations)), dropped_claims
 
 
-def _parse_cited_refs(text: str) -> list[int]:
-    refs: list[int] = []
-    for match in _SOURCES_RE.finditer(text):
-        refs.extend(int(m) for m in _REF_RE.findall(match.group(1)))
-    seen: set[int] = set()
-    unique = []
-    for r in refs:
-        if r not in seen:
-            seen.add(r)
-            unique.append(r)
-    return unique
+def _bind_claims(
+    text: str,
+    doc_evidence: dict[int, dict[str, Any]],
+    *,
+    keep_unmarked: bool = False,
+) -> tuple[str, tuple[Citation, ...], tuple[str, ...]]:
+    """Keep structural or grounded lines and bind resolving refs to citations."""
+    lines = text.split("\n")
+    structural = _structural_line_indexes(lines)
+    kept: list[str] = []
+    dropped: list[str] = []
+    cited_refs: list[int] = []
+
+    for index, line in enumerate(lines):
+        if not line.strip() or index in structural:
+            kept.append(line)
+            continue
+
+        table_match = _TABLE_ROW_RE.match(line)
+        marker_target = table_match.group("cell") if table_match else line
+        marker_matches = list(_REF_RE.finditer(marker_target))
+        refs = [int(match.group(1)) for match in marker_matches]
+        resolving = [ref for ref in refs if ref in doc_evidence]
+        if resolving:
+            clean_target = _remove_ref_markers(marker_target, marker_matches)
+            kept.append(_rebuild_line(line, table_match, clean_target))
+            cited_refs.extend(resolving)
+        elif not refs and keep_unmarked:
+            kept.append(line)
+        else:
+            dropped.append(line)
+
+    unique_refs = list(dict.fromkeys(cited_refs))
+    citations = tuple(_document_citation(doc_evidence[ref]) for ref in unique_refs)
+    return "\n".join(kept).strip(), citations, tuple(dropped)
+
+
+def _structural_line_indexes(lines: list[str]) -> set[int]:
+    structural: set[int] = set()
+    in_code_fence = False
+    for index, line in enumerate(lines):
+        is_fence = bool(_CODE_FENCE_RE.match(line))
+        if in_code_fence or is_fence:
+            structural.add(index)
+        if is_fence:
+            in_code_fence = not in_code_fence
+            continue
+        if _HEADING_RE.match(line) or _HORIZONTAL_RULE_RE.match(line):
+            structural.add(index)
+        if _TABLE_SEPARATOR_RE.match(line):
+            structural.add(index)
+            if index > 0 and _TABLE_ROW_RE.match(lines[index - 1]):
+                structural.add(index - 1)
+    return structural
+
+
+def _rebuild_line(
+    line: str,
+    table_match: re.Match[str] | None,
+    clean_target: str,
+) -> str:
+    if table_match:
+        return f'{table_match.group("prefix")}{clean_target} {table_match.group("end")}'
+    return clean_target
+
+
+def _remove_ref_markers(text: str, matches: list[re.Match[str]]) -> str:
+    """Remove ref spans and marker-only comma separators, then tidy visible text."""
+    leading = text[: len(text) - len(text.lstrip(" \t"))]
+    removal_spans = [match.span() for match in matches]
+    for left, right in zip(matches, matches[1:], strict=False):
+        between = text[left.end() : right.start()]
+        if _REF_SEPARATOR_RE.fullmatch(between):
+            removal_spans.append((left.end(), right.start()))
+
+    cleaned = text
+    for start, end in sorted(removal_spans, reverse=True):
+        cleaned = cleaned[:start] + cleaned[end:]
+
+    body = cleaned[len(leading) :].strip(" \t")
+    body = _SPACE_RUN_RE.sub(" ", body)
+    body = _SPACE_BEFORE_PUNCTUATION_RE.sub(r"\1", body)
+    return leading + body
+
+
+def _document_citation(item: dict[str, Any]) -> Citation:
+    return Citation(
+        kind="document",
+        source_id=str(item["source_id"]),
+        title=item.get("title"),
+        heading=item.get("heading") or None,
+        breadcrumb=item.get("breadcrumb"),
+        snippet=(str(item.get("content", ""))[:200] or None),
+    )
