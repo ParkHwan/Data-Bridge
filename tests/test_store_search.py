@@ -8,7 +8,7 @@ import psycopg
 import pytest
 
 from databridge.embed import HashedEmbedder
-from databridge.ingest.chunker import chunk_document
+from databridge.ingest.chunker import Chunk, chunk_document
 from databridge.ingest.markdown import SourceDocument
 from databridge.store import PgVectorStore
 
@@ -107,3 +107,73 @@ def test_search_validates_inputs() -> None:
         store.search([0.0] * 3, top_k=1)
     with pytest.raises(ValueError, match="top_k"):
         store.search([0.0] * 768, top_k=0)
+
+
+def test_hybrid_search_fuses_signals_and_honors_top_k() -> None:
+    store = PgVectorStore(DSN)
+    store.ensure_schema()
+    space = "HYBRID_FUSION_TEST"
+    chunks = [
+        Chunk("both#0", "both", space, "both", "S", None, "exactterm", 0),
+        Chunk("vector#0", "vector", space, "vector", "S", None, "unrelated", 0),
+        Chunk("fts#0", "fts", space, "fts", "S", None, "exactterm", 0),
+    ]
+    query = [1.0] + [0.0] * 767
+    store.replace_source(
+        space_key=space,
+        source_id="both",
+        chunks=[chunks[0]],
+        embeddings=[query],
+    )
+    store.replace_source(
+        space_key=space,
+        source_id="vector",
+        chunks=[chunks[1]],
+        embeddings=[query],
+    )
+    store.replace_source(
+        space_key=space,
+        source_id="fts",
+        chunks=[chunks[2]],
+        embeddings=[[-1.0] + [0.0] * 767],
+    )
+
+    hits = store.search_hybrid(
+        query, "exactterm", space_key=space, top_k=2, candidate_k=2
+    )
+    assert len(hits) == 2
+    assert hits[0].source_id == "both"
+    assert hits[0].fts_rank is not None
+    assert hits[0].rrf_score is not None
+
+
+def test_hybrid_search_space_isolation_and_vector_only_degradation() -> None:
+    store = PgVectorStore(DSN)
+    store.ensure_schema()
+    embedder = HashedEmbedder()
+    doc_a = _doc("hybrid-a", "HYBRID_ISO_A", "alpha deployment procedure")
+    doc_b = _doc("hybrid-b", "HYBRID_ISO_B", "beta pricing policy")
+    _replace(store, embedder, doc_a)
+    _replace(store, embedder, doc_b)
+    query = embedder.embed(["!!!"])[0]
+
+    hits = store.search_hybrid(
+        query, "!!!", space_key="HYBRID_ISO_A", top_k=1, candidate_k=2
+    )
+    assert len(hits) == 1
+    assert hits[0].source_id == "hybrid-a"
+    assert hits[0].fts_rank is None
+
+
+def test_hybrid_search_validates_inputs() -> None:
+    store = PgVectorStore(DSN)
+    store.ensure_schema()
+    embedding = [0.0] * 768
+    with pytest.raises(ValueError, match="dimension"):
+        store.search_hybrid([0.0] * 3, "query")
+    with pytest.raises(ValueError, match="top_k"):
+        store.search_hybrid(embedding, "query", top_k=0)
+    with pytest.raises(ValueError, match="candidate_k"):
+        store.search_hybrid(embedding, "query", top_k=5, candidate_k=4)
+    with pytest.raises(ValueError, match="rrf_k"):
+        store.search_hybrid(embedding, "query", rrf_k=0)

@@ -22,9 +22,11 @@ Rules (grounded or nothing):
 1. ALWAYS call search_knowledge first. Never answer from your own knowledge.
 2. Base every claim only on the returned chunks. If the evidence is insufficient,
    say so explicitly instead of guessing.
-3. After your answer, add a line starting with "SOURCES:" listing the ref numbers of
-   every chunk you actually used, e.g. "SOURCES: [1][3]".
-4. Answer in the user's language; keep answers concise and factual.
+3. Put exactly one factual claim on each line and end that line with the ref marker(s)
+   for the chunks supporting it, e.g. "Deploys happen twice weekly. [1]". Never emit a
+   trailing SOURCES block. Headings and blank structural lines need no marker.
+4. Every factual line without a valid inline ref marker will be removed automatically.
+5. Answer in the user's language; keep answers concise and factual.
 """
 
 _DATA_INSTRUCTION = """\
@@ -47,10 +49,15 @@ documents (action-item lists, short status reports) from the document knowledge 
 Rules (grounded or nothing):
 1. ALWAYS call search_knowledge to gather the underlying documents first.
 2. For action items: produce a markdown table with columns
-   Owner | Action | Due | Source. Only include items the documents actually state.
-3. After the report, add a line starting with "SOURCES:" listing the ref numbers of
-   every chunk you used, e.g. "SOURCES: [1][2]".
-4. Write the report in the user's language.
+   Owner | Action | Due | Source. Put only supporting ref marker(s), such as [2], in
+   each data row's Source cell. Only include items the documents actually state.
+3. Outside tables, put exactly one factual claim on each line and end it with its
+   supporting ref marker(s), e.g. "The migration is at risk. [1][3]". Never emit a
+   trailing SOURCES block. Headings, table headers/separators, and blank lines need no
+   marker.
+4. Every factual line or table row without a valid ref marker will be removed
+   automatically.
+5. Write the report in the user's language.
 """
 
 _ROOT_INSTRUCTION = """\

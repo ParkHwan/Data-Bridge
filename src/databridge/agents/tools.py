@@ -16,7 +16,9 @@ def search_knowledge(query: str) -> list[dict[str, Any]]:
     """
     deps = get_deps()
     query_embedding = deps.embedder.embed([query])[0]
-    hits = deps.store.search(query_embedding, space_key=deps.space_key, top_k=5)
+    hits = deps.store.search_hybrid(
+        query_embedding, query, space_key=deps.space_key, top_k=5
+    )
     return [
         {
             "ref": i + 1,
