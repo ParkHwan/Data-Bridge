@@ -222,12 +222,17 @@ class PgVectorStore:
             raise ValueError(msg)
 
         space_filter = "AND space_key = %(space)s" if space_key else ""
+        # Candidate rank feeds straight into RRF scoring, so tie order must be
+        # deterministic — Postgres does not guarantee equal-score row order, and a
+        # tie at the candidate_k boundary could otherwise flip which chunks (and
+        # citations) surface between runs. space_key + chunk_id (the composite PK)
+        # breaks every tie stably.
         vector_sql = f"""
             SELECT chunk_id, source_id, space_key, title, heading, breadcrumb, content,
                    embedding <=> %(query)s::vector AS distance
             FROM chunks
             WHERE TRUE {space_filter}
-            ORDER BY distance
+            ORDER BY distance, space_key, chunk_id
             LIMIT %(candidate_k)s
         """
         fts_sql = f"""
@@ -239,7 +244,7 @@ class PgVectorStore:
             FROM chunks
             WHERE content_tsv @@ websearch_to_tsquery('english', %(query_text)s)
                   {space_filter}
-            ORDER BY text_score DESC
+            ORDER BY text_score DESC, space_key, chunk_id
             LIMIT %(candidate_k)s
         """
         # word_similarity(query, content): the query's trigrams matched against the most
@@ -254,7 +259,7 @@ class PgVectorStore:
             FROM chunks
             WHERE %(query_text)s <%% content
                   {space_filter}
-            ORDER BY trgm_score DESC
+            ORDER BY trgm_score DESC, space_key, chunk_id
             LIMIT %(candidate_k)s
         """
         params: dict[str, object] = {
