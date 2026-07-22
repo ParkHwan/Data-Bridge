@@ -59,7 +59,8 @@ GOOGLE_GENAI_USE_VERTEXAI=TRUE GOOGLE_CLOUD_PROJECT=<프로젝트> \
 
 ## 평가 (미니 골든셋)
 
-자작 데모 코퍼스 5문항 — 라이브 Gemini 기준 **keyword_hit 1.000 / source_hit 5/5**:
+자작 데모 코퍼스 7문항 (영어 5 + 트라이그램 recall 경로를 검증하는 한국어 2) — 라이브
+Gemini 기준 **keyword_hit 1.000 / source_hit 7/7**:
 
 ```bash
 GOOGLE_CLOUD_PROJECT=<프로젝트> uv run python scripts/run_golden.py
@@ -73,7 +74,8 @@ GOOGLE_CLOUD_PROJECT=<프로젝트> uv run python scripts/run_golden.py
 | 에이전트 프레임워크 | **ADK** (Agent Development Kit) — root + sub-agents |
 | 벡터 저장소 | **Cloud SQL for PostgreSQL + pgvector** (plain 프로파일 — **AlloyDB** 호환) |
 | 정형 데이터 | **BigQuery** (공개 데이터셋 `thelook_ecommerce`) |
-| 배포 | **Cloud Run** (서비스 + ingest job, scale-to-zero) |
+| 배포 | **Cloud Run** (서비스 + migrate/ingest 잡, scale-to-zero) |
+| CI/CD | **Cloud Build** — `main` 푸시 시 게이트(스토어 통합 테스트 포함) → 잠긴 의존성 빌드 → 스키마 마이그레이션 → digest 배포 ([cloudbuild.yaml](cloudbuild.yaml), 인프라: [scripts/setup_cicd.sh](scripts/setup_cicd.sh)) |
 
 ## 데모 데이터
 
