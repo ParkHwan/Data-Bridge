@@ -1,4 +1,5 @@
-# Mini golden set — 5 questions over the self-authored demo corpus (design Phase 1).
+# Mini golden set — 7 questions over the self-authored demo corpus (design Phase 1;
+# Korean items added post-v0.2.1).
 # Metrics (ported method): keyword_hit (any expected keyword in answer, OR-groups
 # supported) + source_hit (expected source_id appears in citations).
 items:
@@ -26,3 +27,17 @@ items:
     question: "How is Aurora Insights priced?"
     expected_source_id: doc-product-overview
     expected_keywords: [["seat"], ["50 million", "usage"]]
+
+  # Korean items (v0.2.1 §4 follow-up). Queries use bare-form keywords while the
+  # source doc carries josa-suffixed forms (침투 테스트는 / 패치를) — the english FTS
+  # path cannot bridge that gap, so live recall here exercises the pg_trgm trigram
+  # RRF source added in v0.2.1.
+  - id: DG-006
+    question: "외부 침투 테스트 주기가 어떻게 되나요?"
+    expected_source_id: doc-security-review-ko
+    expected_keywords: [["분기"], ["1회", "한 번", "외부"]]
+
+  - id: DG-007
+    question: "심각 등급 취약점의 패치 기한은 얼마인가요?"
+    expected_source_id: doc-security-review-ko
+    expected_keywords: [["48"], ["패치", "시간 이내"]]
