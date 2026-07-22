@@ -61,8 +61,8 @@ Quality gates: `uv run pytest -q` (49 tests) / `uv run ruff check .` / `uv run m
 
 ## Evaluation (mini golden set)
 
-Five questions over the self-authored demo corpus — live Gemini results:
-**keyword_hit 1.000 / source_hit 5/5**.
+Seven questions over the self-authored demo corpus (5 English + 2 Korean exercising
+the trigram recall path) — live Gemini results: **keyword_hit 1.000 / source_hit 7/7**.
 
 ```bash
 GOOGLE_CLOUD_PROJECT=<project> uv run python scripts/run_golden.py
@@ -76,7 +76,8 @@ GOOGLE_CLOUD_PROJECT=<project> uv run python scripts/run_golden.py
 | Agent framework | **ADK** (Agent Development Kit) — root + sub-agents |
 | Vector store | **Cloud SQL for PostgreSQL + pgvector** (plain profile — **AlloyDB**-compatible) |
 | Structured data | **BigQuery** (public dataset `thelook_ecommerce`) |
-| Deploy | **Cloud Run** (service + ingest job, scale-to-zero) |
+| Deploy | **Cloud Run** (service + migrate/ingest jobs, scale-to-zero) |
+| CI/CD | **Cloud Build** trigger on `main` — gates (incl. store integration tests) → locked-deps build → schema migrate → digest deploy ([cloudbuild.yaml](cloudbuild.yaml), infra in [scripts/setup_cicd.sh](scripts/setup_cicd.sh)) |
 
 ## Demo data
 
