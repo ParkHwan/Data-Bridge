@@ -1,0 +1,50 @@
+# CI/CD — runs on every push to main (Cloud Build GitHub trigger).
+# Gates (offline) → build → deploy to Cloud Run. Integration tests that need a live
+# Postgres are skipped here (no DB in the build environment) — the live golden gate
+# stays an owner-run manual step (see docs/releases/v0.2.1.md §4).
+steps:
+  - id: gates
+    name: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        uv sync --extra dev --extra server --extra gcp
+        uv run ruff check .
+        uv run mypy
+        uv run pytest -q
+
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/databridge:$COMMIT_SHA
+      - .
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/databridge:$COMMIT_SHA
+
+  # Deploy with --image only: existing service config (env vars, Cloud SQL connection,
+  # service account) carries over to the new revision unchanged.
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - databridge
+      - --image=us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/databridge:$COMMIT_SHA
+      - --region=us-central1
+      - --quiet
+
+images:
+  - us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/databridge:$COMMIT_SHA
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+timeout: 1200s
