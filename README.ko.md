@@ -55,7 +55,7 @@ GOOGLE_GENAI_USE_VERTEXAI=TRUE GOOGLE_CLOUD_PROJECT=<프로젝트> \
 # → http://localhost:8080
 ```
 
-품질 게이트: `uv run pytest -q` (36 tests) / `uv run ruff check .` / `uv run mypy`
+품질 게이트: `uv run pytest -q` (49 tests) / `uv run ruff check .` / `uv run mypy`
 
 ## 평가 (미니 골든셋)
 

@@ -1,6 +1,6 @@
 [project]
 name = "databridge"
-version = "0.2.0"
+version = "0.2.1"
 description = "Data Bridge — an AI team that connects scattered enterprise documents and data, with citations on every output."
 requires-python = ">=3.12"
 dependencies = [
