@@ -1,0 +1,105 @@
+# CI/CD — runs on every push to main (Cloud Build GitHub trigger; infra defined in
+# scripts/setup_cicd.sh). Pipeline: gates (incl. store integration tests against a
+# throwaway pgvector DB) → build (locked deps) → push → schema migrate → deploy by
+# digest. Runs as the dedicated least-privilege build SA (review: Codex #2 /
+# Antigravity #3). The live golden gate stays an owner-run manual step
+# (docs/releases/v0.2.1.md §4).
+steps:
+  # Throwaway Postgres on the shared `cloudbuild` docker network so the store
+  # integration tests (pg_trgm operators, schema/index DDL, RRF layout, Korean josa
+  # recall) actually run instead of skipping (review: Codex #4).
+  - id: testdb
+    name: gcr.io/cloud-builders/docker
+    args:
+      - run
+      - -d
+      - --name=testdb
+      - --network=cloudbuild
+      - -e=POSTGRES_USER=databridge
+      - -e=POSTGRES_PASSWORD=databridge
+      - -e=POSTGRES_DB=databridge
+      - pgvector/pgvector:pg16
+
+  - id: gates
+    name: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+    env:
+      - DATABRIDGE_DSN=postgresql://databridge:databridge@testdb:5432/databridge
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        set -e
+        uv sync --locked --extra dev --extra server --extra gcp
+        uv run ruff check .
+        uv run mypy
+        uv run python - <<'PY'
+        import os, time
+        import psycopg
+        dsn = os.environ["DATABRIDGE_DSN"]
+        for _ in range(30):
+            try:
+                psycopg.connect(dsn, connect_timeout=2).close()
+                break
+            except Exception:
+                time.sleep(2)
+        else:
+            raise SystemExit("postgres not ready")
+        PY
+        uv run pytest -q
+
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/databridge:$COMMIT_SHA
+      - .
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/databridge:$COMMIT_SHA
+
+  # Schema before code: run the migration job (scripts/migrate.py → ensure_schema)
+  # against production so extensions/indexes exist before the new revision serves
+  # traffic (review: Antigravity #1; closes the v0.2.1 §5 pg_trgm production note).
+  - id: migrate
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        gcloud run jobs update databridge-migrate \
+          --image=us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/databridge:$COMMIT_SHA \
+          --region=us-central1
+        gcloud run jobs execute databridge-migrate --region=us-central1 --wait
+
+  # Deploy by immutable digest, not the mutable tag we just pushed (review: Codex #3).
+  # --image only: existing service config (env vars, Cloud SQL connection, runtime SA)
+  # carries over to the new revision unchanged.
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        DIGEST=$(gcloud artifacts docker images describe \
+          us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/databridge:$COMMIT_SHA \
+          --format='value(image_summary.digest)')
+        gcloud run deploy databridge \
+          --image=us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/databridge@$${DIGEST} \
+          --region=us-central1 \
+          --quiet
+
+images:
+  - us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/databridge:$COMMIT_SHA
+
+serviceAccount: projects/$PROJECT_ID/serviceAccounts/databridge-build@$PROJECT_ID.iam.gserviceaccount.com
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+timeout: 1800s
