@@ -177,3 +177,65 @@ def test_hybrid_search_validates_inputs() -> None:
         store.search_hybrid(embedding, "query", top_k=5, candidate_k=4)
     with pytest.raises(ValueError, match="rrf_k"):
         store.search_hybrid(embedding, "query", rrf_k=0)
+    with pytest.raises(ValueError, match="trgm_threshold"):
+        store.search_hybrid(embedding, "query", trgm_threshold=1.5)
+
+
+def test_hybrid_korean_josa_recall_via_trigram() -> None:
+    """Trigram recovers a Korean chunk that english FTS misses on josa variants.
+
+    ``배포를``/``완료했다`` tokenize as-is under the ``english`` config, so the bare query
+    terms ``배포``/``완료`` share no token with the chunk — english FTS finds nothing.
+    Character trigrams match the substrings, so the trigram source recovers the chunk.
+    """
+    store = PgVectorStore(DSN)
+    store.ensure_schema()
+    embedder = HashedEmbedder()
+    space = "KO_TRGM_TEST"
+    doc = SourceDocument(
+        source_id="ko-deploy",
+        title="ko-deploy",
+        space_key=space,
+        body="## S\n배포를 진행했다. 롤백 없이 안정적으로 완료했다.",
+    )
+    _replace(store, embedder, doc)
+
+    query_emb = embedder.embed(["배포 완료"])[0]
+    hits = store.search_hybrid(
+        query_emb, "배포 완료", space_key=space, top_k=5, candidate_k=10
+    )
+
+    match = [h for h in hits if h.source_id == "ko-deploy"]
+    assert match, "trigram should recover the Korean chunk"
+    assert match[0].trgm_rank is not None, "trigram source should have matched"
+    assert match[0].fts_rank is None, "english FTS should miss the josa-suffixed terms"
+
+
+def test_hybrid_three_source_fusion() -> None:
+    """All three signals (vector, FTS, trigram) contribute independently."""
+    store = PgVectorStore(DSN)
+    store.ensure_schema()
+    space = "TRI_FUSION_TEST"
+    query = [1.0] + [0.0] * 767
+    # kw: FTS + trigram hit on "exactterm", vector far (opposite embedding).
+    store.replace_source(
+        space_key=space,
+        source_id="kw",
+        chunks=[Chunk("kw#0", "kw", space, "kw", "S", None, "exactterm keyword", 0)],
+        embeddings=[[-1.0] + [0.0] * 767],
+    )
+    # vec: vector hit only, unrelated text so neither FTS nor trigram match.
+    store.replace_source(
+        space_key=space,
+        source_id="vec",
+        chunks=[Chunk("vec#0", "vec", space, "vec", "S", None, "unrelated body", 0)],
+        embeddings=[query],
+    )
+
+    hits = store.search_hybrid(query, "exactterm", space_key=space, top_k=2, candidate_k=5)
+    by_id = {h.source_id: h for h in hits}
+    assert {"kw", "vec"} <= set(by_id)
+    assert by_id["kw"].fts_rank is not None
+    assert by_id["kw"].trgm_rank is not None
+    assert by_id["vec"].fts_rank is None
+    assert by_id["vec"].trgm_rank is None

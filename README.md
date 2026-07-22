@@ -57,7 +57,7 @@ GOOGLE_GENAI_USE_VERTEXAI=TRUE GOOGLE_CLOUD_PROJECT=<project> \
 # → http://localhost:8080
 ```
 
-Quality gates: `uv run pytest -q` (36 tests) / `uv run ruff check .` / `uv run mypy`
+Quality gates: `uv run pytest -q` (49 tests) / `uv run ruff check .` / `uv run mypy`
 
 ## Evaluation (mini golden set)
 
