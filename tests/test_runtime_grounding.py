@@ -206,3 +206,27 @@ def test_inline_refs_tolerate_commas() -> None:
     assert answer == "Combined claim."
     assert dropped == ()
     assert len(citations) == 2
+
+
+def test_marker_glued_to_korean_josa_leaves_no_stray_space() -> None:
+    # "배포를 진행했다 [1]는 결정" must not become "… 진행했다 는 결정" — the space
+    # before the removed marker is absorbed when a josa follows (review: Antigravity #4).
+    answer, citations, dropped = _bind_claims("배포를 진행했다 [1]는 결정이 있었다.", DOC)
+    assert answer == "배포를 진행했다는 결정이 있었다."
+    assert dropped == ()
+    assert [c.source_id for c in citations] == ["doc-ops-runbook"]
+
+
+def test_marker_run_glued_to_josa_absorbs_space_once() -> None:
+    answer, citations, dropped = _bind_claims("승인 완료 [1], [2]로 종료.", DOC)
+    assert answer == "승인 완료로 종료."
+    assert dropped == ()
+    assert len(citations) == 2
+
+
+def test_marker_before_spaced_korean_word_keeps_single_space() -> None:
+    # A marker followed by a space then a Hangul word is a normal word boundary —
+    # the space must survive.
+    answer, citations, dropped = _bind_claims("정책 문서 [1] 참고 바랍니다.", DOC)
+    assert answer == "정책 문서 참고 바랍니다."
+    assert dropped == ()
