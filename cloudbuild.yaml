@@ -9,7 +9,7 @@ steps:
   # integration tests (pg_trgm operators, schema/index DDL, RRF layout, Korean josa
   # recall) actually run instead of skipping (review: Codex #4).
   - id: testdb
-    name: gcr.io/cloud-builders/docker
+    name: gcr.io/cloud-builders/docker@sha256:4a33059c95a600582497fac50780c1c4f68388338fb54002a95b99af85b8f651
     args:
       - run
       - -d
@@ -18,10 +18,10 @@ steps:
       - -e=POSTGRES_USER=databridge
       - -e=POSTGRES_PASSWORD=databridge
       - -e=POSTGRES_DB=databridge
-      - pgvector/pgvector:pg16
+      - pgvector/pgvector:pg16@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
 
   - id: gates
-    name: ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+    name: ghcr.io/astral-sh/uv:python3.13-bookworm-slim@sha256:531f855bda2c73cd6ef67d56b733b357cea384185b3022bd09f05e002cd144ca
     env:
       - DATABRIDGE_DSN=postgresql://databridge:databridge@testdb:5432/databridge
     entrypoint: sh
@@ -48,7 +48,7 @@ steps:
         uv run pytest -q
 
   - id: build
-    name: gcr.io/cloud-builders/docker
+    name: gcr.io/cloud-builders/docker@sha256:4a33059c95a600582497fac50780c1c4f68388338fb54002a95b99af85b8f651
     args:
       - build
       - -t
@@ -56,7 +56,7 @@ steps:
       - .
 
   - id: push
-    name: gcr.io/cloud-builders/docker
+    name: gcr.io/cloud-builders/docker@sha256:4a33059c95a600582497fac50780c1c4f68388338fb54002a95b99af85b8f651
     args:
       - push
       - us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/databridge:$COMMIT_SHA
@@ -65,7 +65,7 @@ steps:
   # against production so extensions/indexes exist before the new revision serves
   # traffic (review: Antigravity #1; closes the v0.2.1 §5 pg_trgm production note).
   - id: migrate
-    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim@sha256:4ff69e21bec9a7d0ed54d0134a9b9682fc8008252cb5f173a23ddd70b8e024a4
     entrypoint: bash
     args:
       - -c
@@ -80,7 +80,7 @@ steps:
   # --image only: existing service config (env vars, Cloud SQL connection, runtime SA)
   # carries over to the new revision unchanged.
   - id: deploy
-    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim@sha256:4ff69e21bec9a7d0ed54d0134a9b9682fc8008252cb5f173a23ddd70b8e024a4
     entrypoint: bash
     args:
       - -c

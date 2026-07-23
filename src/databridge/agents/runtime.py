@@ -30,6 +30,7 @@ _APP_NAME = "databridge"
 _REF_RE = re.compile(r"\[(\d+)\]")
 _SPACE_RUN_RE = re.compile(r"[ \t]{2,}")
 _SPACE_BEFORE_PUNCTUATION_RE = re.compile(r"[ \t]+([.,!?])")
+_HANGUL_SYLLABLE_RE = re.compile(r"[가-힣]")
 _REF_SEPARATOR_RE = re.compile(r"[ \t]*,[ \t]*")
 _TABLE_ROW_RE = re.compile(r"^(?P<prefix>\s*\|.*\|)(?P<cell>[^|]*)(?P<end>\|\s*)$")
 _TABLE_SEPARATOR_RE = re.compile(
@@ -252,8 +253,23 @@ def _remove_ref_markers(text: str, matches: list[re.Match[str]]) -> str:
         if _REF_SEPARATOR_RE.fullmatch(between):
             removal_spans.append((left.end(), right.start()))
 
+    # Merge contiguous spans (marker + separator + marker) so the josa check below
+    # sees the whole removed run, then delete right-to-left to keep indexes valid.
+    merged: list[list[int]] = []
+    for start, end in sorted(removal_spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
     cleaned = text
-    for start, end in sorted(removal_spans, reverse=True):
+    for start, end in reversed(merged):
+        # A marker glued to a following Hangul josa ("단어 [1]는") must not leave the
+        # preceding space behind ("단어 는") — extend the removal over those spaces so
+        # the josa reattaches to its word (review: Antigravity #4).
+        if end < len(cleaned) and _HANGUL_SYLLABLE_RE.match(cleaned[end]):
+            while start > 0 and cleaned[start - 1] in " \t":
+                start -= 1
         cleaned = cleaned[:start] + cleaned[end:]
 
     body = cleaned[len(leading) :].strip(" \t")

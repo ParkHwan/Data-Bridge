@@ -40,9 +40,22 @@ the high-severity items below.
   including Korean items; store-level pure trigram recovery
   (`fts_rank=None, trgm_rank=1` for a bare-form query against josa-suffixed content).
 
-## Open items
+## Closure (2026-07-23)
 
-1. Owner decision: remove `roles/editor` from the default compute SA (Codex #5).
-2. Owner decision: Artifact Registry immutable-tag mode (Codex #7).
-3. Backlog: two-stage distance computation (#9), josa-space tidy rule (#10),
-   builder image digest pinning (#7).
+1. **Done** — `roles/editor` removed from the default compute SA (Codex #5); impact
+   analysis first confirmed nothing uses it (all Cloud Run workloads run as
+   `databridge-run@`, no GCE/Functions).
+2. **Done** — Artifact Registry immutable-tag mode enabled on
+   `cloud-run-source-deploy` (Codex #7). Consequence: re-pushing the same
+   `:$COMMIT_SHA` tag fails, so a manual re-run of an already-built commit stops at
+   `push` — the normal per-commit flow is unaffected.
+3. **Done** — josa-space tidy rule (#10): ref-marker removal now absorbs the space
+   before a marker glued to a following Hangul josa (`"단어 [1]는"` → `"단어는"`),
+   implemented via merged-span adjacency in `_remove_ref_markers` with 3 new unit
+   tests.
+4. **Done** — builder/base images pinned to `@sha256` digests in `Dockerfile` and
+   `cloudbuild.yaml` (#7 residual). Refreshing a pin is a deliberate, reviewable diff.
+5. **Deferred by design** — two-stage distance computation (#9): at the demo corpus
+   size the per-row cost is negligible and the extra round trip + complexity isn't
+   warranted; revisit when the corpus grows past the point where the text-candidate
+   scans dominate (`EXPLAIN ANALYZE` on `search_hybrid` is the trigger).
