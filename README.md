@@ -57,16 +57,22 @@ GOOGLE_GENAI_USE_VERTEXAI=TRUE GOOGLE_CLOUD_PROJECT=<project> \
 # → http://localhost:8080
 ```
 
-Quality gates: `uv run pytest -q` (49 tests) / `uv run ruff check .` / `uv run mypy`
+Quality gates: `uv run pytest -q` (96 tests) / `uv run ruff check .` / `uv run mypy`
 
-## Evaluation (mini golden set)
+## Evaluation (golden set)
 
-Seven questions over the self-authored demo corpus (5 English + 2 Korean exercising
-the trigram recall path) — live Gemini results: **keyword_hit 1.000 / source_hit 7/7**.
+Eleven questions over the self-authored demo corpus, covering all three specialists and the
+refusal path: 7 knowledge (5 English + 2 Korean exercising trigram recall), 2 data (BigQuery
+NL2SQL), 1 report, 1 refusal. The evaluator checks **observable contracts** — final agent,
+tool subsequence, citation kind, keyword threshold, and refusal — and the gate is green only
+when every item passes (`PASS`/`FAIL`/`REFUSAL_OK`/`ERROR`). Latest owner-run: **11/11**.
 
 ```bash
 GOOGLE_CLOUD_PROJECT=<project> uv run python scripts/run_golden.py
 ```
+
+The evaluator itself (`src/databridge/evals/`) is ADK-independent and unit-tested offline; see
+[v0.2.3](docs/releases/v0.2.3.md).
 
 ## GCP stack
 

@@ -55,16 +55,21 @@ GOOGLE_GENAI_USE_VERTEXAI=TRUE GOOGLE_CLOUD_PROJECT=<프로젝트> \
 # → http://localhost:8080
 ```
 
-품질 게이트: `uv run pytest -q` (49 tests) / `uv run ruff check .` / `uv run mypy`
+품질 게이트: `uv run pytest -q` (96 tests) / `uv run ruff check .` / `uv run mypy`
 
-## 평가 (미니 골든셋)
+## 평가 (골든셋)
 
-자작 데모 코퍼스 7문항 (영어 5 + 트라이그램 recall 경로를 검증하는 한국어 2) — 라이브
-Gemini 기준 **keyword_hit 1.000 / source_hit 7/7**:
+자작 데모 코퍼스 11문항으로 세 전문 에이전트와 거절 경로를 모두 검증한다: 지식 7(영어 5 +
+트라이그램 recall을 검증하는 한국어 2), 데이터 2(BigQuery NL2SQL), 리포트 1, 거절 1. 평가기는
+**관측 가능한 계약**(최종 에이전트·툴 순서·인용 종류·키워드 임계·거절)을 검사하며, 모든 항목이
+통과해야만 게이트가 green이다(`PASS`/`FAIL`/`REFUSAL_OK`/`ERROR`). 최근 owner 실행: **11/11**.
 
 ```bash
 GOOGLE_CLOUD_PROJECT=<프로젝트> uv run python scripts/run_golden.py
 ```
+
+평가기 자체(`src/databridge/evals/`)는 ADK 비의존이며 오프라인 단위 테스트가 있다.
+[v0.2.3](docs/releases/v0.2.3.md) 참조.
 
 ## GCP 스택
 
