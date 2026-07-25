@@ -11,7 +11,7 @@ COPY evals ./evals
 
 # Locked install: the exact dependency graph the CI gates tested (uv.lock), never a
 # fresh resolution — gate and production image share one lock graph (review: Codex #1).
-RUN uv sync --locked --no-dev --no-editable --extra server --extra gcp
+RUN uv sync --locked --no-dev --no-editable --extra server --extra gcp --extra confluence
 
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PORT=8080

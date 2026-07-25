@@ -29,7 +29,7 @@ steps:
       - -c
       - |
         set -e
-        uv sync --locked --extra dev --extra server --extra gcp
+        uv sync --locked --extra dev --extra server --extra gcp --extra confluence
         uv run ruff check .
         uv run mypy
         uv run python - <<'PY'
@@ -93,6 +93,28 @@ steps:
           --image=us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/databridge@$${DIGEST} \
           --region=us-central1 \
           --quiet
+
+  # The scheduled job uses the same immutable application image. Its environment,
+  # secret, Cloud SQL attachment, and service account are provisioned separately by
+  # scripts/setup_cicd.sh and remain unchanged on an image-only update.
+  - id: update-confluence-job
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim@sha256:4ff69e21bec9a7d0ed54d0134a9b9682fc8008252cb5f173a23ddd70b8e024a4
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        DIGEST=$(gcloud artifacts docker images describe \
+          us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/databridge:$COMMIT_SHA \
+          --format='value(image_summary.digest)')
+        if gcloud run jobs describe databridge-confluence-ingest --region=us-central1 >/dev/null 2>&1; then
+          gcloud run jobs update databridge-confluence-ingest \
+            --image=us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/databridge@$${DIGEST} \
+            --region=us-central1 \
+            --quiet
+        else
+          echo "databridge-confluence-ingest is not provisioned; run scripts/setup_cicd.sh"
+        fi
 
 images:
   - us-central1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/databridge:$COMMIT_SHA

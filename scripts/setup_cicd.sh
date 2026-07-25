@@ -18,7 +18,11 @@ PROJECT=${PROJECT:-genaiacademy-ph}
 REGION=us-central1
 BUILD_SA=databridge-build@${PROJECT}.iam.gserviceaccount.com
 RUNTIME_SA=databridge-run@${PROJECT}.iam.gserviceaccount.com
+SCHEDULER_SA=databridge-scheduler@${PROJECT}.iam.gserviceaccount.com
 REPO_URI=https://github.com/ParkHwan/Data-Bridge.git
+
+gcloud services enable run.googleapis.com secretmanager.googleapis.com \
+  cloudscheduler.googleapis.com --project "$PROJECT"
 
 # 1) Dedicated least-privilege build SA — never the default compute SA, which may
 #    hold roles/editor (review: Codex #2).
@@ -52,7 +56,62 @@ if ! gcloud run jobs describe databridge-migrate --project "$PROJECT" --region "
     --max-retries 0
 fi
 
-# 4) GitHub connection → repository link → trigger on main.
+# 4) Scheduled Confluence ingestion. The self-authored Confluence corpus must use a
+#    dedicated space key (for example CONF_DEMO) because a successful full run garbage
+#    collects sources absent from the configured folder.
+if ! gcloud secrets describe CONFLUENCE_API_TOKEN --project "$PROJECT" >/dev/null 2>&1; then
+  echo "Create Secret Manager secret CONFLUENCE_API_TOKEN before provisioning the ingest job." >&2
+  exit 1
+fi
+: "${CONFLUENCE_BASE_URL:?Set CONFLUENCE_BASE_URL for the Confluence Cloud site}"
+: "${CONFLUENCE_EMAIL:=}"
+: "${FOLDER_ID:?Set FOLDER_ID for the full-folder ingest scope}"
+: "${SPACE_KEY:?Set SPACE_KEY to a dedicated key such as CONF_DEMO}"
+
+gcloud secrets add-iam-policy-binding CONFLUENCE_API_TOKEN --project "$PROJECT" \
+  --member "serviceAccount:$RUNTIME_SA" --role roles/secretmanager.secretAccessor \
+  --condition=None --format=none
+
+IMAGE=$(gcloud run services describe databridge --project "$PROJECT" --region "$REGION" \
+  --format='value(spec.template.spec.containers[0].image)')
+DSN=$(gcloud run services describe databridge --project "$PROJECT" --region "$REGION" \
+  --format=export | grep -A1 'name: DATABRIDGE_DSN' | tail -1 | sed 's/.*value: //')
+if ! gcloud run jobs describe databridge-confluence-ingest \
+  --project "$PROJECT" --region "$REGION" >/dev/null 2>&1; then
+  gcloud run jobs create databridge-confluence-ingest \
+    --project "$PROJECT" --region "$REGION" --image "$IMAGE" \
+    --command python --args scripts/ingest_confluence.py \
+    --set-cloudsql-instances "${PROJECT}:${REGION}:databridge-demo" \
+    --set-env-vars "DATABRIDGE_DSN=${DSN},DATABRIDGE_EMBEDDER=vertex,CONFLUENCE_BASE_URL=${CONFLUENCE_BASE_URL},CONFLUENCE_EMAIL=${CONFLUENCE_EMAIL},FOLDER_ID=${FOLDER_ID},SPACE_KEY=${SPACE_KEY}" \
+    --set-secrets "CONFLUENCE_API_TOKEN=CONFLUENCE_API_TOKEN:latest" \
+    --service-account "$RUNTIME_SA" --max-retries 0 --task-timeout 3600s
+else
+  gcloud run jobs update databridge-confluence-ingest \
+    --project "$PROJECT" --region "$REGION" --image "$IMAGE" \
+    --command python --args scripts/ingest_confluence.py \
+    --set-cloudsql-instances "${PROJECT}:${REGION}:databridge-demo" \
+    --set-env-vars "DATABRIDGE_DSN=${DSN},DATABRIDGE_EMBEDDER=vertex,CONFLUENCE_BASE_URL=${CONFLUENCE_BASE_URL},CONFLUENCE_EMAIL=${CONFLUENCE_EMAIL},FOLDER_ID=${FOLDER_ID},SPACE_KEY=${SPACE_KEY}" \
+    --set-secrets "CONFLUENCE_API_TOKEN=CONFLUENCE_API_TOKEN:latest" \
+    --service-account "$RUNTIME_SA" --max-retries 0 --task-timeout 3600s
+fi
+
+gcloud iam service-accounts describe "$SCHEDULER_SA" --project "$PROJECT" >/dev/null 2>&1 ||
+  gcloud iam service-accounts create databridge-scheduler --project "$PROJECT" \
+    --display-name "Data-Bridge Confluence scheduler"
+gcloud run jobs add-iam-policy-binding databridge-confluence-ingest \
+  --project "$PROJECT" --region "$REGION" \
+  --member "serviceAccount:$SCHEDULER_SA" --role roles/run.invoker --format=none
+
+JOB_URI="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT}/jobs/databridge-confluence-ingest:run"
+if ! gcloud scheduler jobs describe databridge-confluence-ingest \
+  --project "$PROJECT" --location "$REGION" >/dev/null 2>&1; then
+  gcloud scheduler jobs create http databridge-confluence-ingest \
+    --project "$PROJECT" --location "$REGION" --schedule '0 6 * * *' \
+    --time-zone Asia/Seoul --uri "$JOB_URI" --http-method POST \
+    --oauth-service-account-email "$SCHEDULER_SA"
+fi
+
+# 5) GitHub connection → repository link → trigger on main.
 #    First run prints an authorization URL — complete it in the browser (as the
 #    GitHub repo owner), then re-run this script to finish the remaining steps.
 gcloud builds connections describe databridge-github --project "$PROJECT" --region "$REGION" >/dev/null 2>&1 ||
