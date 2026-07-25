@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, Never
 
 import pytest
 from pydantic import ValidationError
-from scripts import run_golden
 
+from databridge.evals.adapter import run_item, snapshot_result
 from databridge.evals.evaluator import EvaluationStatus, _matching_table_rows, evaluate
 from databridge.evals.observation import CitationSnapshot, Observation, TraceSnapshot
 from databridge.evals.schema import GoldenItem, GoldenSchemaError, GoldenSet, load_golden
@@ -392,9 +393,7 @@ def test_report_table_uses_a_later_valid_table_after_an_empty_table() -> None:
     assert _matching_table_rows(answer, ("Owner", "Action", "Due", "Source")) == 1
 
 
-def test_run_item_converts_an_evaluator_exception_to_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_run_item_converts_an_evaluator_exception_to_error() -> None:
     observation = _knowledge_observation()
 
     async def fake_observe(question: str, *, item_timeout: float) -> Observation:
@@ -402,17 +401,46 @@ def test_run_item_converts_an_evaluator_exception_to_error(
         assert item_timeout == 1.0
         return observation
 
-    def broken_evaluator(item: GoldenItem, actual: Observation) -> None:
+    def broken_evaluator(item: GoldenItem, actual: Observation) -> Never:
         assert item.id == "DG-101"
         assert actual is observation
         raise RuntimeError("parser exploded")
 
-    monkeypatch.setattr(run_golden, "_observe", fake_observe)
-    monkeypatch.setattr(run_golden, "evaluate", broken_evaluator)
-    result = asyncio.run(run_golden._run_item(_knowledge_item(), item_timeout=1.0))
+    result = asyncio.run(
+        run_item(
+            _knowledge_item(),
+            item_timeout=1.0,
+            observe=fake_observe,
+            evaluator=broken_evaluator,
+        )
+    )
 
     assert result.evaluation.status == EvaluationStatus.ERROR
     assert result.evaluation.failures == ("evaluator: RuntimeError: parser exploded",)
+
+
+def test_snapshot_result_selects_only_the_observation_surface() -> None:
+    result = SimpleNamespace(
+        answer="Grounded answer",
+        citations=(
+            SimpleNamespace(kind="document", source_id="doc-1", sql=None),
+        ),
+        trace=(
+            SimpleNamespace(agent="knowledge_agent", kind="final", detail="answer"),
+        ),
+        dropped_claims=("unsupported",),
+        runtime_only="not observable",
+    )
+
+    observation = snapshot_result(result)
+
+    assert observation == Observation(
+        outcome="ok",
+        answer="Grounded answer",
+        citations=(CitationSnapshot(kind="document", source_id="doc-1"),),
+        trace=(TraceSnapshot(agent="knowledge_agent", kind="final", detail="answer"),),
+        dropped_claims=("unsupported",),
+    )
 
 
 @pytest.mark.parametrize(
