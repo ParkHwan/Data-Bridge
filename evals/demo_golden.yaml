@@ -1,43 +1,127 @@
-# Mini golden set — 7 questions over the self-authored demo corpus (design Phase 1;
-# Korean items added post-v0.2.1).
-# Metrics (ported method): keyword_hit (any expected keyword in answer, OR-groups
-# supported) + source_hit (expected source_id appears in citations).
+# Golden schema v2. D-9 final-agent values were confirmed from owner-run live traces
+# for each positive kind (knowledge/data/report).
+version: 2
 items:
   - id: DG-001
+    kind: knowledge
     question: "What is the release cadence for production deploys?"
     expected_source_id: doc-ops-runbook
     expected_keywords: [["Tuesday", "Thursdays", "Tuesdays"], ["14:00", "UTC"]]
+    min_keyword: 1.0
+    expected_citation_kind: document
+    expected_final_agent: knowledge_agent
+    required_agents: [knowledge_agent]
+    expected_tools_by_agent: {knowledge_agent: [search_knowledge]}
+    strict_tools: true
 
   - id: DG-002
+    kind: knowledge
     question: "When must we roll back a deploy, and does a rollback need approvals?"
     expected_source_id: doc-ops-runbook
     expected_keywords: [["2%", "error rate"], ["no", "not require", "without"]]
+    min_keyword: 1.0
+    expected_citation_kind: document
+    expected_final_agent: knowledge_agent
+    required_agents: [knowledge_agent]
+    expected_tools_by_agent: {knowledge_agent: [search_knowledge]}
+    strict_tools: true
 
   - id: DG-003
+    kind: knowledge
     question: "Which module migrates first in the Atlas migration and why?"
     expected_source_id: doc-meeting-atlas-kickoff
     expected_keywords: [["Collector"], ["fewest", "downstream"]]
+    min_keyword: 1.0
+    expected_citation_kind: document
+    expected_final_agent: knowledge_agent
+    required_agents: [knowledge_agent]
+    expected_tools_by_agent: {knowledge_agent: [search_knowledge]}
+    strict_tools: true
 
   - id: DG-004
+    kind: knowledge
     question: "What is the highest-severity risk if Warehouse Sync slips past August 20?"
     expected_source_id: doc-risk-log
     expected_keywords: [["freeze", "R-02"], ["Pulse", "September"]]
+    min_keyword: 1.0
+    expected_citation_kind: document
+    expected_final_agent: knowledge_agent
+    required_agents: [knowledge_agent]
+    expected_tools_by_agent: {knowledge_agent: [search_knowledge]}
+    strict_tools: true
 
   - id: DG-005
+    kind: knowledge
     question: "How is Aurora Insights priced?"
     expected_source_id: doc-product-overview
     expected_keywords: [["seat"], ["50 million", "usage"]]
+    min_keyword: 1.0
+    expected_citation_kind: document
+    expected_final_agent: knowledge_agent
+    required_agents: [knowledge_agent]
+    expected_tools_by_agent: {knowledge_agent: [search_knowledge]}
+    strict_tools: true
 
-  # Korean items (v0.2.1 §4 follow-up). Queries use bare-form keywords while the
-  # source doc carries josa-suffixed forms (침투 테스트는 / 패치를) — the english FTS
-  # path cannot bridge that gap, so live recall here exercises the pg_trgm trigram
-  # RRF source added in v0.2.1.
   - id: DG-006
+    kind: knowledge
     question: "외부 침투 테스트 주기가 어떻게 되나요?"
     expected_source_id: doc-security-review-ko
     expected_keywords: [["분기"], ["1회", "한 번", "외부"]]
+    min_keyword: 1.0
+    expected_citation_kind: document
+    expected_final_agent: knowledge_agent
+    required_agents: [knowledge_agent]
+    expected_tools_by_agent: {knowledge_agent: [search_knowledge]}
+    strict_tools: true
 
   - id: DG-007
+    kind: knowledge
     question: "심각 등급 취약점의 패치 기한은 얼마인가요?"
     expected_source_id: doc-security-review-ko
     expected_keywords: [["48"], ["패치", "시간 이내"]]
+    min_keyword: 1.0
+    expected_citation_kind: document
+    expected_final_agent: knowledge_agent
+    required_agents: [knowledge_agent]
+    expected_tools_by_agent: {knowledge_agent: [search_knowledge]}
+    strict_tools: true
+
+  - id: DG-008
+    kind: data
+    question: "How many distinct order statuses exist in the thelook_ecommerce orders table?"
+    expected_keywords: [["status", "statuses"], ["distinct", "different", "unique"]]
+    min_keyword: 1.0
+    expected_citation_kind: bigquery
+    expected_final_agent: data_agent
+    required_agents: [data_agent]
+    expected_tools_by_agent: {data_agent: [list_tables, query_bigquery]}
+    strict_tools: true
+    max_tool_calls: 4
+
+  - id: DG-009
+    kind: data
+    question: "What is the average sale price in the thelook_ecommerce order_items table?"
+    expected_keywords: [["average", "avg", "mean"], ["sale price"]]
+    min_keyword: 1.0
+    expected_citation_kind: bigquery
+    expected_final_agent: data_agent
+    required_agents: [data_agent]
+    expected_tools_by_agent: {data_agent: [list_tables, query_bigquery]}
+    strict_tools: true
+    max_tool_calls: 4
+
+  - id: DG-010
+    kind: report
+    question: "Create an action-item report from the Atlas migration kickoff meeting."
+    expected_source_id: doc-meeting-atlas-kickoff
+    expected_citation_kind: document
+    expected_final_agent: report_agent
+    required_agents: [report_agent]
+    expected_tools_by_agent: {report_agent: [search_knowledge]}
+    strict_tools: true
+    expected_table_headers: [Owner, Action, Due, Source]
+    min_table_rows: 1
+
+  - id: DG-011
+    kind: refusal
+    question: "What is the approved catering menu for the Neptune office holiday party?"

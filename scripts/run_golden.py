@@ -1,4 +1,4 @@
-"""Run the mini golden set against the live AI team (real Gemini + real store).
+"""Run the v2 golden set against the live team and evaluate observable contracts.
 
 Usage:
     docker compose up -d && <ingest first>
@@ -7,50 +7,167 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import os
 import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
-
-import yaml
+from typing import cast
 
 os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "TRUE")
 os.environ.setdefault("GOOGLE_CLOUD_LOCATION", "us-central1")
 
-from databridge.agents.runtime import ask  # noqa: E402
+from databridge.agents.runtime import NoEvidenceError, TeamResult, ask_async  # noqa: E402
+from databridge.evals.evaluator import (  # noqa: E402
+    EvaluationResult,
+    EvaluationStatus,
+    evaluate,
+)
+from databridge.evals.observation import (  # noqa: E402
+    CitationSnapshot,
+    Observation,
+    TraceKind,
+    TraceSnapshot,
+)
+from databridge.evals.schema import GoldenItem, GoldenSchemaError, load_golden  # noqa: E402
 
 
-def keyword_hit(answer: str, expected: list) -> float:
-    if not expected:
-        return 0.0
-    low = answer.lower()
-    hits = 0
-    for entry in expected:
-        aliases = entry if isinstance(entry, list) else [entry]
-        if any(str(a).lower() in low for a in aliases):
-            hits += 1
-    return hits / len(expected)
+@dataclass(frozen=True, slots=True)
+class ItemRun:
+    item: GoldenItem
+    observation: Observation
+    evaluation: EvaluationResult
+    elapsed_seconds: float
+
+
+def _snapshot_result(result: TeamResult) -> Observation:
+    return Observation(
+        outcome="ok",
+        answer=result.answer,
+        citations=tuple(
+            CitationSnapshot(kind=citation.kind, source_id=citation.source_id, sql=citation.sql)
+            for citation in result.citations
+        ),
+        trace=tuple(
+            TraceSnapshot(agent=step.agent, kind=cast(TraceKind, step.kind), detail=step.detail)
+            for step in result.trace
+        ),
+        dropped_claims=result.dropped_claims,
+    )
+
+
+async def _observe(question: str, *, item_timeout: float) -> Observation:
+    try:
+        result = await asyncio.wait_for(ask_async(question), timeout=item_timeout)
+        return _snapshot_result(result)
+    except NoEvidenceError as exc:
+        return Observation(outcome="refusal", error_message=str(exc))
+    except Exception as exc:
+        return Observation(
+            outcome="error",
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+        )
+
+
+async def _run_item(item: GoldenItem, *, item_timeout: float) -> ItemRun:
+    started = time.monotonic()
+    observation = await _observe(item.question, item_timeout=item_timeout)
+    try:
+        evaluation = evaluate(item, observation)
+    except Exception as exc:
+        detail = type(exc).__name__
+        if str(exc):
+            detail = f"{detail}: {exc}"
+        evaluation = EvaluationResult(
+            item_id=item.id,
+            status=EvaluationStatus.ERROR,
+            failures=(f"evaluator: {detail}",),
+        )
+    elapsed = time.monotonic() - started
+    return ItemRun(
+        item=item,
+        observation=observation,
+        evaluation=evaluation,
+        elapsed_seconds=elapsed,
+    )
+
+
+def _print_item(run: ItemRun) -> None:
+    result = run.evaluation
+    observation = run.observation
+    calls = sum(step.kind == "tool_call" for step in observation.trace)
+    finals = [step.agent for step in observation.trace if step.kind == "final"]
+    final_agent = finals[-1] if finals else "-"
+    keyword = "-" if result.keyword_hit is None else f"{result.keyword_hit:.3f}"
+    print(
+        f"[{result.status.value}] {run.item.id} "
+        f"time={run.elapsed_seconds:.2f}s calls={calls} kw={keyword} final={final_agent}"
+    )
+    for failure in result.failures:
+        print(f"    {failure}")
+    if observation.answer:
+        print(f"    A: {observation.answer[:140]}")
+    if observation.citations:
+        print(f"    C: {[citation.source_id for citation in observation.citations]}")
+    if observation.outcome == "refusal" and observation.error_message:
+        print(f"    R: {observation.error_message}")
+
+
+async def _run_all(
+    items: tuple[GoldenItem, ...], *, item_timeout: float
+) -> tuple[ItemRun, ...]:
+    runs: list[ItemRun] = []
+    for item in items:
+        run = await _run_item(item, item_timeout=item_timeout)
+        runs.append(run)
+        _print_item(run)
+    return tuple(runs)
+
+
+def _parse_args() -> argparse.Namespace:
+    root = Path(__file__).parents[1]
+    parser = argparse.ArgumentParser(description="Run the live Data Bridge v2 golden set")
+    parser.add_argument("--golden", type=Path, default=root / "evals" / "demo_golden.yaml")
+    parser.add_argument("--item-timeout", type=float, default=120.0)
+    parser.add_argument("--total-timeout", type=float, default=1200.0)
+    return parser.parse_args()
 
 
 def main() -> int:
-    golden_path = Path(__file__).parents[1] / "evals" / "demo_golden.yaml"
-    items = yaml.safe_load(golden_path.read_text(encoding="utf-8"))["items"]
+    args = _parse_args()
+    if args.item_timeout <= 0 or args.total_timeout <= 0:
+        print("timeouts must be positive", file=sys.stderr)
+        return 2
+    try:
+        golden = load_golden(args.golden)
+    except GoldenSchemaError as exc:
+        print(exc, file=sys.stderr)
+        return 2
 
-    total_kw = 0.0
-    source_hits = 0
-    for item in items:
-        result = ask(item["question"]).grounded
-        kw = keyword_hit(result.answer, item["expected_keywords"])
-        src = any(c.source_id == item["expected_source_id"] for c in result.citations)
-        total_kw += kw
-        source_hits += int(src)
-        status = "PASS" if src and kw > 0 else "MISS"
-        print(f"[{status}] {item['id']} kw={kw:.2f} src={'O' if src else 'X'}")
-        print(f"    A: {result.answer[:140]}")
-        print(f"    C: {[c.source_id for c in result.citations]}")
+    started = time.monotonic()
+    try:
+        runs = asyncio.run(
+            asyncio.wait_for(
+                _run_all(golden.items, item_timeout=args.item_timeout),
+                timeout=args.total_timeout,
+            )
+        )
+    except TimeoutError:
+        print(f"[ERROR] total timeout exceeded ({args.total_timeout:.1f}s)", file=sys.stderr)
+        return 1
 
-    n = len(items)
-    print(f"\nsummary: keyword_hit={total_kw / n:.3f}  source_hit={source_hits}/{n}")
-    return 0 if source_hits == n else 1
+    passed = sum(run.evaluation.passed for run in runs)
+    calls = sum(
+        step.kind == "tool_call" for run in runs for step in run.observation.trace
+    )
+    elapsed = time.monotonic() - started
+    print(
+        f"\nsummary: passed={passed}/{len(runs)} calls={calls} elapsed={elapsed:.2f}s"
+    )
+    return 0 if passed == len(runs) else 1
 
 
 if __name__ == "__main__":
