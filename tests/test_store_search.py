@@ -100,6 +100,23 @@ def test_same_source_id_in_two_spaces_do_not_clobber() -> None:
     assert store.search(q, space_key="ISO_B", top_k=5) != []
 
 
+def test_list_source_ids_and_advisory_lock_are_space_scoped() -> None:
+    store = PgVectorStore(DSN)
+    store.ensure_schema()
+    embedder = HashedEmbedder()
+    _replace(store, embedder, _doc("list-a", "LIST_A", "alpha"))
+    _replace(store, embedder, _doc("list-b", "LIST_A", "beta"))
+    _replace(store, embedder, _doc("list-other", "LIST_B", "gamma"))
+
+    assert store.list_source_ids(space_key="LIST_A") == {"list-a", "list-b"}
+    with store.advisory_lock("test-list-lock") as first:
+        assert first is True
+        with store.advisory_lock("test-list-lock") as second:
+            assert second is False
+    with store.advisory_lock("test-list-lock") as reacquired:
+        assert reacquired is True
+
+
 def test_search_validates_inputs() -> None:
     store = PgVectorStore(DSN)
     store.ensure_schema()

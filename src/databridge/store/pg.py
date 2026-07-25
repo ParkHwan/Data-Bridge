@@ -16,6 +16,8 @@ Space isolation is a plain ``WHERE space_key = %s``.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import resources
 from typing import Any
@@ -99,6 +101,28 @@ class PgVectorStore:
                 (space_key, source_id),
             )
             return cur.rowcount or 0
+
+    def list_source_ids(self, *, space_key: str) -> set[str]:
+        """Return the distinct sources currently stored in one isolated space."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT source_id FROM chunks WHERE space_key = %s",
+                (space_key,),
+            )
+            return {str(row[0]) for row in cur.fetchall()}
+
+    @contextmanager
+    def advisory_lock(self, key: str) -> Iterator[bool]:
+        """Hold a session-level advisory lock for the entire context lifetime."""
+        with self._connect(register=False) as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_try_advisory_lock(hashtextextended(%s, 0))", (key,))
+            row = cur.fetchone()
+            acquired = bool(row and row[0])
+            try:
+                yield acquired
+            finally:
+                if acquired:
+                    cur.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))", (key,))
 
     @staticmethod
     def _validate_batch(chunks: list[Chunk], embeddings: list[list[float]]) -> None:
