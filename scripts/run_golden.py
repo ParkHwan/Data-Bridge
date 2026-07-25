@@ -12,56 +12,25 @@ import asyncio
 import os
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 
 os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "TRUE")
 os.environ.setdefault("GOOGLE_CLOUD_LOCATION", "us-central1")
 
-from databridge.agents.runtime import NoEvidenceError, TeamResult, ask_async  # noqa: E402
-from databridge.evals.evaluator import (  # noqa: E402
-    EvaluationResult,
-    EvaluationStatus,
-    evaluate,
+from databridge.agents.runtime import NoEvidenceError, ask_async  # noqa: E402
+from databridge.evals.adapter import (  # noqa: E402
+    ItemRun,
+    run_item,
+    snapshot_result,
 )
-from databridge.evals.observation import (  # noqa: E402
-    CitationSnapshot,
-    Observation,
-    TraceKind,
-    TraceSnapshot,
-)
+from databridge.evals.observation import Observation  # noqa: E402
 from databridge.evals.schema import GoldenItem, GoldenSchemaError, load_golden  # noqa: E402
-
-
-@dataclass(frozen=True, slots=True)
-class ItemRun:
-    item: GoldenItem
-    observation: Observation
-    evaluation: EvaluationResult
-    elapsed_seconds: float
-
-
-def _snapshot_result(result: TeamResult) -> Observation:
-    return Observation(
-        outcome="ok",
-        answer=result.answer,
-        citations=tuple(
-            CitationSnapshot(kind=citation.kind, source_id=citation.source_id, sql=citation.sql)
-            for citation in result.citations
-        ),
-        trace=tuple(
-            TraceSnapshot(agent=step.agent, kind=cast(TraceKind, step.kind), detail=step.detail)
-            for step in result.trace
-        ),
-        dropped_claims=result.dropped_claims,
-    )
 
 
 async def _observe(question: str, *, item_timeout: float) -> Observation:
     try:
         result = await asyncio.wait_for(ask_async(question), timeout=item_timeout)
-        return _snapshot_result(result)
+        return snapshot_result(result)
     except NoEvidenceError as exc:
         return Observation(outcome="refusal", error_message=str(exc))
     except Exception as exc:
@@ -73,26 +42,7 @@ async def _observe(question: str, *, item_timeout: float) -> Observation:
 
 
 async def _run_item(item: GoldenItem, *, item_timeout: float) -> ItemRun:
-    started = time.monotonic()
-    observation = await _observe(item.question, item_timeout=item_timeout)
-    try:
-        evaluation = evaluate(item, observation)
-    except Exception as exc:
-        detail = type(exc).__name__
-        if str(exc):
-            detail = f"{detail}: {exc}"
-        evaluation = EvaluationResult(
-            item_id=item.id,
-            status=EvaluationStatus.ERROR,
-            failures=(f"evaluator: {detail}",),
-        )
-    elapsed = time.monotonic() - started
-    return ItemRun(
-        item=item,
-        observation=observation,
-        evaluation=evaluation,
-        elapsed_seconds=elapsed,
-    )
+    return await run_item(item, item_timeout=item_timeout, observe=_observe)
 
 
 def _print_item(run: ItemRun) -> None:
