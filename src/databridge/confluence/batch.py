@@ -11,7 +11,11 @@ from typing import Protocol
 
 from databridge.confluence.adapter import page_to_source_document
 from databridge.confluence.ancestors import AncestorResolver
-from databridge.confluence.exceptions import BatchAlreadyRunningError, BatchSafetyError
+from databridge.confluence.exceptions import (
+    BatchAlreadyRunningError,
+    BatchSafetyError,
+    EmptyBodyError,
+)
 from databridge.confluence.models import Page, Space
 from databridge.confluence.parser import ADFParser
 from databridge.embed.base import Embedder
@@ -79,11 +83,14 @@ class ConfluenceBatchConfig:
 
 @dataclass(frozen=True, slots=True)
 class BatchResult:
+    """Summary of a batch run; ``pages`` counts pages actually ingested."""
+
     pages: int
     chunks: int
     vertex_calls: int
     deleted_sources: int
     elapsed_seconds: float
+    skipped_pages: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,8 +146,10 @@ async def _run_locked(
     descendant_ids = await _collect_page_ids(client, config)
     resolver = AncestorResolver(client)
     prepared: list[_PreparedPage] = []
+    seen: set[str] = set()
     total_chunks = 0
     vertex_calls = 0
+    skipped_pages = 0
 
     for page_id in descendant_ids:
         page = await client.get_page(page_id, body_format="atlas_doc_format")
@@ -151,12 +160,20 @@ async def _run_locked(
         resolver.seed_page(page)
         ancestors = await resolver.resolve(page.parent_id, page.parent_type)
         breadcrumb = " > ".join(ancestors) or None
-        document = page_to_source_document(
-            page,
-            space_key=config.space_key,
-            breadcrumb=breadcrumb,
-            parser=parser,
-        )
+        try:
+            document = page_to_source_document(
+                page,
+                space_key=config.space_key,
+                breadcrumb=breadcrumb,
+                parser=parser,
+            )
+        except EmptyBodyError:
+            logger.warning(
+                "Skipping empty Confluence page: page_id=%s title=%r", page.id, page.title
+            )
+            skipped_pages += 1
+            seen.add(page.id)
+            continue
         chunks = chunk_document(document)
         if not chunks:
             raise BatchSafetyError(f"Page {page.id} produced no chunks")
@@ -175,6 +192,10 @@ async def _run_locked(
                 f"Embedder returned {len(embeddings)} vectors for {len(chunks)} chunks"
             )
         prepared.append(_PreparedPage(page.id, chunks, embeddings))
+        seen.add(page.id)
+
+    if not prepared:
+        raise BatchSafetyError("All pages produced no content; refusing destructive GC")
 
     for item in prepared:
         store.replace_source(
@@ -184,22 +205,29 @@ async def _run_locked(
             embeddings=item.embeddings,
         )
 
-    seen = {item.page_id for item in prepared}
     stale = store.list_source_ids(space_key=config.space_key) - seen
     for source_id in sorted(stale):
         store.delete_source(space_key=config.space_key, source_id=source_id)
     elapsed = time.monotonic() - started
     logger.info(
         "Confluence ingest complete: space=%s pages=%s chunks=%s vertex_calls=%s "
-        "deleted_sources=%s elapsed_seconds=%.3f",
+        "deleted_sources=%s elapsed_seconds=%.3f skipped_pages=%s",
         config.space_key,
         len(prepared),
         total_chunks,
         vertex_calls,
         len(stale),
         elapsed,
+        skipped_pages,
     )
-    return BatchResult(len(prepared), total_chunks, vertex_calls, len(stale), elapsed)
+    return BatchResult(
+        pages=len(prepared),
+        chunks=total_chunks,
+        vertex_calls=vertex_calls,
+        deleted_sources=len(stale),
+        elapsed_seconds=elapsed,
+        skipped_pages=skipped_pages,
+    )
 
 
 async def _collect_page_ids(client: BatchClient, config: ConfluenceBatchConfig) -> list[str]:
