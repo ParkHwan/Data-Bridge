@@ -20,9 +20,41 @@ BUILD_SA=databridge-build@${PROJECT}.iam.gserviceaccount.com
 RUNTIME_SA=databridge-run@${PROJECT}.iam.gserviceaccount.com
 SCHEDULER_SA=databridge-scheduler@${PROJECT}.iam.gserviceaccount.com
 REPO_URI=https://github.com/ParkHwan/Data-Bridge.git
+# Production search is intentionally pinned to the permanent, single MFS corpus.
+: "${DATABRIDGE_SPACE:=MFS}"
+: "${CONFLUENCE_BASE_URL:?Set CONFLUENCE_BASE_URL for the Confluence Cloud site}"
+: "${CONFLUENCE_EMAIL:=}"
+: "${FOLDER_ID:?Set FOLDER_ID for the full-folder ingest scope}"
+: "${SPACE_KEY:?Set SPACE_KEY to a dedicated key such as CONF_DEMO}"
 
 gcloud services enable run.googleapis.com secretmanager.googleapis.com \
   cloudscheduler.googleapis.com --project "$PROJECT"
+
+# Fail before changing any Cloud Run resource. A secret reference alone is not enough:
+# the version selected by `latest` must exist and be enabled when an instance starts.
+if ! gcloud secrets describe DATABRIDGE_DSN --project "$PROJECT" >/dev/null 2>&1; then
+  echo "Create Secret Manager secret DATABRIDGE_DSN before provisioning." >&2
+  exit 1
+fi
+if [[ "$(gcloud secrets versions describe latest --secret DATABRIDGE_DSN \
+  --project "$PROJECT" --format='value(state)' 2>/dev/null)" != "ENABLED" ]]; then
+  echo "Enable the latest DATABRIDGE_DSN secret version before provisioning." >&2
+  exit 1
+fi
+if ! gcloud secrets describe CONFLUENCE_API_TOKEN --project "$PROJECT" >/dev/null 2>&1; then
+  echo "Create Secret Manager secret CONFLUENCE_API_TOKEN before provisioning the ingest job." >&2
+  exit 1
+fi
+if [[ "$(gcloud secrets versions describe latest --secret CONFLUENCE_API_TOKEN \
+  --project "$PROJECT" --format='value(state)' 2>/dev/null)" != "ENABLED" ]]; then
+  echo "Enable the latest CONFLUENCE_API_TOKEN secret version before provisioning." >&2
+  exit 1
+fi
+if ! gcloud run services describe databridge \
+  --project "$PROJECT" --region "$REGION" >/dev/null 2>&1; then
+  echo "Deploy the databridge service first (Cloud Build ^main^ trigger)." >&2
+  exit 1
+fi
 
 # 1) Dedicated least-privilege build SA — never the default compute SA, which may
 #    hold roles/editor (review: Codex #2).
@@ -40,59 +72,102 @@ done
 gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" --project "$PROJECT" \
   --member "serviceAccount:$BUILD_SA" --role roles/iam.serviceAccountUser --format=none
 
-# 3) Migration Cloud Run job (schema-before-code; executed by the pipeline's
-#    `migrate` step). Reuses the service's image, Cloud SQL wiring, and DSN.
-if ! gcloud run jobs describe databridge-migrate --project "$PROJECT" --region "$REGION" >/dev/null 2>&1; then
-  IMAGE=$(gcloud run services describe databridge --project "$PROJECT" --region "$REGION" \
-    --format='value(spec.template.spec.containers[0].image)')
-  DSN=$(gcloud run services describe databridge --project "$PROJECT" --region "$REGION" \
-    --format=export | grep -A1 'name: DATABRIDGE_DSN' | tail -1 | sed 's/.*value: //')
-  gcloud run jobs create databridge-migrate --project "$PROJECT" --region "$REGION" \
-    --image "$IMAGE" \
-    --command python --args scripts/migrate.py \
-    --set-cloudsql-instances "${PROJECT}:${REGION}:databridge-demo" \
-    --set-env-vars "DATABRIDGE_DSN=${DSN}" \
-    --service-account "$RUNTIME_SA" \
-    --max-retries 0
-fi
-
-# 4) Scheduled Confluence ingestion. The self-authored Confluence corpus must use a
-#    dedicated space key (for example CONF_DEMO) because a successful full run garbage
-#    collects sources absent from the configured folder.
-if ! gcloud secrets describe CONFLUENCE_API_TOKEN --project "$PROJECT" >/dev/null 2>&1; then
-  echo "Create Secret Manager secret CONFLUENCE_API_TOKEN before provisioning the ingest job." >&2
-  exit 1
-fi
-: "${CONFLUENCE_BASE_URL:?Set CONFLUENCE_BASE_URL for the Confluence Cloud site}"
-: "${CONFLUENCE_EMAIL:=}"
-: "${FOLDER_ID:?Set FOLDER_ID for the full-folder ingest scope}"
-: "${SPACE_KEY:?Set SPACE_KEY to a dedicated key such as CONF_DEMO}"
-
+# Secret-level access is sufficient for all four resources because they share the runtime SA.
+gcloud secrets add-iam-policy-binding DATABRIDGE_DSN --project "$PROJECT" \
+  --member "serviceAccount:$RUNTIME_SA" --role roles/secretmanager.secretAccessor \
+  --condition=None --format=none
 gcloud secrets add-iam-policy-binding CONFLUENCE_API_TOKEN --project "$PROJECT" \
   --member "serviceAccount:$RUNTIME_SA" --role roles/secretmanager.secretAccessor \
   --condition=None --format=none
 
 IMAGE=$(gcloud run services describe databridge --project "$PROJECT" --region "$REGION" \
   --format='value(spec.template.spec.containers[0].image)')
-DSN=$(gcloud run services describe databridge --project "$PROJECT" --region "$REGION" \
-  --format=export | grep -A1 'name: DATABRIDGE_DSN' | tail -1 | sed 's/.*value: //')
+
+# Never scrape DATABRIDGE_DSN from `--format=export`: secretKeyRef uses a valueFrom
+# block, so the old value-line pipeline produced an unrelated garbage string.
+# Existing resources use --update-secrets because --set-secrets removes every other
+# secret reference on the resource.
+
+# 3) Migration Cloud Run job (schema-before-code; executed by the pipeline's
+#    `migrate` step). Reuses the service's image and Cloud SQL wiring.
+if ! gcloud run jobs describe databridge-migrate --project "$PROJECT" --region "$REGION" >/dev/null 2>&1; then
+  gcloud run jobs create databridge-migrate --project "$PROJECT" --region "$REGION" \
+    --image "$IMAGE" \
+    --command python --args scripts/migrate.py \
+    --set-cloudsql-instances "${PROJECT}:${REGION}:databridge-demo" \
+    --set-secrets "DATABRIDGE_DSN=DATABRIDGE_DSN:latest" \
+    --service-account "$RUNTIME_SA" \
+    --max-retries 0
+else
+  gcloud run jobs update databridge-migrate --project "$PROJECT" --region "$REGION" \
+    --remove-env-vars DATABRIDGE_DSN \
+    --update-secrets "DATABRIDGE_DSN=DATABRIDGE_DSN:latest"
+fi
+
+# The sample ingest job is owner-created and deliberately manual. Convert it in place
+# when present without changing its image, command, or args; do not create it here.
+if gcloud run jobs describe databridge-ingest \
+  --project "$PROJECT" --region "$REGION" >/dev/null 2>&1; then
+  gcloud run jobs update databridge-ingest --project "$PROJECT" --region "$REGION" \
+    --remove-env-vars DATABRIDGE_DSN \
+    --update-secrets "DATABRIDGE_DSN=DATABRIDGE_DSN:latest"
+fi
+
+# 4) Scheduled Confluence ingestion. The self-authored Confluence corpus must use a
+#    dedicated space key (for example CONF_DEMO) because a successful full run garbage
+#    collects sources absent from the configured folder.
 if ! gcloud run jobs describe databridge-confluence-ingest \
   --project "$PROJECT" --region "$REGION" >/dev/null 2>&1; then
   gcloud run jobs create databridge-confluence-ingest \
     --project "$PROJECT" --region "$REGION" --image "$IMAGE" \
     --command python --args scripts/ingest_confluence.py \
     --set-cloudsql-instances "${PROJECT}:${REGION}:databridge-demo" \
-    --set-env-vars "DATABRIDGE_DSN=${DSN},DATABRIDGE_EMBEDDER=vertex,CONFLUENCE_BASE_URL=${CONFLUENCE_BASE_URL},CONFLUENCE_EMAIL=${CONFLUENCE_EMAIL},FOLDER_ID=${FOLDER_ID},SPACE_KEY=${SPACE_KEY}" \
-    --set-secrets "CONFLUENCE_API_TOKEN=CONFLUENCE_API_TOKEN:latest" \
+    --set-env-vars "DATABRIDGE_EMBEDDER=vertex,CONFLUENCE_BASE_URL=${CONFLUENCE_BASE_URL},CONFLUENCE_EMAIL=${CONFLUENCE_EMAIL},FOLDER_ID=${FOLDER_ID},SPACE_KEY=${SPACE_KEY}" \
+    --set-secrets "DATABRIDGE_DSN=DATABRIDGE_DSN:latest,CONFLUENCE_API_TOKEN=CONFLUENCE_API_TOKEN:latest" \
     --service-account "$RUNTIME_SA" --max-retries 0 --task-timeout 3600s
 else
   gcloud run jobs update databridge-confluence-ingest \
     --project "$PROJECT" --region "$REGION" --image "$IMAGE" \
     --command python --args scripts/ingest_confluence.py \
     --set-cloudsql-instances "${PROJECT}:${REGION}:databridge-demo" \
-    --set-env-vars "DATABRIDGE_DSN=${DSN},DATABRIDGE_EMBEDDER=vertex,CONFLUENCE_BASE_URL=${CONFLUENCE_BASE_URL},CONFLUENCE_EMAIL=${CONFLUENCE_EMAIL},FOLDER_ID=${FOLDER_ID},SPACE_KEY=${SPACE_KEY}" \
-    --set-secrets "CONFLUENCE_API_TOKEN=CONFLUENCE_API_TOKEN:latest" \
+    --set-env-vars "DATABRIDGE_EMBEDDER=vertex,CONFLUENCE_BASE_URL=${CONFLUENCE_BASE_URL},CONFLUENCE_EMAIL=${CONFLUENCE_EMAIL},FOLDER_ID=${FOLDER_ID},SPACE_KEY=${SPACE_KEY}" \
+    --update-secrets "DATABRIDGE_DSN=DATABRIDGE_DSN:latest,CONFLUENCE_API_TOKEN=CONFLUENCE_API_TOKEN:latest" \
     --service-account "$RUNTIME_SA" --max-retries 0 --task-timeout 3600s
+fi
+
+# Convert the serving revision last and set its permanent single-space corpus in the
+# same update, avoiding an extra revision and any interval without a DSN.
+# gcloud projections have no list .filter() transform, and `run services describe`
+# does not support --filter. Parse one export with awk, reporting only whether the
+# DSN is literal or secret so its value is never printed.
+SERVICE_EXPORT=$(gcloud run services describe databridge \
+  --project "$PROJECT" --region "$REGION" --format=export)
+SERVICE_DSN_KIND=$(printf '%s\n' "$SERVICE_EXPORT" | awk '
+  /^[[:space:]]*-[[:space:]]*name:[[:space:]]*DATABRIDGE_DSN[[:space:]]*$/ {f=1; next}
+  f {
+    if ($0 ~ /^[[:space:]]*value:/)     {print "literal"; exit}
+    if ($0 ~ /^[[:space:]]*valueFrom:/) {print "secret";  exit}
+    f=0
+  }')
+# Close after one item like the DSN parser. Format drift then yields an empty value,
+# which safely sends the guard through the update path.
+SERVICE_SPACE=$(printf '%s\n' "$SERVICE_EXPORT" | awk '
+  /^[[:space:]]*-[[:space:]]*name:[[:space:]]*DATABRIDGE_SPACE[[:space:]]*$/ {f=1; next}
+  f {
+    if ($0 ~ /^[[:space:]]*value:/) {
+      sub(/^[[:space:]]*value:[[:space:]]*/, "")
+      print
+      exit
+    }
+    f=0
+  }')
+if [[ "$SERVICE_DSN_KIND" == "secret" && "$SERVICE_SPACE" == "$DATABRIDGE_SPACE" ]]; then
+  echo "databridge service already uses the DSN secret and DATABRIDGE_SPACE=${DATABRIDGE_SPACE}; skipping update."
+else
+  gcloud run services update databridge --project "$PROJECT" --region "$REGION" \
+    --remove-env-vars DATABRIDGE_DSN \
+    --update-env-vars "DATABRIDGE_SPACE=${DATABRIDGE_SPACE}" \
+    --update-secrets "DATABRIDGE_DSN=DATABRIDGE_DSN:latest"
 fi
 
 gcloud iam service-accounts describe "$SCHEDULER_SA" --project "$PROJECT" >/dev/null 2>&1 ||
