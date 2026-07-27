@@ -48,6 +48,29 @@ class TraceSnapshot:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class DocumentEvidenceSnapshot:
+    """A safe document locator retained for refusal diagnosis."""
+
+    source_id: str
+    heading: str | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RefusalDiagnosticsSnapshot:
+    """Framework-independent refusal state without query, body, or answer text."""
+
+    documents: tuple[DocumentEvidenceSnapshot, ...] = ()
+    search_result_counts: tuple[int | None, ...] = ()
+    bq_evidence_count: int = 0
+    final_text_empty: bool = True
+    final_text_length: int = 0
+    citation_count: int = 0
+    answer_empty: bool = True
+    referenced_refs: tuple[int, ...] = ()
+    resolving_ref_count: int = 0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class Observation:
     """One normalized live or fixture result at the selected observation surface."""
 
@@ -56,6 +79,7 @@ class Observation:
     citations: tuple[CitationSnapshot, ...] = ()
     trace: tuple[TraceSnapshot, ...] = ()
     dropped_claims: tuple[str, ...] = ()
+    refusal_diagnostics: RefusalDiagnosticsSnapshot | None = None
     error_type: str | None = None
     error_message: str | None = None
 

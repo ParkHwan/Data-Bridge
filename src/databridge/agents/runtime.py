@@ -56,6 +56,34 @@ class TraceStep:
 
 
 @dataclass(frozen=True, slots=True)
+class DocumentEvidenceDiagnostic:
+    """Locators only; document content is deliberately excluded."""
+
+    source_id: str
+    heading: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class RefusalDiagnostics:
+    """Evaluation-only context captured without queries or model response text.
+
+    Search query text is intentionally not retained, so query rewriting can only be
+    inferred after routing, retrieval, and grounding causes have been eliminated.
+    """
+
+    trace: tuple[TraceStep, ...]
+    documents: tuple[DocumentEvidenceDiagnostic, ...]
+    search_result_counts: tuple[int | None, ...]
+    bq_evidence_count: int
+    final_text_empty: bool
+    final_text_length: int
+    citation_count: int
+    answer_empty: bool
+    referenced_refs: tuple[int, ...]
+    resolving_ref_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class TeamResult:
     grounded: GroundedAnswer
     trace: tuple[TraceStep, ...]
@@ -73,6 +101,19 @@ class TeamResult:
 class NoEvidenceError(RuntimeError):
     """Raised when the team produced no citable evidence for the question."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        citation_count: int = 0,
+        answer_empty: bool = True,
+        diagnostics: RefusalDiagnostics | None = None,
+    ) -> None:
+        self.citation_count = citation_count
+        self.answer_empty = answer_empty
+        self.diagnostics = diagnostics
+        super().__init__(message)
+
 
 def ask(question: str, *, user_id: str = "local") -> TeamResult:
     return asyncio.run(ask_async(question, user_id=user_id))
@@ -86,6 +127,7 @@ async def ask_async(question: str, *, user_id: str = "local") -> TeamResult:
     doc_evidence: dict[int, dict[str, Any]] = {}
     bq_evidence: list[dict[str, Any]] = []
     trace: list[TraceStep] = []
+    search_result_counts: list[int | None] = []
     final_text = ""
 
     async for event in runner.run_async(
@@ -99,12 +141,45 @@ async def ask_async(question: str, *, user_id: str = "local") -> TeamResult:
             response = getattr(part, "function_response", None)
             if response is not None:
                 trace.append(TraceStep(agent=agent, kind="tool_result", detail=response.name))
+                if response.name == "search_knowledge":
+                    body = _response_body(response)
+                    search_result_counts.append(len(body) if isinstance(body, list) else None)
                 _collect_evidence(response, doc_evidence, bq_evidence)
         if event.is_final_response() and event.content and event.content.parts:
             final_text = "".join(p.text or "" for p in event.content.parts)
             trace.append(TraceStep(agent=agent, kind="final", detail=final_text[:80]))
 
-    grounded, dropped_claims = _ground_answer(final_text, doc_evidence, bq_evidence)
+    try:
+        grounded, dropped_claims = _ground_answer(final_text, doc_evidence, bq_evidence)
+    except NoEvidenceError as exc:
+        referenced_refs = tuple(
+            dict.fromkeys(int(match.group(1)) for match in _REF_RE.finditer(final_text))
+        )
+        available_refs = set(doc_evidence)
+        diagnostics = RefusalDiagnostics(
+            trace=_sanitize_diagnostic_trace(trace),
+            documents=tuple(
+                DocumentEvidenceDiagnostic(
+                    source_id=str(item.get("source_id", "")),
+                    heading=str(item["heading"]) if item.get("heading") is not None else None,
+                )
+                for item in doc_evidence.values()
+            ),
+            search_result_counts=tuple(search_result_counts),
+            bq_evidence_count=len(bq_evidence),
+            final_text_empty=not final_text,
+            final_text_length=len(final_text),
+            citation_count=exc.citation_count,
+            answer_empty=exc.answer_empty,
+            referenced_refs=referenced_refs,
+            resolving_ref_count=len(available_refs.intersection(referenced_refs)),
+        )
+        raise NoEvidenceError(
+            str(exc),
+            citation_count=exc.citation_count,
+            answer_empty=exc.answer_empty,
+            diagnostics=diagnostics,
+        ) from exc
     return TeamResult(
         grounded=grounded,
         trace=tuple(trace),
@@ -117,13 +192,29 @@ def _parts(event: Any) -> list[Any]:
     return list(getattr(content, "parts", None) or [])
 
 
+def _sanitize_diagnostic_trace(trace: list[TraceStep]) -> tuple[TraceStep, ...]:
+    """Preserve event order and tool names without retaining final response text."""
+    return tuple(
+        TraceStep(
+            agent=step.agent,
+            kind=step.kind,
+            detail=step.detail if step.kind in {"tool_call", "tool_result"} else "final",
+        )
+        for step in trace
+    )
+
+
+def _response_body(response: Any) -> Any:
+    payload = response.response or {}
+    return payload.get("result", payload) if isinstance(payload, dict) else payload
+
+
 def _collect_evidence(
     response: Any,
     doc_evidence: dict[int, dict[str, Any]],
     bq_evidence: list[dict[str, Any]],
 ) -> None:
-    payload = response.response or {}
-    body = payload.get("result", payload) if isinstance(payload, dict) else payload
+    body = _response_body(response)
     if response.name == "search_knowledge" and isinstance(body, list):
         for item in body:
             if isinstance(item, dict) and isinstance(item.get("ref"), int):
@@ -170,11 +261,12 @@ def _ground_answer(
     )
     citations.extend(document_citations)
 
-    if not citations:
-        raise NoEvidenceError(_REFUSAL)
-
-    if not answer:
-        raise NoEvidenceError(_REFUSAL)
+    if not citations or not answer:
+        raise NoEvidenceError(
+            _REFUSAL,
+            citation_count=len(citations),
+            answer_empty=not answer,
+        )
     return GroundedAnswer(answer=answer, citations=tuple(citations)), dropped_claims
 
 

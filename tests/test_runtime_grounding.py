@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
+from databridge.agents import runtime
 from databridge.agents.runtime import (
     NoEvidenceError,
     _bind_claims,
@@ -59,6 +62,115 @@ def test_markers_referencing_unknown_refs_are_refused() -> None:
 def test_no_evidence_at_all_is_refused() -> None:
     with pytest.raises(NoEvidenceError):
         _to_grounded_answer("Answer. [1]", {}, [])
+
+
+def test_refusal_preserves_message_and_independent_grounding_states() -> None:
+    message = (
+        "I could not find supporting evidence in the knowledge base, "
+        "so I cannot give a grounded answer."
+    )
+    with pytest.raises(NoEvidenceError) as no_citations:
+        _ground_answer("Answer without evidence.", {}, [])
+    assert str(no_citations.value) == message
+    assert no_citations.value.citation_count == 0
+    assert not no_citations.value.answer_empty
+
+    bq = [{"sql": "SELECT 1", "referenced_tables": ["p.d.t"]}]
+    with pytest.raises(NoEvidenceError) as empty_answer:
+        _ground_answer("", {}, bq)
+    assert str(empty_answer.value) == message
+    assert empty_answer.value.citation_count == 1
+    assert empty_answer.value.answer_empty
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("final_text", "expected_refs"),
+    [
+        ("Uncited model response that must not enter diagnostics.", ()),
+        ("Model response with an invalid marker. [9]", (9,)),
+    ],
+)
+async def test_ask_async_attaches_safe_trace_and_evidence_to_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    final_text: str,
+    expected_refs: tuple[int, ...],
+) -> None:
+    evidence = DOC[1]
+
+    def event(author: str, part: SimpleNamespace, *, final: bool = False) -> SimpleNamespace:
+        return SimpleNamespace(
+            author=author,
+            content=SimpleNamespace(parts=[part]),
+            is_final_response=lambda: final,
+        )
+
+    events = (
+        event(
+            "knowledge_agent",
+            SimpleNamespace(
+                function_call=SimpleNamespace(name="search_knowledge"),
+                function_response=None,
+                text=None,
+            ),
+        ),
+        event(
+            "knowledge_agent",
+            SimpleNamespace(
+                function_call=None,
+                function_response=SimpleNamespace(
+                    name="search_knowledge", response={"result": [evidence]}
+                ),
+                text=None,
+            ),
+        ),
+        event(
+            "knowledge_agent",
+            SimpleNamespace(function_call=None, function_response=None, text=final_text),
+            final=True,
+        ),
+    )
+
+    class FakeSessionService:
+        async def create_session(self, **kwargs: object) -> SimpleNamespace:
+            assert kwargs
+            return SimpleNamespace(id="session")
+
+    class FakeRunner:
+        def __init__(self, **kwargs: object) -> None:
+            assert kwargs
+            self.session_service = FakeSessionService()
+
+        async def run_async(self, **kwargs: object):  # type: ignore[no-untyped-def]
+            assert kwargs
+            for item in events:
+                yield item
+
+    monkeypatch.setattr(runtime, "InMemoryRunner", FakeRunner)
+    monkeypatch.setattr(runtime, "build_root_agent", lambda: object())
+
+    with pytest.raises(NoEvidenceError) as captured:
+        await runtime.ask_async("question")
+
+    diagnostics = captured.value.diagnostics
+    assert diagnostics is not None
+    assert [(step.kind, step.detail) for step in diagnostics.trace] == [
+        ("tool_call", "search_knowledge"),
+        ("tool_result", "search_knowledge"),
+        ("final", "final"),
+    ]
+    assert diagnostics.search_result_counts == (1,)
+    assert [(item.source_id, item.heading) for item in diagnostics.documents] == [
+        ("doc-ops-runbook", "Release cadence")
+    ]
+    assert diagnostics.bq_evidence_count == 0
+    assert not diagnostics.final_text_empty
+    assert diagnostics.final_text_length == len(final_text)
+    assert diagnostics.citation_count == 0
+    assert diagnostics.answer_empty
+    assert diagnostics.referenced_refs == expected_refs
+    assert diagnostics.resolving_ref_count == 0
+    assert all(final_text not in step.detail for step in diagnostics.trace)
 
 
 def test_report_table_drops_unresolved_rows_and_keeps_structure() -> None:

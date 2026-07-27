@@ -11,9 +11,15 @@ from typing import Any, Never
 import pytest
 from pydantic import ValidationError
 
-from databridge.evals.adapter import run_item, snapshot_result
+from databridge.evals.adapter import run_item, snapshot_refusal, snapshot_result
 from databridge.evals.evaluator import EvaluationStatus, _matching_table_rows, evaluate
-from databridge.evals.observation import CitationSnapshot, Observation, TraceSnapshot
+from databridge.evals.observation import (
+    CitationSnapshot,
+    DocumentEvidenceSnapshot,
+    Observation,
+    RefusalDiagnosticsSnapshot,
+    TraceSnapshot,
+)
 from databridge.evals.schema import GoldenItem, GoldenSchemaError, GoldenSet, load_golden
 from databridge.evals.space import GoldenSpaceError, configure_golden_space
 
@@ -176,6 +182,7 @@ def test_observation_state_invariants(kwargs: dict[str, Any], message: str) -> N
 def test_refusal_preserves_optional_message() -> None:
     observation = Observation(outcome="refusal", error_message="grounded or nothing")
     assert observation.error_message == "grounded or nothing"
+    assert observation.refusal_diagnostics is None
 
 
 def test_trace_and_citation_snapshot_invariants() -> None:
@@ -199,6 +206,71 @@ def test_status_matrix_covers_refusal_fail_and_error() -> None:
             Observation(outcome="error", error_type="TimeoutError", error_message="late"),
         ).status
         == EvaluationStatus.ERROR
+    )
+
+
+def test_refusal_diagnostics_requires_a_completed_search_but_legacy_remains_compatible() -> None:
+    refusal = _refusal_item()
+    diagnostics = RefusalDiagnosticsSnapshot()
+    legacy = Observation(outcome="refusal")
+    assert evaluate(refusal, legacy).status == EvaluationStatus.REFUSAL_OK
+
+    missing_search = Observation(
+        outcome="refusal",
+        trace=(TraceSnapshot(agent="databridge_root", kind="final", detail="final"),),
+        refusal_diagnostics=diagnostics,
+    )
+    result = evaluate(refusal, missing_search)
+    assert result.status == EvaluationStatus.FAIL
+    assert result.failures == (
+        "refusal_process: search_knowledge was not completed before refusal",
+    )
+
+    searched = Observation(
+        outcome="refusal",
+        trace=_knowledge_trace(),
+        refusal_diagnostics=diagnostics,
+    )
+    assert evaluate(refusal, searched).status == EvaluationStatus.REFUSAL_OK
+
+
+def test_snapshot_refusal_preserves_safe_diagnostics_without_runtime_imports() -> None:
+    diagnostics = SimpleNamespace(
+        trace=(
+            SimpleNamespace(
+                agent="knowledge_agent", kind="tool_call", detail="search_knowledge"
+            ),
+            SimpleNamespace(
+                agent="knowledge_agent", kind="tool_result", detail="search_knowledge"
+            ),
+            SimpleNamespace(agent="knowledge_agent", kind="final", detail="final"),
+        ),
+        documents=(SimpleNamespace(source_id="doc-risk-log", heading="R-02"),),
+        search_result_counts=(5,),
+        bq_evidence_count=0,
+        final_text_empty=False,
+        final_text_length=42,
+        citation_count=0,
+        answer_empty=True,
+        referenced_refs=(9,),
+        resolving_ref_count=0,
+    )
+    observation = snapshot_refusal("grounded or nothing", diagnostics)
+    assert observation.trace == (
+        TraceSnapshot(agent="knowledge_agent", kind="tool_call", detail="search_knowledge"),
+        TraceSnapshot(agent="knowledge_agent", kind="tool_result", detail="search_knowledge"),
+        TraceSnapshot(agent="knowledge_agent", kind="final", detail="final"),
+    )
+    assert observation.refusal_diagnostics == RefusalDiagnosticsSnapshot(
+        documents=(DocumentEvidenceSnapshot(source_id="doc-risk-log", heading="R-02"),),
+        search_result_counts=(5,),
+        bq_evidence_count=0,
+        final_text_empty=False,
+        final_text_length=42,
+        citation_count=0,
+        answer_empty=True,
+        referenced_refs=(9,),
+        resolving_ref_count=0,
     )
 
 
