@@ -1,6 +1,7 @@
-# Golden schema v2. D-9 final-agent values were confirmed from owner-run live traces
+# Golden schema v3. D-9 final-agent values were confirmed from owner-run live traces
 # for each positive kind (knowledge/data/report).
-version: 2
+version: 3
+space_key: DEMO
 items:
   - id: DG-001
     kind: knowledge
@@ -90,6 +91,7 @@ items:
     kind: data
     question: "How many distinct order statuses exist in the thelook_ecommerce orders table?"
     expected_keywords: [["status", "statuses"], ["distinct", "different", "unique"]]
+    expected_exact_value: 5
     min_keyword: 1.0
     expected_citation_kind: bigquery
     expected_final_agent: data_agent
@@ -102,6 +104,7 @@ items:
     kind: data
     question: "What is the average sale price in the thelook_ecommerce order_items table?"
     expected_keywords: [["average", "avg", "mean"], ["sale price"]]
+    expected_exact_value: "59.75"
     min_keyword: 1.0
     expected_citation_kind: bigquery
     expected_final_agent: data_agent

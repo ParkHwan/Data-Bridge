@@ -9,7 +9,7 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Protocol
 
-from databridge.confluence.adapter import page_to_source_document
+from databridge.confluence.adapter import page_has_only_children_extension, page_to_source_document
 from databridge.confluence.ancestors import AncestorResolver
 from databridge.confluence.exceptions import (
     BatchAlreadyRunningError,
@@ -91,6 +91,7 @@ class BatchResult:
     deleted_sources: int
     elapsed_seconds: float
     skipped_pages: int = 0
+    suppressed_pages: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +151,7 @@ async def _run_locked(
     total_chunks = 0
     vertex_calls = 0
     skipped_pages = 0
+    suppressed_pages = 0
 
     for page_id in descendant_ids:
         page = await client.get_page(page_id, body_format="atlas_doc_format")
@@ -158,6 +160,14 @@ async def _run_locked(
                 f"Page {page.id} belongs to space {page.space_id!r}, expected {space.id!r}"
             )
         resolver.seed_page(page)
+        if page_has_only_children_extension(page, parser=parser):
+            logger.info(
+                "Suppressing children-only Confluence page: page_id=%s title=%r",
+                page.id,
+                page.title,
+            )
+            suppressed_pages += 1
+            continue
         ancestors = await resolver.resolve(page.parent_id, page.parent_type)
         breadcrumb = " > ".join(ancestors) or None
         try:
@@ -211,7 +221,7 @@ async def _run_locked(
     elapsed = time.monotonic() - started
     logger.info(
         "Confluence ingest complete: space=%s pages=%s chunks=%s vertex_calls=%s "
-        "deleted_sources=%s elapsed_seconds=%.3f skipped_pages=%s",
+        "deleted_sources=%s elapsed_seconds=%.3f skipped_pages=%s suppressed_pages=%s",
         config.space_key,
         len(prepared),
         total_chunks,
@@ -219,6 +229,7 @@ async def _run_locked(
         len(stale),
         elapsed,
         skipped_pages,
+        suppressed_pages,
     )
     return BatchResult(
         pages=len(prepared),
@@ -227,6 +238,7 @@ async def _run_locked(
         deleted_sources=len(stale),
         elapsed_seconds=elapsed,
         skipped_pages=skipped_pages,
+        suppressed_pages=suppressed_pages,
     )
 
 

@@ -1,8 +1,9 @@
-"""Pure offline coverage for the v2 golden evaluation safety net."""
+"""Pure offline coverage for the versioned golden evaluation safety net."""
 
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Never
@@ -14,6 +15,7 @@ from databridge.evals.adapter import run_item, snapshot_result
 from databridge.evals.evaluator import EvaluationStatus, _matching_table_rows, evaluate
 from databridge.evals.observation import CitationSnapshot, Observation, TraceSnapshot
 from databridge.evals.schema import GoldenItem, GoldenSchemaError, GoldenSet, load_golden
+from databridge.evals.space import GoldenSpaceError, configure_golden_space
 
 ROOT = Path(__file__).parents[1]
 
@@ -112,11 +114,14 @@ def _data_observation(**updates: Any) -> Observation:
     return Observation(**raw)
 
 
-def test_demo_golden_is_explicit_v2_with_seven_migrated_and_four_new_items() -> None:
+def test_demo_golden_is_explicit_v3_with_seven_migrated_and_four_new_items() -> None:
     golden = load_golden(ROOT / "evals" / "demo_golden.yaml")
-    assert golden.version == 2
+    assert golden.version == 3
+    assert golden.space_key == "DEMO"
     assert [item.id for item in golden.items] == [f"DG-{index:03d}" for index in range(1, 12)]
     assert [item.kind for item in golden.items[7:]] == ["data", "data", "report", "refusal"]
+    assert golden.items[7].expected_exact_value == 5
+    assert golden.items[8].expected_exact_value == "59.75"
 
 
 def test_migrated_seven_items_pass_equivalent_offline_fixtures() -> None:
@@ -491,12 +496,61 @@ def test_refusal_rejects_positive_and_unobservable_fields(field: str) -> None:
 
 def test_schema_rejects_bool_version_duplicate_ids_and_empty_items() -> None:
     item = _refusal_item()
-    with pytest.raises(ValidationError, match="integer 2"):
+    with pytest.raises(ValidationError, match="integer 2 or 3"):
         GoldenSet.model_validate({"version": True, "items": [item]})
     with pytest.raises(ValidationError, match="unique"):
         GoldenSet(version=2, items=(item, item))
     with pytest.raises(ValidationError, match="non-empty"):
         GoldenSet(version=2, items=())
+
+
+def test_golden_v2_defaults_to_demo_and_v3_requires_explicit_space() -> None:
+    item = _refusal_item()
+    legacy = GoldenSet.model_validate({"version": 2, "items": [item]})
+    assert legacy.space_key == "DEMO"
+    with pytest.raises(ValidationError, match="requires top-level space_key"):
+        GoldenSet.model_validate({"version": 3, "items": [item]})
+    with pytest.raises(ValidationError, match="does not allow top-level space_key"):
+        GoldenSet.model_validate({"version": 2, "space_key": "MFS", "items": [item]})
+
+
+def test_configure_golden_space_sets_absent_env_and_verifies_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("DATABRIDGE_SPACE", raising=False)
+    actual = configure_golden_space(
+        golden_space="MFS",
+        cli_space="MFS",
+        get_actual_space=lambda: os.environ["DATABRIDGE_SPACE"],
+    )
+    assert actual == "MFS"
+
+
+@pytest.mark.parametrize(
+    ("cli_space", "env_space", "actual_space", "message"),
+    [
+        ("DEMO", None, "MFS", "--space"),
+        (None, "DEMO", "MFS", "DATABRIDGE_SPACE"),
+        (None, None, "DEMO", "runtime space"),
+    ],
+)
+def test_configure_golden_space_rejects_every_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    cli_space: str | None,
+    env_space: str | None,
+    actual_space: str,
+    message: str,
+) -> None:
+    if env_space is None:
+        monkeypatch.delenv("DATABRIDGE_SPACE", raising=False)
+    else:
+        monkeypatch.setenv("DATABRIDGE_SPACE", env_space)
+    with pytest.raises(GoldenSpaceError, match=message):
+        configure_golden_space(
+            golden_space="MFS",
+            cli_space=cli_space,
+            get_actual_space=lambda: actual_space,
+        )
 
 
 def test_data_schema_requires_an_answer_assertion() -> None:

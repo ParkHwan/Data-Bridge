@@ -109,8 +109,10 @@ class ADFParser:
             return self._render_table(node, depth)
         if kind in {"tableRow", "tableCell", "tableHeader"}:
             return children()
-        if kind in {"panel", "expand", "nestedExpand"}:
+        if kind == "panel":
             return self._render_container(node, context, depth)
+        if kind in {"expand", "nestedExpand"}:
+            return self._render_expand(node, context, depth)
         if kind in {"media", "mediaInline", "mediaSingle", "mediaGroup"}:
             return self._render_media(node, context, depth)
         if kind == "emoji":
@@ -268,6 +270,15 @@ class ADFParser:
         prefix = f"**{label}:**\n\n" if label else ""
         quoted = "\n".join(f"> {line}" if line else ">" for line in body.splitlines())
         return f"{prefix}{quoted}\n\n"
+
+    def _render_expand(self, node: ADFNode, context: _RenderContext, depth: int) -> str:
+        """Flatten disclosure content so nested headings remain chunk anchors."""
+        body = self._normalize_blocks(self._render_nodes(node.content, context, depth + 1)).strip()
+        if not body:
+            return ""
+        title = self._string(node.attrs.get("title"))
+        prefix = f"**{title}:**\n\n" if title else ""
+        return f"{prefix}{body}\n\n"
 
     def _render_media(self, node: ADFNode, context: _RenderContext, depth: int) -> str:
         if node.type not in {"media", "mediaInline"}:

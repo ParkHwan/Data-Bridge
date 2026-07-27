@@ -32,3 +32,28 @@ def page_to_source_document(
         body=markdown,
         breadcrumb=breadcrumb,
     )
+
+
+def page_has_only_children_extension(page: Page, *, parser: ADFParser | None = None) -> bool:
+    """Return whether the ADF body is solely a non-content children macro."""
+    body_format = page.body.atlas_doc_format if page.body is not None else None
+    raw = body_format.value if body_format is not None else None
+    if raw is None or not raw.strip():
+        return False
+    document = (parser or ADFParser()).parse_json(raw)
+    meaningful_nodes = [
+        node
+        for node in document.content
+        # Confluence commonly leaves an empty trailing paragraph after a macro.
+        # Keep every other empty-looking node (for example, rule) conservatively.
+        if not (node.type == "paragraph" and not node.text and not node.content)
+    ]
+    if len(meaningful_nodes) != 1:
+        return False
+    node = meaningful_nodes[0]
+    return (
+        node.type in {"extension", "bodiedExtension", "inlineExtension"}
+        and str(node.attrs.get("extensionKey", "")).strip().casefold() == "children"
+        and not node.content
+        and not node.text
+    )
