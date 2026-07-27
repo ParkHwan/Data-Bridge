@@ -11,7 +11,9 @@ from databridge.evals.evaluator import EvaluationResult, EvaluationStatus, evalu
 from databridge.evals.observation import (
     CitationKind,
     CitationSnapshot,
+    DocumentEvidenceSnapshot,
     Observation,
+    RefusalDiagnosticsSnapshot,
     TraceKind,
     TraceSnapshot,
 )
@@ -38,6 +40,46 @@ class _TraceLike(Protocol):
 
     @property
     def detail(self) -> str: ...
+
+
+class _DocumentEvidenceLike(Protocol):
+    @property
+    def source_id(self) -> str: ...
+
+    @property
+    def heading(self) -> str | None: ...
+
+
+class RefusalDiagnosticsLike(Protocol):
+    @property
+    def trace(self) -> Sequence[_TraceLike]: ...
+
+    @property
+    def documents(self) -> Sequence[_DocumentEvidenceLike]: ...
+
+    @property
+    def search_result_counts(self) -> Sequence[int | None]: ...
+
+    @property
+    def bq_evidence_count(self) -> int: ...
+
+    @property
+    def final_text_empty(self) -> bool: ...
+
+    @property
+    def final_text_length(self) -> int: ...
+
+    @property
+    def citation_count(self) -> int: ...
+
+    @property
+    def answer_empty(self) -> bool: ...
+
+    @property
+    def referenced_refs(self) -> Sequence[int]: ...
+
+    @property
+    def resolving_ref_count(self) -> int: ...
 
 
 class TeamResultLike(Protocol):
@@ -96,6 +138,43 @@ def snapshot_result(result: TeamResultLike) -> Observation:
             for step in result.trace
         ),
         dropped_claims=tuple(result.dropped_claims),
+    )
+
+
+def snapshot_refusal(
+    message: str, diagnostics: RefusalDiagnosticsLike | None
+) -> Observation:
+    """Preserve safe runtime diagnostics while keeping evals framework-independent."""
+    if diagnostics is None:
+        return Observation(outcome="refusal", error_message=message)
+    return Observation(
+        outcome="refusal",
+        error_message=message,
+        trace=tuple(
+            TraceSnapshot(
+                agent=step.agent,
+                kind=cast(TraceKind, step.kind),
+                detail=step.detail,
+            )
+            for step in diagnostics.trace
+        ),
+        refusal_diagnostics=RefusalDiagnosticsSnapshot(
+            documents=tuple(
+                DocumentEvidenceSnapshot(
+                    source_id=document.source_id,
+                    heading=document.heading,
+                )
+                for document in diagnostics.documents
+            ),
+            search_result_counts=tuple(diagnostics.search_result_counts),
+            bq_evidence_count=diagnostics.bq_evidence_count,
+            final_text_empty=diagnostics.final_text_empty,
+            final_text_length=diagnostics.final_text_length,
+            citation_count=diagnostics.citation_count,
+            answer_empty=diagnostics.answer_empty,
+            referenced_refs=tuple(diagnostics.referenced_refs),
+            resolving_ref_count=diagnostics.resolving_ref_count,
+        ),
     )
 
 

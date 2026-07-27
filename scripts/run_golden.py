@@ -22,6 +22,7 @@ from databridge.agents.runtime import NoEvidenceError, ask_async  # noqa: E402
 from databridge.evals.adapter import (  # noqa: E402
     ItemRun,
     run_item,
+    snapshot_refusal,
     snapshot_result,
 )
 from databridge.evals.observation import Observation  # noqa: E402
@@ -37,7 +38,7 @@ async def _observe(question: str, *, item_timeout: float) -> Observation:
         result = await asyncio.wait_for(ask_async(question), timeout=item_timeout)
         return snapshot_result(result)
     except NoEvidenceError as exc:
-        return Observation(outcome="refusal", error_message=str(exc))
+        return snapshot_refusal(str(exc), exc.diagnostics)
     except Exception as exc:
         return Observation(
             outcome="error",
@@ -69,6 +70,22 @@ def _print_item(run: ItemRun) -> None:
         print(f"    C: {[citation.source_id for citation in observation.citations]}")
     if observation.outcome == "refusal" and observation.error_message:
         print(f"    R: {observation.error_message}")
+        diagnostics = observation.refusal_diagnostics
+        if diagnostics is not None:
+            tools = [
+                step.detail for step in observation.trace if step.kind == "tool_call"
+            ]
+            print(
+                "    D: "
+                f"tools={tools} search_results={list(diagnostics.search_result_counts)} "
+                f"docs={len(diagnostics.documents)} bq={diagnostics.bq_evidence_count} "
+                f"citations={diagnostics.citation_count} "
+                f"answer_empty={diagnostics.answer_empty} "
+                f"final_empty={diagnostics.final_text_empty} "
+                f"final_len={diagnostics.final_text_length} "
+                f"refs={list(diagnostics.referenced_refs)} "
+                f"resolving_refs={diagnostics.resolving_ref_count}"
+            )
 
 
 async def _run_all(

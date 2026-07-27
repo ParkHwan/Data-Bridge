@@ -44,6 +44,17 @@ def evaluate(item: GoldenItem, observation: Observation) -> EvaluationResult:
 
     if item.kind == "refusal":
         if observation.outcome == "refusal":
+            if (
+                observation.refusal_diagnostics is not None
+                and not _has_completed_tool(observation.trace, "search_knowledge")
+            ):
+                return EvaluationResult(
+                    item_id=item.id,
+                    status=EvaluationStatus.FAIL,
+                    failures=(
+                        "refusal_process: search_knowledge was not completed before refusal",
+                    ),
+                )
             return EvaluationResult(item_id=item.id, status=EvaluationStatus.REFUSAL_OK)
         return EvaluationResult(
             item_id=item.id,
@@ -212,6 +223,14 @@ def _find_step(
         if step.kind == kind and step.detail == detail:
             return index
     return None
+
+
+def _has_completed_tool(steps: tuple[TraceSnapshot, ...], tool: str) -> bool:
+    step_list = list(steps)
+    call_index = _find_step(step_list, 0, kind="tool_call", detail=tool)
+    return call_index is not None and _find_step(
+        step_list, call_index + 1, kind="tool_result", detail=tool
+    ) is not None
 
 
 def _evaluate_exact_value(
