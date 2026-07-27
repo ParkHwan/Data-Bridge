@@ -38,6 +38,9 @@ The Confluence ingest path is real code as of
 [v0.2.4](docs/releases/v0.2.4.md) — a batch Cloud Run job (`src/databridge/confluence/`) that pulls
 a folder over the REST v2 API and converts ADF → Markdown. Its live demo runs against a
 self-authored space only (D-10); the sample corpus above still drives the local quick start.
+[v0.2.5](docs/releases/v0.2.5.md) hardened that path from real operation: an empty page no longer
+fails the nightly run, the Cloud SQL DSN moved to Secret Manager, and the serving space now has a
+declared default in `scripts/setup_cicd.sh` (the release note documents how to change it).
 
 ### Data Agent guardrails (all enforced in code, never left to the model)
 
