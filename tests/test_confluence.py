@@ -584,6 +584,55 @@ async def test_batch_replaces_all_pages_before_safe_gc() -> None:
 
 
 @pytest.mark.asyncio
+async def test_batch_skips_empty_page_and_ingests_remaining_pages() -> None:
+    empty = _page("empty", body=_adf({"type": "paragraph"}))
+    store = _BatchStore()
+    result = await run_confluence_batch(
+        client=_BatchClient([_page("p1"), empty]),
+        store=store,
+        embedder=HashedEmbedder(),
+        config=ConfluenceBatchConfig(space_key="CONF_DEMO", folder_id="folder-1"),
+    )
+    assert result.pages == 1
+    assert result.skipped_pages == 1
+    assert store.events[1:] == ["replace:p1", "list", "unlock"]
+
+
+@pytest.mark.asyncio
+async def test_batch_preserves_existing_source_for_skipped_empty_page() -> None:
+    empty = _page("empty", body=_adf({"type": "paragraph"}))
+    store = _BatchStore({"empty", "stale"})
+    await run_confluence_batch(
+        client=_BatchClient([_page("p1"), empty]),
+        store=store,
+        embedder=HashedEmbedder(),
+        config=ConfluenceBatchConfig(space_key="CONF_DEMO", folder_id="folder-1"),
+    )
+    assert "delete:empty" not in store.events
+    assert "delete:stale" in store.events
+
+
+@pytest.mark.asyncio
+async def test_batch_rejects_all_empty_pages_without_store_mutation() -> None:
+    pages = [
+        _page("empty-1", body=_adf({"type": "paragraph"})),
+        _page("empty-2", body=_adf({"type": "paragraph"})),
+    ]
+    store = _BatchStore({"empty-1", "stale"})
+    with pytest.raises(BatchSafetyError, match="All pages produced no content"):
+        await run_confluence_batch(
+            client=_BatchClient(pages),
+            store=store,
+            embedder=HashedEmbedder(),
+            config=ConfluenceBatchConfig(space_key="CONF_DEMO", folder_id="folder-1"),
+        )
+    assert store.events == [
+        "lock:databridge:confluence:CONF_DEMO:folder-1",
+        "unlock",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_batch_failure_never_mutates_or_garbage_collects() -> None:
     store = _BatchStore({"stale"})
     with pytest.raises(ConfluenceAPIError):
