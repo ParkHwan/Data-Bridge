@@ -1,4 +1,4 @@
-"""Run the v2 golden set against the live team and evaluate observable contracts.
+"""Run a versioned golden set against the live team and evaluate observable contracts.
 
 Usage:
     docker compose up -d && <ingest first>
@@ -17,6 +17,7 @@ from pathlib import Path
 os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "TRUE")
 os.environ.setdefault("GOOGLE_CLOUD_LOCATION", "us-central1")
 
+from databridge.agents.deps import get_deps  # noqa: E402
 from databridge.agents.runtime import NoEvidenceError, ask_async  # noqa: E402
 from databridge.evals.adapter import (  # noqa: E402
     ItemRun,
@@ -25,6 +26,10 @@ from databridge.evals.adapter import (  # noqa: E402
 )
 from databridge.evals.observation import Observation  # noqa: E402
 from databridge.evals.schema import GoldenItem, GoldenSchemaError, load_golden  # noqa: E402
+from databridge.evals.space import (  # noqa: E402
+    GoldenSpaceError,
+    configure_golden_space,
+)
 
 
 async def _observe(question: str, *, item_timeout: float) -> Observation:
@@ -79,8 +84,9 @@ async def _run_all(
 
 def _parse_args() -> argparse.Namespace:
     root = Path(__file__).parents[1]
-    parser = argparse.ArgumentParser(description="Run the live Data Bridge v2 golden set")
+    parser = argparse.ArgumentParser(description="Run the live Data Bridge golden set")
     parser.add_argument("--golden", type=Path, default=root / "evals" / "demo_golden.yaml")
+    parser.add_argument("--space", help="Assert the golden set's search space (never overrides it)")
     parser.add_argument("--item-timeout", type=float, default=120.0)
     parser.add_argument("--total-timeout", type=float, default=1200.0)
     return parser.parse_args()
@@ -96,6 +102,17 @@ def main() -> int:
     except GoldenSchemaError as exc:
         print(exc, file=sys.stderr)
         return 2
+
+    try:
+        actual_space = configure_golden_space(
+            golden_space=golden.space_key,
+            cli_space=args.space,
+            get_actual_space=lambda: get_deps().space_key,
+        )
+    except GoldenSpaceError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    print(f"space: {actual_space}")
 
     started = time.monotonic()
     try:

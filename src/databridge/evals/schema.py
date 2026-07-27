@@ -20,11 +20,11 @@ _REPORT_HEADERS = ("Owner", "Action", "Due", "Source")
 
 
 class GoldenSchemaError(ValueError):
-    """Raised when a golden YAML file violates the v2 contract."""
+    """Raised when a golden YAML file violates its versioned contract."""
 
 
 class GoldenItem(BaseModel):
-    """One fully validated v2 golden item."""
+    """One fully validated golden item."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -247,19 +247,28 @@ class GoldenItem(BaseModel):
 
 
 class GoldenSet(BaseModel):
-    """Top-level v2 golden document."""
+    """Top-level versioned golden document."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     version: int
+    space_key: str = "DEMO"
     items: tuple[GoldenItem, ...]
 
     @field_validator("version", mode="before")
     @classmethod
     def _validate_version(cls, value: object) -> object:
-        if isinstance(value, bool) or value != 2:
-            raise ValueError("version must be the integer 2")
+        if isinstance(value, bool) or value not in {2, 3}:
+            raise ValueError("version must be the integer 2 or 3")
         return value
+
+    @field_validator("space_key")
+    @classmethod
+    def _validate_space_key(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("space_key must be non-empty")
+        return stripped
 
     @field_validator("items")
     @classmethod
@@ -271,9 +280,18 @@ class GoldenSet(BaseModel):
             raise ValueError("golden item ids must be unique")
         return value
 
+    @model_validator(mode="after")
+    def _validate_versioned_space_contract(self) -> GoldenSet:
+        declared = "space_key" in self.model_fields_set
+        if self.version == 3 and not declared:
+            raise ValueError("golden schema v3 requires top-level space_key")
+        if self.version == 2 and declared:
+            raise ValueError("golden schema v2 does not allow top-level space_key")
+        return self
+
 
 def load_golden(path: Path) -> GoldenSet:
-    """Load and strictly validate a UTF-8 YAML v2 golden file."""
+    """Load and strictly validate a UTF-8 golden file."""
 
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))

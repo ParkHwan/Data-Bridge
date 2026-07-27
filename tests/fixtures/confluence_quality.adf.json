@@ -1,0 +1,95 @@
+{
+  "type": "doc",
+  "version": 1,
+  "content": [
+    {
+      "type": "heading",
+      "attrs": {"level": 2},
+      "content": [{"type": "text", "text": "Vision"}]
+    },
+    {
+      "type": "paragraph",
+      "content": [{"type": "text", "text": "Synthetic quality contract."}]
+    },
+    {
+      "type": "heading",
+      "attrs": {"level": 3},
+      "content": [{"type": "text", "text": "Pipeline"}]
+    },
+    {
+      "type": "codeBlock",
+      "attrs": {"language": "python"},
+      "content": [{"type": "text", "text": "print('quality')"}]
+    },
+    {
+      "type": "table",
+      "content": [
+        {
+          "type": "tableRow",
+          "content": [
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Stage"}]}]},
+            {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Owner"}]}]}
+          ]
+        },
+        {
+          "type": "tableRow",
+          "content": [
+            {"type": "tableCell", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Parse"}]}]},
+            {"type": "tableCell", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Ada"}]}]}
+          ]
+        }
+      ]
+    },
+    {
+      "type": "mediaSingle",
+      "content": [
+        {"type": "media", "attrs": {"id": "media-1", "alt": "Architecture"}}
+      ]
+    },
+    {
+      "type": "paragraph",
+      "content": [
+        {"type": "text", "text": "Reference: "},
+        {"type": "inlineCard", "attrs": {"url": "https://example.test/card"}}
+      ]
+    },
+    {
+      "type": "extension",
+      "attrs": {"extensionKey": "children"}
+    },
+    {
+      "type": "expand",
+      "attrs": {"title": "Details"},
+      "content": [
+        {
+          "type": "heading",
+          "attrs": {"level": 4},
+          "content": [{"type": "text", "text": "Expanded Matrix"}]
+        },
+        {
+          "type": "paragraph",
+          "content": [{"type": "text", "text": "Expanded evidence."}]
+        },
+        {
+          "type": "table",
+          "content": [
+            {
+              "type": "tableRow",
+              "content": [
+                {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Signal"}]}]},
+                {"type": "tableHeader", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Value"}]}]}
+              ]
+            },
+            {
+              "type": "tableRow",
+              "content": [
+                {"type": "tableCell", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Recall"}]}]},
+                {"type": "tableCell", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "High"}]}]}
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

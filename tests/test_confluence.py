@@ -5,13 +5,17 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 import respx
 
-from databridge.confluence.adapter import page_to_source_document
+from databridge.confluence.adapter import (
+    page_has_only_children_extension,
+    page_to_source_document,
+)
 from databridge.confluence.ancestors import AncestorResolver
 from databridge.confluence.batch import ConfluenceBatchConfig, run_confluence_batch
 from databridge.confluence.client import ConfluenceClient
@@ -25,7 +29,9 @@ from databridge.confluence.exceptions import (
 from databridge.confluence.models import Body, BodyFormat, Page, Space
 from databridge.confluence.parser import ADFParser
 from databridge.embed import HashedEmbedder
-from databridge.ingest.chunker import Chunk
+from databridge.ingest.chunker import Chunk, chunk_document
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def _text(value: str, *, marks: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -260,7 +266,7 @@ x = 1
 
 **Details:**
 
-> More
+More
 
 | Name | Owner |
 | --- | --- |
@@ -437,6 +443,96 @@ def test_adapter_rejects_missing_and_rendered_empty_bodies() -> None:
         page_to_source_document(empty, space_key="CONF_DEMO", breadcrumb=None)
 
 
+def test_children_extension_classifier_requires_the_macro_to_be_the_only_content() -> None:
+    children = _page(
+        "container",
+        body=_adf({"type": "extension", "attrs": {"extensionKey": "children"}}),
+    )
+    children_with_empty_paragraph = _page(
+        "container-with-trailing-paragraph",
+        body=_adf(
+            {"type": "extension", "attrs": {"extensionKey": "children"}},
+            {"type": "paragraph"},
+        ),
+    )
+    with_text = _page(
+        "content",
+        body=_adf(
+            {"type": "extension", "attrs": {"extensionKey": "children"}},
+            _paragraph("Meaningful body"),
+        ),
+    )
+    with_heading = _page(
+        "content-with-heading",
+        body=_adf(
+            {"type": "heading", "attrs": {"level": 2}, "content": [_text("Heading")]},
+            {"type": "extension", "attrs": {"extensionKey": "children"}},
+        ),
+    )
+    literal = _page("literal", body=_adf(_paragraph("[children]")))
+
+    assert page_has_only_children_extension(children)
+    assert page_has_only_children_extension(children_with_empty_paragraph)
+    assert not page_has_only_children_extension(with_text)
+    assert not page_has_only_children_extension(with_heading)
+    assert not page_has_only_children_extension(literal)
+
+
+def test_synthetic_adf_contract_preserves_quality_critical_structure() -> None:
+    body = (FIXTURES / "confluence_quality.adf.json").read_text(encoding="utf-8")
+    page = _page(
+        "quality-fixture",
+        title="Quality Fixture",
+        body=body,
+    )
+    document = page_to_source_document(
+        page,
+        space_key="FIXTURE",
+        breadcrumb="Lab > Data Processing",
+    )
+
+    markdown = document.body
+    assert "## Vision" in markdown
+    assert "### Pipeline" in markdown
+    assert "#### Expanded Matrix" in markdown
+    assert "```python\nprint('quality')\n```" in markdown
+    table_lines = [line for line in markdown.splitlines() if line.startswith("|")]
+    assert len(table_lines) == 6
+    assert not any(line.startswith("> |") for line in markdown.splitlines())
+    assert "[Architecture (attachment media-1)]" in markdown
+    assert "[https://example.test/card](https://example.test/card)" in markdown
+    assert "[children]" in markdown
+
+    chunks = chunk_document(document)
+    assert [chunk.heading for chunk in chunks] == [
+        "Vision",
+        "Vision > Pipeline",
+        "Vision > Pipeline > Expanded Matrix",
+    ]
+    assert all(chunk.heading for chunk in chunks)
+    assert all(chunk.source_id == "quality-fixture" for chunk in chunks)
+    assert all(chunk.space_key == "FIXTURE" for chunk in chunks)
+    assert all(chunk.breadcrumb == "Lab > Data Processing" for chunk in chunks)
+    assert not page_has_only_children_extension(page)
+
+
+@pytest.mark.parametrize("kind", ["expand", "nestedExpand"])
+def test_expand_variants_flatten_body_without_changing_panel_contract(kind: str) -> None:
+    fixture = _adf(
+        {
+            "type": kind,
+            "attrs": {"title": "Details"},
+            "content": [
+                {"type": "heading", "attrs": {"level": 2}, "content": [_text("Anchor")]},
+                _paragraph("Body"),
+            ],
+        }
+    )
+    markdown = ADFParser().to_markdown(ADFParser().parse_json(fixture))
+    assert markdown == "**Details:**\n\n## Anchor\n\nBody"
+    assert ">" not in markdown
+
+
 class _AncestorClient:
     def __init__(
         self,
@@ -610,6 +706,46 @@ async def test_batch_preserves_existing_source_for_skipped_empty_page() -> None:
     )
     assert "delete:empty" not in store.events
     assert "delete:stale" in store.events
+
+
+@pytest.mark.asyncio
+async def test_batch_suppresses_children_only_page_and_garbage_collects_old_chunk() -> None:
+    container = _page(
+        "container",
+        body=_adf({"type": "extension", "attrs": {"extensionKey": "children"}}),
+    )
+    store = _BatchStore({"container"})
+    result = await run_confluence_batch(
+        client=_BatchClient([_page("p1"), container]),
+        store=store,
+        embedder=HashedEmbedder(),
+        config=ConfluenceBatchConfig(space_key="CONF_DEMO", folder_id="folder-1"),
+    )
+
+    assert result.pages == 1
+    assert result.skipped_pages == 0
+    assert result.suppressed_pages == 1
+    assert store.events[1:] == ["replace:p1", "list", "delete:container", "unlock"]
+
+
+@pytest.mark.asyncio
+async def test_batch_rejects_all_suppressed_pages_without_store_mutation() -> None:
+    container = _page(
+        "container",
+        body=_adf({"type": "extension", "attrs": {"extensionKey": "children"}}),
+    )
+    store = _BatchStore({"container"})
+    with pytest.raises(BatchSafetyError, match="All pages produced no content"):
+        await run_confluence_batch(
+            client=_BatchClient([container]),
+            store=store,
+            embedder=HashedEmbedder(),
+            config=ConfluenceBatchConfig(space_key="CONF_DEMO", folder_id="folder-1"),
+        )
+    assert store.events == [
+        "lock:databridge:confluence:CONF_DEMO:folder-1",
+        "unlock",
+    ]
 
 
 @pytest.mark.asyncio
