@@ -200,3 +200,10 @@ COMMIT;
 
 Re-run the report and golden checks before resuming the scheduler. Generation and profile
 rows are audit/rollback state and must remain even when their chunk count reaches zero.
+
+On the **first** migration of a space there is no preserved generation to restore: the prior
+state was the unprovable legacy `NULL` rows removed in step 5, and the verified building
+generation is the only complete copy. Rolling back there means returning the service to
+`observe` — the block above would match zero rows and abort, which is the correct outcome
+rather than something to work around. A preserved generation exists from the second
+migration onward.
