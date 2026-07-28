@@ -119,6 +119,10 @@ do not copy a generation id between spaces.
    PY
    ```
 
+   Activation does not use operator-authored SQL: `activate_generation()` validates the
+   same-space building target and matching profile, checks that activation updated exactly
+   one row, and lets any exception roll back the connection transaction.
+
 7. Switch the service to `strict`; the environment update creates a new revision. Confirm
    startup preflight succeeds before restoring scheduled writes:
 
@@ -140,22 +144,59 @@ generation report differs from the verified build. Pause the scheduler first, re
 service to `observe`, and atomically restore the preserved generation while holding the
 same space lock used by the application:
 
+Open `psql` with variables supplied separately so values are safely quoted at the only
+substitution points outside the dollar-quoted `DO` body:
+
+```sh
+psql "$DATABRIDGE_DSN" \
+  --set=ON_ERROR_STOP=1 \
+  --set=space_key="$SPACE_KEY" \
+  --set=previous_generation_id="$PREVIOUS_GENERATION_ID"
+```
+
+Then run the following block in that session. `SET LOCAL` transfers the psql variables
+into transaction-local PostgreSQL settings because psql does not substitute variables
+inside a dollar-quoted body. If the restore target is absent, belongs to another space,
+or is not retired, the `RAISE` aborts the transaction before `COMMIT`:
+
 ```sql
 BEGIN;
+SET LOCAL databridge.rollback_space_key = :'space_key';
+SET LOCAL databridge.rollback_generation_id = :'previous_generation_id';
 SELECT pg_advisory_xact_lock(
-  hashtextextended('databridge:embedding-profile:' || :'space_key', 0)
+  hashtextextended(
+    'databridge:embedding-profile:'
+      || current_setting('databridge.rollback_space_key'),
+    0
+  )
 );
-UPDATE space_generation
-SET state = 'retired'
-WHERE space_key = :'space_key' AND state = 'active';
-UPDATE space_generation
-SET state = 'active', activated_at = now()
-WHERE space_key = :'space_key'
-  AND generation_id = :'previous_generation_id'
-  AND state = 'retired';
+DO $rollback$
+DECLARE
+  restored_rows INTEGER;
+BEGIN
+  UPDATE space_generation
+  SET state = 'retired'
+  WHERE space_key = current_setting('databridge.rollback_space_key')
+    AND state = 'active';
+
+  UPDATE space_generation
+  SET state = 'active', activated_at = now()
+  WHERE space_key = current_setting('databridge.rollback_space_key')
+    AND generation_id = current_setting(
+      'databridge.rollback_generation_id'
+    )::BIGINT
+    AND state = 'retired';
+  GET DIAGNOSTICS restored_rows = ROW_COUNT;
+
+  IF restored_rows <> 1 THEN
+    RAISE EXCEPTION
+      'rollback target must match exactly one retired generation; matched %',
+      restored_rows;
+  END IF;
+END
+$rollback$;
 COMMIT;
 ```
 
-Require the final `UPDATE` to affect exactly one row. Re-run the report and golden checks
-before resuming the scheduler. Generation and profile rows are audit/rollback state and
-must remain even when their chunk count reaches zero.
+Re-run the report and golden checks before resuming the scheduler. Generation and profile
+rows are audit/rollback state and must remain even when their chunk count reaches zero.

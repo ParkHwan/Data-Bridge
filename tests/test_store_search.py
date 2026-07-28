@@ -112,24 +112,26 @@ def test_upsert_search_and_space_isolation() -> None:
     store = _store()
     store.ensure_schema()
     embedder = HashedEmbedder()
+    space_a = _unique_space("SPACE_A")
+    space_b = _unique_space("SPACE_B")
 
     docs = [
-        _doc("t-rollback", "SPACE_A", "rollback procedure error rate release profile"),
-        _doc("t-pricing", "SPACE_A", "pricing per seat usage events enterprise fee"),
-        _doc("t-other", "SPACE_B", "rollback procedure in another space"),
+        _doc("t-rollback", space_a, "rollback procedure error rate release profile"),
+        _doc("t-pricing", space_a, "pricing per seat usage events enterprise fee"),
+        _doc("t-other", space_b, "rollback procedure in another space"),
     ]
     for doc in docs:
         _replace(store, embedder, doc)
 
     query = embedder.embed(["how do I rollback a release"])[0]
 
-    hits_a = store.search(query, space_key="SPACE_A", top_k=2)
+    hits_a = store.search(query, space_key=space_a, top_k=2)
     assert hits_a and hits_a[0].source_id == "t-rollback"
-    assert all(h.space_key == "SPACE_A" for h in hits_a)
+    assert all(h.space_key == space_a for h in hits_a)
 
     # atomic replace is idempotent — row count stays stable
     count = _replace(store, embedder, docs[0])
-    hits_again = store.search(query, space_key="SPACE_A", top_k=5)
+    hits_again = store.search(query, space_key=space_a, top_k=5)
     assert len([h for h in hits_again if h.source_id == "t-rollback"]) == count
 
 
@@ -138,56 +140,62 @@ def test_same_source_id_in_two_spaces_do_not_clobber() -> None:
     store = _store()
     store.ensure_schema()
     embedder = HashedEmbedder()
+    space_a = _unique_space("ISO_A")
+    space_b = _unique_space("ISO_B")
 
-    doc_a = _doc("t-shared", "ISO_A", "alpha content about deployment")
-    doc_b = _doc("t-shared", "ISO_B", "beta content about pricing")
+    doc_a = _doc("t-shared", space_a, "alpha content about deployment")
+    doc_b = _doc("t-shared", space_b, "beta content about pricing")
     _replace(store, embedder, doc_a)
     _replace(store, embedder, doc_b)
 
     q = embedder.embed(["deployment"])[0]
-    hits_a = store.search(q, space_key="ISO_A", top_k=5)
-    hits_b = store.search(q, space_key="ISO_B", top_k=5)
+    hits_a = store.search(q, space_key=space_a, top_k=5)
+    hits_b = store.search(q, space_key=space_b, top_k=5)
     assert {h.source_id for h in hits_a} == {"t-shared"}
     assert {h.source_id for h in hits_b} == {"t-shared"}
     assert hits_a[0].content != hits_b[0].content
 
     # scoped delete removes only one space's copy
-    deleted = store.delete_source(space_key="ISO_A", source_id="t-shared")
+    deleted = store.delete_source(space_key=space_a, source_id="t-shared")
     assert deleted > 0
-    assert store.search(q, space_key="ISO_A", top_k=5) == []
-    assert store.search(q, space_key="ISO_B", top_k=5) != []
+    assert store.search(q, space_key=space_a, top_k=5) == []
+    assert store.search(q, space_key=space_b, top_k=5) != []
 
 
 def test_list_source_ids_and_advisory_lock_are_space_scoped() -> None:
     store = _store()
     store.ensure_schema()
     embedder = HashedEmbedder()
-    _replace(store, embedder, _doc("list-a", "LIST_A", "alpha"))
-    _replace(store, embedder, _doc("list-b", "LIST_A", "beta"))
-    _replace(store, embedder, _doc("list-other", "LIST_B", "gamma"))
+    space_a = _unique_space("LIST_A")
+    space_b = _unique_space("LIST_B")
+    lock_key = _unique_space("test-list-lock")
+    _replace(store, embedder, _doc("list-a", space_a, "alpha"))
+    _replace(store, embedder, _doc("list-b", space_a, "beta"))
+    _replace(store, embedder, _doc("list-other", space_b, "gamma"))
 
-    assert store.list_source_ids(space_key="LIST_A") == {"list-a", "list-b"}
-    with store.advisory_lock("test-list-lock") as first:
+    assert store.list_source_ids(space_key=space_a) == {"list-a", "list-b"}
+    with store.advisory_lock(lock_key) as first:
         assert first is True
-        with store.advisory_lock("test-list-lock") as second:
+        with store.advisory_lock(lock_key) as second:
             assert second is False
-    with store.advisory_lock("test-list-lock") as reacquired:
+    with store.advisory_lock(lock_key) as reacquired:
         assert reacquired is True
 
 
 def test_search_validates_inputs() -> None:
     store = _store()
     store.ensure_schema()
+    space = _unique_space("VALIDATION")
     with pytest.raises(ValueError, match="dimension"):
-        store.search([0.0] * 3, space_key="VALIDATION", top_k=1)
+        store.search([0.0] * 3, space_key=space, top_k=1)
     with pytest.raises(ValueError, match="top_k"):
-        store.search([0.0] * 768, space_key="VALIDATION", top_k=0)
+        store.search([0.0] * 768, space_key=space, top_k=0)
 
 
 def test_hybrid_search_fuses_signals_and_honors_top_k() -> None:
     store = _store()
     store.ensure_schema()
-    space = "HYBRID_FUSION_TEST"
+    space = _unique_space("HYBRID_FUSION_TEST")
     chunks = [
         Chunk("both#0", "both", space, "both", "S", None, "exactterm", 0),
         Chunk("vector#0", "vector", space, "vector", "S", None, "unrelated", 0),
@@ -226,14 +234,16 @@ def test_hybrid_search_space_isolation_and_vector_only_degradation() -> None:
     store = _store()
     store.ensure_schema()
     embedder = HashedEmbedder()
-    doc_a = _doc("hybrid-a", "HYBRID_ISO_A", "alpha deployment procedure")
-    doc_b = _doc("hybrid-b", "HYBRID_ISO_B", "beta pricing policy")
+    space_a = _unique_space("HYBRID_ISO_A")
+    space_b = _unique_space("HYBRID_ISO_B")
+    doc_a = _doc("hybrid-a", space_a, "alpha deployment procedure")
+    doc_b = _doc("hybrid-b", space_b, "beta pricing policy")
     _replace(store, embedder, doc_a)
     _replace(store, embedder, doc_b)
     query = embedder.embed(["!!!"])[0]
 
     hits = store.search_hybrid(
-        query, "!!!", space_key="HYBRID_ISO_A", top_k=1, candidate_k=2
+        query, "!!!", space_key=space_a, top_k=1, candidate_k=2
     )
     assert len(hits) == 1
     assert hits[0].source_id == "hybrid-a"
@@ -244,19 +254,20 @@ def test_hybrid_search_validates_inputs() -> None:
     store = _store()
     store.ensure_schema()
     embedding = [0.0] * 768
+    space = _unique_space("VALIDATION")
     with pytest.raises(ValueError, match="dimension"):
-        store.search_hybrid([0.0] * 3, "query", space_key="VALIDATION")
+        store.search_hybrid([0.0] * 3, "query", space_key=space)
     with pytest.raises(ValueError, match="top_k"):
-        store.search_hybrid(embedding, "query", space_key="VALIDATION", top_k=0)
+        store.search_hybrid(embedding, "query", space_key=space, top_k=0)
     with pytest.raises(ValueError, match="candidate_k"):
         store.search_hybrid(
-            embedding, "query", space_key="VALIDATION", top_k=5, candidate_k=4
+            embedding, "query", space_key=space, top_k=5, candidate_k=4
         )
     with pytest.raises(ValueError, match="rrf_k"):
-        store.search_hybrid(embedding, "query", space_key="VALIDATION", rrf_k=0)
+        store.search_hybrid(embedding, "query", space_key=space, rrf_k=0)
     with pytest.raises(ValueError, match="trgm_threshold"):
         store.search_hybrid(
-            embedding, "query", space_key="VALIDATION", trgm_threshold=1.5
+            embedding, "query", space_key=space, trgm_threshold=1.5
         )
 
 
@@ -270,7 +281,7 @@ def test_hybrid_korean_josa_recall_via_trigram() -> None:
     store = _store()
     store.ensure_schema()
     embedder = HashedEmbedder()
-    space = "KO_TRGM_TEST"
+    space = _unique_space("KO_TRGM_TEST")
     doc = SourceDocument(
         source_id="ko-deploy",
         title="ko-deploy",
@@ -294,7 +305,7 @@ def test_hybrid_three_source_fusion() -> None:
     """All three signals (vector, FTS, trigram) contribute independently."""
     store = _store()
     store.ensure_schema()
-    space = "TRI_FUSION_TEST"
+    space = _unique_space("TRI_FUSION_TEST")
     query = [1.0] + [0.0] * 767
     # kw: FTS + trigram hit on "exactterm", vector far (opposite embedding).
     store.replace_source(
