@@ -47,8 +47,9 @@ class SearchHit:
 
 
 class PgVectorStore:
-    def __init__(self, dsn: str) -> None:
+    def __init__(self, dsn: str, *, profile: EmbeddingProfile | None = None) -> None:
         self._dsn = dsn
+        self._profile = profile
 
     def _connect(self, *, register: bool = True) -> psycopg.Connection:
         conn = psycopg.connect(self._dsn)
@@ -225,6 +226,153 @@ class PgVectorStore:
         )
         row = cur.fetchone()
         return None if row is None else cls._generation_from_row(row)
+
+    def _require_profile(self) -> EmbeddingProfile:
+        if self._profile is None:
+            raise RuntimeError("Embedding profile is required for vector operations")
+        return self._profile
+
+    @staticmethod
+    def _assert_matching_profile(generation: Generation, profile: EmbeddingProfile) -> None:
+        if generation.profile != profile:
+            raise EmbeddingProfileMismatchError(
+                "Embedding profile does not match the target generation"
+            )
+
+    def _resolve_write_generation(
+        self,
+        cur: psycopg.Cursor,
+        *,
+        space_key: str,
+        generation_id: int | None,
+        allow_empty_bootstrap: bool,
+    ) -> Generation:
+        """Resolve and validate a write target while the space xact lock is held."""
+        profile = self._require_profile()
+        if generation_id is not None:
+            generation = self._get_generation(
+                cur,
+                space_key=space_key,
+                generation_id=generation_id,
+                for_update=True,
+            )
+            if generation is None:
+                raise EmbeddingProfileMismatchError(
+                    "Target embedding generation does not exist in this space"
+                )
+            self._assert_matching_profile(generation, profile)
+            if generation.state is not GenerationState.BUILDING:
+                raise EmbeddingProfileMismatchError(
+                    "Explicit write target must be a building generation"
+                )
+            return generation
+
+        active = self._get_active_generation(cur, space_key=space_key, for_update=True)
+        if active is not None:
+            self._assert_matching_profile(active, profile)
+            return active
+
+        cur.execute("SELECT EXISTS (SELECT 1 FROM chunks WHERE space_key = %s)", (space_key,))
+        row = cur.fetchone()
+        populated = bool(row and row[0])
+        if populated or not allow_empty_bootstrap:
+            raise EmbeddingProfileMismatchError(
+                "No active embedding generation is available for this space"
+            )
+
+        profile_id = self._ensure_profile(cur, profile)
+        cur.execute(
+            """
+            INSERT INTO space_generation
+                (space_key, profile_id, state, activated_at)
+            VALUES (%s, %s, 'active', now())
+            RETURNING generation_id
+            """,
+            (space_key, profile_id),
+        )
+        created = cur.fetchone()
+        if created is None:
+            raise RuntimeError("Failed to create the initial embedding generation")
+        generation = self._get_generation(
+            cur,
+            space_key=space_key,
+            generation_id=int(created[0]),
+            for_update=True,
+        )
+        if generation is None:
+            raise RuntimeError("Created embedding generation could not be read back")
+        return generation
+
+    def create_building_generation(self, *, space_key: str) -> Generation:
+        """Create an inactive generation for an explicit clean rebuild."""
+        profile = self._require_profile()
+        with self._connect() as conn, conn.cursor() as cur:
+            self._lock_space_for_update(cur, space_key)
+            profile_id = self._ensure_profile(cur, profile)
+            cur.execute(
+                """
+                INSERT INTO space_generation (space_key, profile_id, state)
+                VALUES (%s, %s, 'building')
+                RETURNING generation_id
+                """,
+                (space_key, profile_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise RuntimeError("Failed to create building embedding generation")
+            generation = self._get_generation(
+                cur,
+                space_key=space_key,
+                generation_id=int(row[0]),
+                for_update=True,
+            )
+            if generation is None:
+                raise RuntimeError("Created embedding generation could not be read back")
+            return generation
+
+    def activate_generation(self, *, space_key: str, generation_id: int) -> Generation:
+        """Atomically retire the current generation and activate a verified build."""
+        profile = self._require_profile()
+        with self._connect() as conn, conn.cursor() as cur:
+            self._lock_space_for_update(cur, space_key)
+            target = self._get_generation(
+                cur,
+                space_key=space_key,
+                generation_id=generation_id,
+                for_update=True,
+            )
+            if target is None or target.state is not GenerationState.BUILDING:
+                raise EmbeddingProfileMismatchError(
+                    "Only a building generation in this space can be activated"
+                )
+            self._assert_matching_profile(target, profile)
+            cur.execute(
+                """
+                UPDATE space_generation
+                   SET state = 'retired'
+                 WHERE space_key = %s AND state = 'active'
+                """,
+                (space_key,),
+            )
+            cur.execute(
+                """
+                UPDATE space_generation
+                   SET state = 'active', activated_at = now()
+                 WHERE space_key = %s AND generation_id = %s AND state = 'building'
+                """,
+                (space_key, generation_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("Embedding generation activation did not update one row")
+            activated = self._get_generation(
+                cur,
+                space_key=space_key,
+                generation_id=generation_id,
+                for_update=True,
+            )
+            if activated is None:
+                raise RuntimeError("Activated embedding generation could not be read back")
+            return activated
 
     @staticmethod
     def _validate_batch(chunks: list[Chunk], embeddings: list[list[float]]) -> None:
