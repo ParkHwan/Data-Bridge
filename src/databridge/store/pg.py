@@ -50,16 +50,28 @@ class SearchHit:
 
 
 class PgVectorStore:
+    _profile: EmbeddingProfile | None
+    _mode: ProfileMode | None
+
     def __init__(
         self,
         dsn: str,
         *,
-        profile: EmbeddingProfile | None = None,
-        mode: ProfileMode = ProfileMode.OBSERVE,
+        profile: EmbeddingProfile,
+        mode: ProfileMode,
     ) -> None:
         self._dsn = dsn
         self._profile = profile
         self._mode = mode
+
+    @classmethod
+    def for_migration(cls, dsn: str) -> PgVectorStore:
+        """Create a schema-only store without requiring runtime embedding config."""
+        store = cls.__new__(cls)
+        store._dsn = dsn
+        store._profile = None
+        store._mode = None
+        return store
 
     def _connect(self, *, register: bool = True) -> psycopg.Connection:
         conn = psycopg.connect(self._dsn)
@@ -270,8 +282,13 @@ class PgVectorStore:
 
     def _require_profile(self) -> EmbeddingProfile:
         if self._profile is None:
-            raise RuntimeError("Embedding profile is required for vector operations")
+            raise RuntimeError("Migration-only store cannot perform vector operations")
         return self._profile
+
+    def preflight(self, *, space_key: str) -> None:
+        """Validate runtime provenance before startup or a top-level query."""
+        with self._connect() as conn, conn.cursor() as cur:
+            self._resolve_search_generation(cur, space_key=space_key)
 
     @staticmethod
     def _assert_matching_profile(generation: Generation, profile: EmbeddingProfile) -> None:

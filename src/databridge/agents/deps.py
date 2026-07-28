@@ -11,7 +11,7 @@ import os
 from dataclasses import dataclass
 
 from databridge.embed import Embedder, resolve_embedder
-from databridge.store import PgVectorStore
+from databridge.store import PgVectorStore, resolve_profile_mode
 
 DEFAULT_DSN = "postgresql://databridge:databridge@localhost:5433/databridge"
 DEFAULT_SPACE = "DEMO"
@@ -41,8 +41,13 @@ def set_deps(deps: AgentDeps) -> None:
 
 
 def _build_default() -> AgentDeps:
+    embedder = resolve_embedder()
     return AgentDeps(
-        store=PgVectorStore(os.environ.get("DATABRIDGE_DSN", DEFAULT_DSN)),
-        embedder=resolve_embedder(),
+        store=PgVectorStore(
+            os.environ.get("DATABRIDGE_DSN", DEFAULT_DSN),
+            profile=embedder.profile,
+            mode=resolve_profile_mode(),
+        ),
+        embedder=embedder,
         space_key=os.environ.get("DATABRIDGE_SPACE", DEFAULT_SPACE),
     )
