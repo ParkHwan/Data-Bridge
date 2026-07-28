@@ -18,6 +18,12 @@ from databridge.embed import (
 )
 from databridge.embed.base import make_config_fingerprint
 from databridge.embed.vertex import _MODEL, VertexEmbedder
+from databridge.store import (
+    PgVectorStore,
+    ProfileMode,
+    ProfileModeConfigurationError,
+    resolve_profile_mode,
+)
 
 _ROOT = Path(__file__).parents[1]
 
@@ -98,18 +104,66 @@ def test_confluence_ingest_uses_shared_resolver(monkeypatch: pytest.MonkeyPatch)
 
 
 def test_agent_runtime_uses_shared_resolver(monkeypatch: pytest.MonkeyPatch) -> None:
-    sentinel = object()
+    sentinel = HashedEmbedder()
     monkeypatch.setattr(deps, "resolve_embedder", lambda: sentinel)
+    monkeypatch.setattr(deps, "resolve_profile_mode", lambda: ProfileMode.OBSERVE)
     built = deps._build_default()
     assert built.embedder is sentinel
 
 
+def test_profile_mode_resolver_requires_explicit_value() -> None:
+    with pytest.raises(ProfileModeConfigurationError, match="is required"):
+        resolve_profile_mode({})
+    with pytest.raises(ProfileModeConfigurationError, match="is required"):
+        resolve_profile_mode({"DATABRIDGE_PROFILE_MODE": "  "})
+
+
+def test_profile_mode_resolver_rejects_typo_and_normalizes_valid_value() -> None:
+    with pytest.raises(ProfileModeConfigurationError, match="Unsupported"):
+        resolve_profile_mode({"DATABRIDGE_PROFILE_MODE": "enforce"})
+    assert (
+        resolve_profile_mode({"DATABRIDGE_PROFILE_MODE": " STRICT "})
+        is ProfileMode.STRICT
+    )
+
+
+def test_migration_store_rejects_vector_reads_and_writes_without_connecting() -> None:
+    store = PgVectorStore.for_migration("postgresql://unreachable.invalid/db")
+    with pytest.raises(RuntimeError, match="Migration-only"):
+        store.search([0.0] * EMBEDDING_DIM, space_key="TEST")
+    with pytest.raises(RuntimeError, match="Migration-only"):
+        store.list_source_ids(space_key="TEST")
+    with pytest.raises(RuntimeError, match="Migration-only"):
+        store.replace_source(
+            space_key="TEST", source_id="source", chunks=[], embeddings=[]
+        )
+    with pytest.raises(RuntimeError, match="Migration-only"), store.advisory_lock("test"):
+        pass
+
+
+def test_search_apis_require_space_key_before_store_access() -> None:
+    store = PgVectorStore.for_migration("postgresql://unreachable.invalid/db")
+    with pytest.raises(TypeError, match="space_key"):
+        store.search([0.0] * EMBEDDING_DIM)  # type: ignore[call-arg]
+    with pytest.raises(TypeError, match="space_key"):
+        store.search_hybrid(  # type: ignore[call-arg]
+            [0.0] * EMBEDDING_DIM,
+            "query",
+        )
+
+
 def test_iac_pins_embedder_for_all_runtime_resources() -> None:
     script = (_ROOT / "scripts" / "setup_cicd.sh").read_text()
-    assert "--update-env-vars \"DATABRIDGE_EMBEDDER=vertex\"" in script
+    assert (
+        "--update-env-vars \"DATABRIDGE_EMBEDDER=vertex,"
+        "DATABRIDGE_PROFILE_MODE=observe\""
+    ) in script
+    assert "DATABRIDGE_PROFILE_MODE=observe" in script
     assert (
         "--update-env-vars \"DATABRIDGE_SPACE=${DATABRIDGE_SPACE},"
-        "DATABRIDGE_EMBEDDER=vertex\""
+        "DATABRIDGE_EMBEDDER=vertex,DATABRIDGE_PROFILE_MODE=observe\""
     ) in script
     assert '"$SERVICE_EMBEDDER" == "vertex"' in script
+    assert '"$SERVICE_PROFILE_MODE" == "observe"' in script
     assert script.count("DATABRIDGE_EMBEDDER=vertex") >= 4
+    assert script.count("DATABRIDGE_PROFILE_MODE=observe") >= 4

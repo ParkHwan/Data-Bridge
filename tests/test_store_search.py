@@ -3,14 +3,24 @@
 from __future__ import annotations
 
 import os
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote
 
 import psycopg
 import pytest
 
-from databridge.embed import HashedEmbedder
+from databridge.embed import EmbeddingProfile, HashedEmbedder
+from databridge.embed.base import make_config_fingerprint
 from databridge.ingest.chunker import Chunk, chunk_document
 from databridge.ingest.markdown import SourceDocument
-from databridge.store import PgVectorStore
+from databridge.store import (
+    EmbeddingProfileMismatchError,
+    GenerationState,
+    PgVectorStore,
+    ProfileMode,
+)
 
 DSN = os.environ.get("DATABRIDGE_DSN", "postgresql://databridge:databridge@localhost:5433/databridge")
 
@@ -35,18 +45,71 @@ def _doc(source_id: str, space: str, text: str) -> SourceDocument:
     )
 
 
-def _replace(store: PgVectorStore, embedder: HashedEmbedder, doc: SourceDocument) -> int:
+def _store(
+    *,
+    profile: EmbeddingProfile | None = None,
+    mode: ProfileMode = ProfileMode.STRICT,
+) -> PgVectorStore:
+    return PgVectorStore(
+        DSN,
+        profile=profile or HashedEmbedder().profile,
+        mode=mode,
+    )
+
+
+def _other_profile() -> EmbeddingProfile:
+    provider = "hashed"
+    model = "hashed-test-alternate"
+    dimension = 768
+    return EmbeddingProfile(
+        provider=provider,
+        model=model,
+        dimension=dimension,
+        config_fingerprint=make_config_fingerprint(
+            provider=provider,
+            model=model,
+            dimension=dimension,
+            options={"variant": "alternate"},
+        ),
+    )
+
+
+def _unique_space(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def _insert_legacy_chunk(space: str, source_id: str = "legacy") -> None:
+    vector = "[" + ",".join(["0"] * 768) + "]"
+    with psycopg.connect(DSN) as conn:
+        conn.execute(
+            """
+            INSERT INTO chunks
+                (space_key, generation_id, chunk_id, source_id, title, content, embedding)
+            VALUES (%s, NULL, %s, %s, %s, %s, %s::vector)
+            """,
+            (space, f"{source_id}#0", source_id, source_id, "legacy body", vector),
+        )
+
+
+def _replace(
+    store: PgVectorStore,
+    embedder: HashedEmbedder,
+    doc: SourceDocument,
+    *,
+    generation_id: int | None = None,
+) -> int:
     chunks = chunk_document(doc)
     return store.replace_source(
         space_key=doc.space_key,
         source_id=doc.source_id,
         chunks=chunks,
         embeddings=embedder.embed([c.embedding_text for c in chunks]),
+        generation_id=generation_id,
     )
 
 
 def test_upsert_search_and_space_isolation() -> None:
-    store = PgVectorStore(DSN)
+    store = _store()
     store.ensure_schema()
     embedder = HashedEmbedder()
 
@@ -64,11 +127,6 @@ def test_upsert_search_and_space_isolation() -> None:
     assert hits_a and hits_a[0].source_id == "t-rollback"
     assert all(h.space_key == "SPACE_A" for h in hits_a)
 
-    # Unfiltered search spans spaces. The shared dev DB may hold other corpora
-    # (e.g. DEMO samples), so assert superset membership, not equality.
-    hits_all = store.search(query, top_k=50)
-    assert {"SPACE_A", "SPACE_B"} <= {h.space_key for h in hits_all}
-
     # atomic replace is idempotent — row count stays stable
     count = _replace(store, embedder, docs[0])
     hits_again = store.search(query, space_key="SPACE_A", top_k=5)
@@ -77,7 +135,7 @@ def test_upsert_search_and_space_isolation() -> None:
 
 def test_same_source_id_in_two_spaces_do_not_clobber() -> None:
     """Post-review P1: mutations honor space isolation (composite PK)."""
-    store = PgVectorStore(DSN)
+    store = _store()
     store.ensure_schema()
     embedder = HashedEmbedder()
 
@@ -101,7 +159,7 @@ def test_same_source_id_in_two_spaces_do_not_clobber() -> None:
 
 
 def test_list_source_ids_and_advisory_lock_are_space_scoped() -> None:
-    store = PgVectorStore(DSN)
+    store = _store()
     store.ensure_schema()
     embedder = HashedEmbedder()
     _replace(store, embedder, _doc("list-a", "LIST_A", "alpha"))
@@ -118,16 +176,16 @@ def test_list_source_ids_and_advisory_lock_are_space_scoped() -> None:
 
 
 def test_search_validates_inputs() -> None:
-    store = PgVectorStore(DSN)
+    store = _store()
     store.ensure_schema()
     with pytest.raises(ValueError, match="dimension"):
-        store.search([0.0] * 3, top_k=1)
+        store.search([0.0] * 3, space_key="VALIDATION", top_k=1)
     with pytest.raises(ValueError, match="top_k"):
-        store.search([0.0] * 768, top_k=0)
+        store.search([0.0] * 768, space_key="VALIDATION", top_k=0)
 
 
 def test_hybrid_search_fuses_signals_and_honors_top_k() -> None:
-    store = PgVectorStore(DSN)
+    store = _store()
     store.ensure_schema()
     space = "HYBRID_FUSION_TEST"
     chunks = [
@@ -165,7 +223,7 @@ def test_hybrid_search_fuses_signals_and_honors_top_k() -> None:
 
 
 def test_hybrid_search_space_isolation_and_vector_only_degradation() -> None:
-    store = PgVectorStore(DSN)
+    store = _store()
     store.ensure_schema()
     embedder = HashedEmbedder()
     doc_a = _doc("hybrid-a", "HYBRID_ISO_A", "alpha deployment procedure")
@@ -183,19 +241,23 @@ def test_hybrid_search_space_isolation_and_vector_only_degradation() -> None:
 
 
 def test_hybrid_search_validates_inputs() -> None:
-    store = PgVectorStore(DSN)
+    store = _store()
     store.ensure_schema()
     embedding = [0.0] * 768
     with pytest.raises(ValueError, match="dimension"):
-        store.search_hybrid([0.0] * 3, "query")
+        store.search_hybrid([0.0] * 3, "query", space_key="VALIDATION")
     with pytest.raises(ValueError, match="top_k"):
-        store.search_hybrid(embedding, "query", top_k=0)
+        store.search_hybrid(embedding, "query", space_key="VALIDATION", top_k=0)
     with pytest.raises(ValueError, match="candidate_k"):
-        store.search_hybrid(embedding, "query", top_k=5, candidate_k=4)
+        store.search_hybrid(
+            embedding, "query", space_key="VALIDATION", top_k=5, candidate_k=4
+        )
     with pytest.raises(ValueError, match="rrf_k"):
-        store.search_hybrid(embedding, "query", rrf_k=0)
+        store.search_hybrid(embedding, "query", space_key="VALIDATION", rrf_k=0)
     with pytest.raises(ValueError, match="trgm_threshold"):
-        store.search_hybrid(embedding, "query", trgm_threshold=1.5)
+        store.search_hybrid(
+            embedding, "query", space_key="VALIDATION", trgm_threshold=1.5
+        )
 
 
 def test_hybrid_korean_josa_recall_via_trigram() -> None:
@@ -205,7 +267,7 @@ def test_hybrid_korean_josa_recall_via_trigram() -> None:
     terms ``배포``/``완료`` share no token with the chunk — english FTS finds nothing.
     Character trigrams match the substrings, so the trigram source recovers the chunk.
     """
-    store = PgVectorStore(DSN)
+    store = _store()
     store.ensure_schema()
     embedder = HashedEmbedder()
     space = "KO_TRGM_TEST"
@@ -230,7 +292,7 @@ def test_hybrid_korean_josa_recall_via_trigram() -> None:
 
 def test_hybrid_three_source_fusion() -> None:
     """All three signals (vector, FTS, trigram) contribute independently."""
-    store = PgVectorStore(DSN)
+    store = _store()
     store.ensure_schema()
     space = "TRI_FUSION_TEST"
     query = [1.0] + [0.0] * 767
@@ -256,3 +318,280 @@ def test_hybrid_three_source_fusion() -> None:
     assert by_id["kw"].trgm_rank is not None
     assert by_id["vec"].fts_rank is None
     assert by_id["vec"].trgm_rank is None
+
+
+def test_profile_and_generation_survive_last_source_deletion() -> None:
+    store = _store()
+    store.ensure_schema()
+    space = _unique_space("PRESERVE")
+    _replace(store, HashedEmbedder(), _doc("only", space, "one source"))
+    before = store.profile_report(space_key=space)
+
+    assert store.delete_source(space_key=space, source_id="only") > 0
+    after = store.profile_report(space_key=space)
+
+    assert after.active_generation_id == before.active_generation_id
+    assert after.distinct_profile_count == 1
+    assert sum(item.chunk_count for item in after.generation_chunk_counts) == 0
+
+
+def test_strict_mismatch_rejects_read_and_preflight_before_query() -> None:
+    writer = _store()
+    writer.ensure_schema()
+    space = _unique_space("STRICT_MISMATCH")
+    embedder = HashedEmbedder()
+    _replace(writer, embedder, _doc("source", space, "retained evidence"))
+    incompatible = _store(profile=_other_profile(), mode=ProfileMode.STRICT)
+
+    with pytest.raises(EmbeddingProfileMismatchError):
+        incompatible.preflight(space_key=space)
+    with pytest.raises(EmbeddingProfileMismatchError):
+        incompatible.search(embedder.embed(["evidence"])[0], space_key=space)
+
+
+def test_observe_mismatch_reads_active_generation_and_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    writer = _store()
+    writer.ensure_schema()
+    space = _unique_space("OBSERVE_MISMATCH")
+    embedder = HashedEmbedder()
+    _replace(writer, embedder, _doc("source", space, "observable evidence"))
+    observer = _store(profile=_other_profile(), mode=ProfileMode.OBSERVE)
+
+    with caplog.at_level("WARNING"):
+        observer.preflight(space_key=space)
+        hits = observer.search(embedder.embed(["evidence"])[0], space_key=space)
+
+    assert hits
+    assert "profile mismatch observed" in caplog.text
+
+
+def test_populated_legacy_space_is_not_automatically_labelled() -> None:
+    store = _store()
+    store.ensure_schema()
+    space = _unique_space("LEGACY_REJECT")
+    _insert_legacy_chunk(space)
+
+    with pytest.raises(EmbeddingProfileMismatchError, match="No active"):
+        _replace(store, HashedEmbedder(), _doc("new", space, "new body"))
+
+    with psycopg.connect(DSN) as conn:
+        row = conn.execute(
+            "SELECT count(*) FROM chunks WHERE space_key = %s AND generation_id IS NULL",
+            (space,),
+        ).fetchone()
+    assert row == (1,)
+
+
+def test_legacy_null_chunks_are_not_active_in_either_mode(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    strict = _store()
+    strict.ensure_schema()
+    space = _unique_space("LEGACY_READ")
+    _insert_legacy_chunk(space)
+    query = HashedEmbedder().embed(["legacy"])[0]
+
+    with pytest.raises(EmbeddingProfileMismatchError):
+        strict.search(query, space_key=space)
+    observe = _store(mode=ProfileMode.OBSERVE)
+    with caplog.at_level("WARNING"):
+        assert observe.search(query, space_key=space) == []
+    assert "No active embedding generation" in caplog.text
+
+
+def test_generation_build_is_isolated_until_atomic_activation() -> None:
+    store = _store()
+    store.ensure_schema()
+    embedder = HashedEmbedder()
+    space = _unique_space("ACTIVATE")
+    _replace(store, embedder, _doc("shared", space, "old active content"))
+    old_active = store.profile_report(space_key=space).active_generation_id
+    building = store.create_building_generation(space_key=space)
+    _replace(
+        store,
+        embedder,
+        _doc("shared", space, "new building content"),
+        generation_id=building.generation_id,
+    )
+
+    assert store.list_source_ids(space_key=space) == {"shared"}
+    assert store.list_source_ids(
+        space_key=space, generation_id=building.generation_id
+    ) == {"shared"}
+    assert "old active" in store.search(
+        embedder.embed(["content"])[0], space_key=space
+    )[0].content
+
+    activated = store.activate_generation(
+        space_key=space, generation_id=building.generation_id
+    )
+    report = store.profile_report(space_key=space)
+    assert activated.state is GenerationState.ACTIVE
+    assert report.active_generation_id == building.generation_id
+    assert report.active_generation_id != old_active
+    assert "new building" in store.search(
+        embedder.embed(["content"])[0], space_key=space
+    )[0].content
+
+
+def test_active_and_building_gc_are_source_isolated() -> None:
+    store = _store()
+    store.ensure_schema()
+    embedder = HashedEmbedder()
+    space = _unique_space("GEN_GC")
+    _replace(store, embedder, _doc("active-only", space, "active"))
+    building = store.create_building_generation(space_key=space)
+    _replace(
+        store,
+        embedder,
+        _doc("build-only", space, "building"),
+        generation_id=building.generation_id,
+    )
+
+    assert store.delete_source(
+        space_key=space,
+        source_id="build-only",
+        generation_id=building.generation_id,
+    ) > 0
+    assert store.list_source_ids(space_key=space) == {"active-only"}
+    assert store.list_source_ids(
+        space_key=space, generation_id=building.generation_id
+    ) == set()
+
+
+def test_failed_activation_preserves_existing_active_pointer() -> None:
+    store = _store()
+    store.ensure_schema()
+    space = _unique_space("FAILED_ACTIVATE")
+    _replace(store, HashedEmbedder(), _doc("active", space, "active"))
+    active_before = store.profile_report(space_key=space).active_generation_id
+
+    with pytest.raises(EmbeddingProfileMismatchError):
+        store.activate_generation(space_key=space, generation_id=9_223_372_036_854_775_000)
+
+    assert store.profile_report(space_key=space).active_generation_id == active_before
+
+
+def test_profile_mismatch_fails_before_replace_delete() -> None:
+    writer = _store()
+    writer.ensure_schema()
+    embedder = HashedEmbedder()
+    space = _unique_space("PREDELETE")
+    _replace(writer, embedder, _doc("source", space, "must survive"))
+    incompatible = _store(profile=_other_profile())
+
+    with pytest.raises(EmbeddingProfileMismatchError):
+        _replace(incompatible, embedder, _doc("source", space, "must not replace"))
+
+    hits = writer.search(embedder.embed(["survive"])[0], space_key=space)
+    assert hits and "must survive" in hits[0].content
+
+
+def test_concurrent_initial_writers_share_one_active_generation() -> None:
+    schema_store = _store()
+    schema_store.ensure_schema()
+    embedder = HashedEmbedder()
+    space = _unique_space("FIRST_WRITER")
+    barrier = threading.Barrier(2)
+
+    def write(source_id: str) -> int:
+        barrier.wait()
+        return _replace(_store(), embedder, _doc(source_id, space, source_id))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(write, ["one", "two"]))
+
+    report = schema_store.profile_report(space_key=space)
+    assert results == [1, 1]
+    assert report.active_generation_id is not None
+    active_counts = [
+        item for item in report.generation_chunk_counts if item.state is GenerationState.ACTIVE
+    ]
+    assert len(active_counts) == 1
+    assert schema_store.list_source_ids(space_key=space) == {"one", "two"}
+
+
+def test_writer_activation_race_is_serialized() -> None:
+    store = _store()
+    store.ensure_schema()
+    embedder = HashedEmbedder()
+    space = _unique_space("ACTIVATION_RACE")
+    _replace(store, embedder, _doc("old", space, "old"))
+    building = store.create_building_generation(space_key=space)
+    barrier = threading.Barrier(2)
+
+    def write() -> str:
+        barrier.wait()
+        try:
+            _replace(
+                _store(),
+                embedder,
+                _doc("racing", space, "racing"),
+                generation_id=building.generation_id,
+            )
+        except EmbeddingProfileMismatchError:
+            return "activation-won"
+        return "writer-won"
+
+    def activate() -> int:
+        barrier.wait()
+        return _store().activate_generation(
+            space_key=space, generation_id=building.generation_id
+        ).generation_id
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        write_future = pool.submit(write)
+        activate_future = pool.submit(activate)
+        write_outcome = write_future.result()
+        activated_id = activate_future.result()
+
+    assert write_outcome in {"writer-won", "activation-won"}
+    assert activated_id == building.generation_id
+    assert store.profile_report(space_key=space).active_generation_id == building.generation_id
+
+
+def test_existing_legacy_schema_migrates_idempotently_without_backfill() -> None:
+    schema = f"migration_{uuid.uuid4().hex}"
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        conn.execute(f'CREATE SCHEMA "{schema}"')
+        conn.execute(f'SET search_path TO "{schema}", public')
+        conn.execute(
+            """
+            CREATE TABLE chunks (
+                space_key TEXT NOT NULL,
+                chunk_id TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                heading TEXT,
+                breadcrumb TEXT,
+                content TEXT NOT NULL,
+                embedding vector(768) NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (space_key, chunk_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO chunks
+                (space_key, chunk_id, source_id, title, content, embedding)
+            VALUES ('LEGACY', 'legacy#0', 'legacy', 'legacy', 'body',
+                    ('[' || repeat('0,', 767) || '0]')::vector)
+            """
+        )
+    separator = "&" if "?" in DSN else "?"
+    scoped_dsn = f"{DSN}{separator}options={quote(f'-csearch_path={schema},public')}"
+    migration_store = PgVectorStore.for_migration(scoped_dsn)
+    try:
+        migration_store.ensure_schema()
+        migration_store.ensure_schema()
+        with psycopg.connect(scoped_dsn) as conn:
+            row = conn.execute(
+                "SELECT generation_id, id IS NOT NULL FROM chunks WHERE chunk_id='legacy#0'"
+            ).fetchone()
+        assert row == (None, True)
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute(f'DROP SCHEMA "{schema}" CASCADE')

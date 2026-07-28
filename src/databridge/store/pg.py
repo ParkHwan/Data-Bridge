@@ -107,6 +107,7 @@ class PgVectorStore:
         Delete + insert run in a single transaction (post-review P1: separate
         delete/upsert calls could leave a source empty on mid-ingest failure).
         """
+        self._require_profile()
         self._validate_batch(chunks, embeddings)
         for chunk in chunks:
             if chunk.space_key != space_key or chunk.source_id != source_id:
@@ -139,6 +140,7 @@ class PgVectorStore:
         self, *, space_key: str, source_id: str, generation_id: int | None = None
     ) -> int:
         """Space-scoped delete — mutations honor space isolation (post-review P1)."""
+        self._require_profile()
         with self._connect() as conn, conn.cursor() as cur:
             self._lock_space_for_update(cur, space_key)
             generation = self._resolve_write_generation(
@@ -160,6 +162,7 @@ class PgVectorStore:
         self, *, space_key: str, generation_id: int | None = None
     ) -> set[str]:
         """Return the distinct sources currently stored in one isolated space."""
+        self._require_profile()
         with self._connect() as conn, conn.cursor() as cur:
             generation = self._resolve_read_target(
                 cur, space_key=space_key, generation_id=generation_id
@@ -177,6 +180,7 @@ class PgVectorStore:
     @contextmanager
     def advisory_lock(self, key: str) -> Iterator[bool]:
         """Hold a session-level advisory lock for the entire context lifetime."""
+        self._require_profile()
         with self._connect(register=False) as conn, conn.cursor() as cur:
             cur.execute("SELECT pg_try_advisory_lock(hashtextextended(%s, 0))", (key,))
             row = cur.fetchone()
@@ -294,6 +298,7 @@ class PgVectorStore:
 
     def preflight(self, *, space_key: str) -> None:
         """Validate runtime provenance before startup or a top-level query."""
+        self._require_profile()
         with self._connect() as conn, conn.cursor() as cur:
             self._resolve_search_generation(cur, space_key=space_key)
             report = self._profile_report(cur, space_key=space_key)
@@ -301,6 +306,7 @@ class PgVectorStore:
 
     def profile_report(self, *, space_key: str) -> SpaceProfileReport:
         """Return an operational provenance report for one space."""
+        self._require_profile()
         with self._connect() as conn, conn.cursor() as cur:
             return self._profile_report(cur, space_key=space_key)
 
@@ -626,6 +632,7 @@ class PgVectorStore:
         top_k: int = 5,
     ) -> list[SearchHit]:
         """Cosine-distance search within one active, profile-checked generation."""
+        self._require_profile()
         if len(query_embedding) != EMBEDDING_DIM:
             msg = f"query embedding dimension {len(query_embedding)} != {EMBEDDING_DIM}"
             raise ValueError(msg)
@@ -684,6 +691,7 @@ class PgVectorStore:
         Like the FTS path, it degrades gracefully to an empty list when nothing clears
         ``trgm_threshold``; RRF simply fuses whichever sources produced candidates.
         """
+        self._require_profile()
         if len(query_embedding) != EMBEDDING_DIM:
             msg = f"query embedding dimension {len(query_embedding)} != {EMBEDDING_DIM}"
             raise ValueError(msg)

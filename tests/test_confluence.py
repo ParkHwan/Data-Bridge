@@ -716,6 +716,25 @@ async def test_batch_replaces_all_pages_before_safe_gc() -> None:
 
 
 @pytest.mark.asyncio
+async def test_batch_logs_and_uses_explicit_target_generation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = _BatchStore({"stale"})
+    with caplog.at_level("INFO"):
+        await run_confluence_batch(
+            client=_BatchClient([_page("p1")]),
+            store=store,
+            embedder=HashedEmbedder(),
+            config=ConfluenceBatchConfig(space_key="CONF_DEMO", folder_id="folder-1"),
+            generation_id=77,
+        )
+
+    assert store.generation_ids == [77, 77, 77]
+    assert "space=CONF_DEMO generation_id=77" in caplog.text
+    assert "Embedding provenance batch report" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_batch_skips_empty_page_and_ingests_remaining_pages() -> None:
     empty = _page("empty", body=_adf({"type": "paragraph"}))
     store = _BatchStore()
