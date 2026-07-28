@@ -60,8 +60,8 @@ docker compose up -d
 uv pip install -e ".[server,gcp,dev]"
 
 # 2) ingest the sample corpus
-#    Set DATABRIDGE_EMBEDDER to the SAME value in step 3 — the defaults differ
-#    (ingest: hashed, runtime: vertex) and a mismatch fails silently, not loudly.
+#    DATABRIDGE_EMBEDDER is required. Use the SAME value in step 3 so ingestion
+#    and queries operate in the same vector space.
 DATABRIDGE_EMBEDDER=hashed uv run python scripts/ingest_samples.py
 
 # 3) serve. The hashed embedder keeps embedding local, but the agents still call
@@ -90,16 +90,16 @@ green only when every item passes (`PASS`/`FAIL`/`REFUSAL_OK`/`ERROR`). Latest o
 `bigquery-public-data.thelook_ecommerce`, which is not a static snapshot, so the agent's answer was
 right and the pin was stale.
 
-**Run the ingest and the query path with the same embedder.** `DATABRIDGE_EMBEDDER` currently
-defaults to `hashed` in `scripts/ingest_samples.py` and to `vertex` in the agent runtime. Both
-produce 768 dimensions, so a mismatch raises no error — it just ranks against a different vector
-space. Earlier reports of `DG-004` instability were measured under that mismatch; after
-re-ingesting with a matching embedder the item answered and cited correctly in 10 of 10 isolated
-runs. Ten runs bound the failure rate loosely, so this is not a stability certificate.
+**Run the ingest and the query path with the same embedder.** `DATABRIDGE_EMBEDDER` is required
+and accepts `hashed` or `vertex`; there is no fallback default. Both produce 768 dimensions, so
+the setting prevents new configuration mismatches but cannot yet prove which embedder produced
+an already stored index. Earlier reports of `DG-004` instability were measured under a mismatch.
+After re-ingesting with a matching embedder the item answered and cited correctly in 10 of 10
+isolated runs. Ten runs bound the failure rate loosely, so this is not a stability certificate.
 
 The golden file declares the space it targets, and `--space` asserts that value rather than
-overriding it, so a space-key mismatch is blocked before the first question is asked. There is no
-equivalent guard for the embedder yet.
+overriding it, so a space-key mismatch is blocked before the first question is asked. Embedder
+provenance for stored indexes will be enforced by a follow-up schema migration.
 
 ```bash
 # same embedder as the ingest that built the index, for the same reason as above

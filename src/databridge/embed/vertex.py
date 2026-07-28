@@ -10,9 +10,21 @@ import os
 import time
 from typing import Any
 
-from databridge.embed.base import EMBEDDING_DIM
+from databridge.embed.base import EMBEDDING_DIM, EmbeddingProfile, make_config_fingerprint
 
 _MODEL = "gemini-embedding-001"
+_PROVIDER = "vertex"
+_PROFILE = EmbeddingProfile(
+    provider=_PROVIDER,
+    model=_MODEL,
+    dimension=EMBEDDING_DIM,
+    config_fingerprint=make_config_fingerprint(
+        provider=_PROVIDER,
+        model=_MODEL,
+        dimension=EMBEDDING_DIM,
+        options={"output_dimensionality": EMBEDDING_DIM},
+    ),
+)
 
 
 class VertexEmbedder:
@@ -27,6 +39,10 @@ class VertexEmbedder:
             project=project or os.environ.get("GOOGLE_CLOUD_PROJECT"),
             location=location or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"),
         )
+
+    @property
+    def profile(self) -> EmbeddingProfile:
+        return _PROFILE
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         result = self._embed_with_retry(texts)

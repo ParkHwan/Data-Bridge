@@ -46,26 +46,49 @@
 docker compose up -d
 uv pip install -e ".[server,gcp,dev]"
 
-# 2) 샘플 코퍼스 인제스트 (GCP 없이: 해시 임베더 / Vertex: DATABRIDGE_EMBEDDER=vertex)
-uv run python scripts/ingest_samples.py
+# 2) 샘플 코퍼스 인제스트
+#    DATABRIDGE_EMBEDDER 는 필수이며 기본값이 없다. 3단계와 같은 값을 써야
+#    인제스트와 질의가 같은 벡터 공간에서 동작한다.
+DATABRIDGE_EMBEDDER=hashed uv run python scripts/ingest_samples.py
 
-# 3) 서버 (Vertex AI 사용 시 ADC 필요)
-GOOGLE_GENAI_USE_VERTEXAI=TRUE GOOGLE_CLOUD_PROJECT=<프로젝트> \
+# 3) 서버. 해시 임베더는 임베딩만 로컬에서 처리하고, 에이전트는 어느 쪽이든
+#    Gemini 를 호출하므로 Google 모델 자격증명이 필요하다.
+DATABRIDGE_EMBEDDER=hashed GOOGLE_GENAI_USE_VERTEXAI=TRUE GOOGLE_CLOUD_PROJECT=<프로젝트> \
   uv run uvicorn databridge.server.app:app --port 8080
 # → http://localhost:8080
+
+# 3') Vertex 로 서빙하려면(ADC 필요) 2단계도 vertex 로 다시 인제스트한다
+DATABRIDGE_EMBEDDER=vertex uv run python scripts/ingest_samples.py
+DATABRIDGE_EMBEDDER=vertex GOOGLE_GENAI_USE_VERTEXAI=TRUE GOOGLE_CLOUD_PROJECT=<프로젝트> \
+  uv run uvicorn databridge.server.app:app --port 8080
 ```
 
-품질 게이트: `uv run pytest -q` (96 tests) / `uv run ruff check .` / `uv run mypy`
+품질 게이트: `uv run pytest -q` / `uv run ruff check .` / `uv run mypy`
+(테스트 개수는 로컬 DB 기동 여부에 따라 달라진다 — DB 가 없으면 통합 테스트가 skip 된다)
 
 ## 평가 (골든셋)
 
 자작 데모 코퍼스 11문항으로 세 전문 에이전트와 거절 경로를 모두 검증한다: 지식 7(영어 5 +
 트라이그램 recall을 검증하는 한국어 2), 데이터 2(BigQuery NL2SQL), 리포트 1, 거절 1. 평가기는
 **관측 가능한 계약**(최종 에이전트·툴 순서·인용 종류·키워드 임계·거절)을 검사하며, 모든 항목이
-통과해야만 게이트가 green이다(`PASS`/`FAIL`/`REFUSAL_OK`/`ERROR`). 최근 owner 실행: **11/11**.
+통과해야만 게이트가 green이다(`PASS`/`FAIL`/`REFUSAL_OK`/`ERROR`). 최근 owner 실행: **10/11**이며
+실패는 `DG-009` 다 — 기대값이 `bigquery-public-data.thelook_ecommerce` 에 대해 상수로 박혀 있는데
+이 데이터셋은 고정 스냅샷이 아니어서, 에이전트 답이 맞고 박아둔 값이 낡았다.
+
+**인제스트와 질의는 같은 임베더로 실행해야 한다.** `DATABRIDGE_EMBEDDER` 는 필수이며
+`hashed` 또는 `vertex` 를 받고 기본값이 없다. 둘 다 768차원이라 이 설정은 새 불일치를 막을 뿐,
+이미 저장된 인덱스가 어느 임베더로 만들어졌는지는 아직 증명하지 못한다. 과거에 보고된
+`DG-004` 불안정성은 불일치 상태에서 측정된 것이었고, 임베더를 맞춰 재인제스트한 뒤에는
+10회 중 10회 정상 응답·인용했다. 10회로는 실패율 상한이 넓으므로 안정성 인증은 아니다.
+
+골든 파일은 대상 스페이스를 선언하고 `--space` 는 그 값을 덮어쓰지 않고 검증하므로,
+스페이스 키 불일치는 첫 질문 전에 차단된다. 저장된 인덱스의 임베더 provenance 강제는
+후속 스키마 마이그레이션에서 다룬다.
 
 ```bash
-GOOGLE_CLOUD_PROJECT=<프로젝트> uv run python scripts/run_golden.py
+# 인덱스를 만든 인제스트와 같은 임베더를 쓴다 (위와 같은 이유)
+DATABRIDGE_EMBEDDER=vertex GOOGLE_CLOUD_PROJECT=<프로젝트> \
+  uv run python scripts/run_golden.py
 ```
 
 평가기 자체(`src/databridge/evals/`)는 ADK 비의존이며 오프라인 단위 테스트가 있다.

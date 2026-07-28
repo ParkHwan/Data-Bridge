@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from databridge.embed.base import Embedder
+from databridge.embed import Embedder, resolve_embedder
 from databridge.store import PgVectorStore
 
 DEFAULT_DSN = "postgresql://databridge:databridge@localhost:5433/databridge"
@@ -41,16 +41,8 @@ def set_deps(deps: AgentDeps) -> None:
 
 
 def _build_default() -> AgentDeps:
-    if os.environ.get("DATABRIDGE_EMBEDDER", "vertex").lower() == "vertex":
-        from databridge.embed.vertex import VertexEmbedder
-
-        embedder: Embedder = VertexEmbedder()
-    else:
-        from databridge.embed import HashedEmbedder
-
-        embedder = HashedEmbedder()
     return AgentDeps(
         store=PgVectorStore(os.environ.get("DATABRIDGE_DSN", DEFAULT_DSN)),
-        embedder=embedder,
+        embedder=resolve_embedder(),
         space_key=os.environ.get("DATABRIDGE_SPACE", DEFAULT_SPACE),
     )

@@ -2,7 +2,7 @@
 
 Usage:
     docker compose up -d
-    uv run python scripts/ingest_samples.py                # HashedEmbedder (no GCP)
+    DATABRIDGE_EMBEDDER=hashed uv run python scripts/ingest_samples.py
     DATABRIDGE_EMBEDDER=vertex uv run python scripts/ingest_samples.py
 
 DSN override: DATABRIDGE_DSN (default: local docker compose instance).
@@ -14,7 +14,7 @@ import os
 import sys
 from pathlib import Path
 
-from databridge.embed import Embedder, HashedEmbedder
+from databridge.embed import Embedder, resolve_embedder
 from databridge.ingest.chunker import chunk_document
 from databridge.ingest.markdown import load_markdown_file
 from databridge.store import PgVectorStore
@@ -23,11 +23,7 @@ DEFAULT_DSN = "postgresql://databridge:databridge@localhost:5433/databridge"
 
 
 def make_embedder() -> Embedder:
-    if os.environ.get("DATABRIDGE_EMBEDDER", "hashed").lower() == "vertex":
-        from databridge.embed.vertex import VertexEmbedder
-
-        return VertexEmbedder()
-    return HashedEmbedder()
+    return resolve_embedder()
 
 
 def main() -> int:
