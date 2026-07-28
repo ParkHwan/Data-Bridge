@@ -91,9 +91,12 @@ green only when every item passes (`PASS`/`FAIL`/`REFUSAL_OK`/`ERROR`). Latest o
 right and the pin was stale.
 
 **Run the ingest and the query path with the same embedder.** `DATABRIDGE_EMBEDDER` is required
-and accepts `hashed` or `vertex`; there is no fallback default. Both produce 768 dimensions, so
-the setting prevents new configuration mismatches but cannot yet prove which embedder produced
-an already stored index. Earlier reports of `DG-004` instability were measured under a mismatch.
+and accepts `hashed` or `vertex`; there is no fallback default. That removes the mismatch that used
+to arise from the two sides defaulting differently, but the processes do not compare their values:
+setting `hashed` for an ingest and `vertex` for the server still runs without error, and both
+produce 768 dimensions so nothing downstream notices. Nor can the setting prove which embedder
+produced an index that already exists. Earlier reports of `DG-004` instability were measured under
+a mismatch.
 After re-ingesting with a matching embedder the item answered and cited correctly in 10 of 10
 isolated runs. Ten runs bound the failure rate loosely, so this is not a stability certificate.
 
