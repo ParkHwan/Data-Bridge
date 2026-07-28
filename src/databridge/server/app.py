@@ -17,13 +17,15 @@ from pydantic import BaseModel, Field
 
 from databridge.agents.deps import get_deps
 from databridge.agents.runtime import NoEvidenceError, ask_async
+from databridge.store import EmbeddingProfileMismatchError
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Fail startup with a configuration error instead of failing the first /ask."""
     del app
-    get_deps()
+    deps = get_deps()
+    deps.store.preflight(space_key=deps.space_key)
     yield
 
 
@@ -66,7 +68,14 @@ def health() -> dict[str, Any]:
 @app.post("/ask", response_model=AskResponse)
 async def ask_endpoint(request: AskRequest) -> AskResponse:
     try:
+        deps = get_deps()
+        deps.store.preflight(space_key=deps.space_key)
         result = await ask_async(request.question)
+    except EmbeddingProfileMismatchError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Knowledge index configuration is incompatible",
+        ) from exc
     except NoEvidenceError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return AskResponse(

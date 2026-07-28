@@ -14,7 +14,7 @@ from databridge.store import PgVectorStore
 
 
 def main() -> None:
-    store = PgVectorStore(os.environ["DATABRIDGE_DSN"])
+    store = PgVectorStore.for_migration(os.environ["DATABRIDGE_DSN"])
     store.ensure_schema()
     print("schema ensured")
 

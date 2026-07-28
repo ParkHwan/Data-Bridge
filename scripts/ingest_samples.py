@@ -17,7 +17,7 @@ from pathlib import Path
 from databridge.embed import Embedder, resolve_embedder
 from databridge.ingest.chunker import chunk_document
 from databridge.ingest.markdown import load_markdown_file
-from databridge.store import PgVectorStore
+from databridge.store import PgVectorStore, resolve_profile_mode
 
 DEFAULT_DSN = "postgresql://databridge:databridge@localhost:5433/databridge"
 
@@ -28,9 +28,13 @@ def make_embedder() -> Embedder:
 
 def main() -> int:
     docs_dir = Path(__file__).parents[1] / "samples" / "docs"
-    store = PgVectorStore(os.environ.get("DATABRIDGE_DSN", DEFAULT_DSN))
-    store.ensure_schema()
     embedder = make_embedder()
+    store = PgVectorStore(
+        os.environ.get("DATABRIDGE_DSN", DEFAULT_DSN),
+        profile=embedder.profile,
+        mode=resolve_profile_mode(),
+    )
+    store.ensure_schema()
 
     total_chunks = 0
     for path in sorted(docs_dir.glob("*.md")):

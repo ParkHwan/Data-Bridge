@@ -9,7 +9,7 @@ import sys
 
 from databridge.confluence import ConfluenceBatchConfig, ConfluenceClient, run_confluence_batch
 from databridge.embed import Embedder, resolve_embedder
-from databridge.store import PgVectorStore
+from databridge.store import PgVectorStore, resolve_profile_mode
 
 DEFAULT_DSN = "postgresql://databridge:databridge@localhost:5433/databridge"
 
@@ -34,6 +34,19 @@ def _positive_env(name: str, default: int) -> int:
     return value
 
 
+def _optional_positive_env(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if value < 1:
+        raise RuntimeError(f"{name} must be positive")
+    return value
+
+
 def _make_embedder() -> Embedder:
     return resolve_embedder()
 
@@ -46,7 +59,12 @@ async def _run() -> None:
         max_chunks=_positive_env("CONFLUENCE_MAX_CHUNKS", 5_000),
         embed_batch_size=_positive_env("CONFLUENCE_EMBED_BATCH_SIZE", 100),
     )
-    store = PgVectorStore(os.environ.get("DATABRIDGE_DSN", DEFAULT_DSN))
+    embedder = _make_embedder()
+    store = PgVectorStore(
+        os.environ.get("DATABRIDGE_DSN", DEFAULT_DSN),
+        profile=embedder.profile,
+        mode=resolve_profile_mode(),
+    )
     store.ensure_schema()
     async with ConfluenceClient(
         base_url=_required_env("CONFLUENCE_BASE_URL"),
@@ -56,8 +74,9 @@ async def _run() -> None:
         result = await run_confluence_batch(
             client=client,
             store=store,
-            embedder=_make_embedder(),
+            embedder=embedder,
             config=config,
+            generation_id=_optional_positive_env("DATABRIDGE_GENERATION_ID"),
         )
     logging.getLogger(__name__).info("Batch result: %s", result)
 

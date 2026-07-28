@@ -60,19 +60,22 @@ docker compose up -d
 uv pip install -e ".[server,gcp,dev]"
 
 # 2) ingest the sample corpus
-#    DATABRIDGE_EMBEDDER is required. Use the SAME value in step 3 so ingestion
-#    and queries operate in the same vector space.
-DATABRIDGE_EMBEDDER=hashed uv run python scripts/ingest_samples.py
+#    Both settings are required. Use the SAME embedder in step 3.
+DATABRIDGE_EMBEDDER=hashed DATABRIDGE_PROFILE_MODE=observe \
+  uv run python scripts/ingest_samples.py
 
 # 3) serve. The hashed embedder keeps embedding local, but the agents still call
 #    Gemini, so Google model credentials are required either way.
-DATABRIDGE_EMBEDDER=hashed GOOGLE_GENAI_USE_VERTEXAI=TRUE GOOGLE_CLOUD_PROJECT=<project> \
+DATABRIDGE_EMBEDDER=hashed DATABRIDGE_PROFILE_MODE=observe \
+  GOOGLE_GENAI_USE_VERTEXAI=TRUE GOOGLE_CLOUD_PROJECT=<project> \
   uv run uvicorn databridge.server.app:app --port 8080
 # → http://localhost:8080
 
 # 3') or serve against Vertex (requires ADC) — then re-ingest step 2 with vertex too
-DATABRIDGE_EMBEDDER=vertex uv run python scripts/ingest_samples.py
-DATABRIDGE_EMBEDDER=vertex GOOGLE_GENAI_USE_VERTEXAI=TRUE GOOGLE_CLOUD_PROJECT=<project> \
+DATABRIDGE_EMBEDDER=vertex DATABRIDGE_PROFILE_MODE=observe \
+  uv run python scripts/ingest_samples.py
+DATABRIDGE_EMBEDDER=vertex DATABRIDGE_PROFILE_MODE=observe \
+  GOOGLE_GENAI_USE_VERTEXAI=TRUE GOOGLE_CLOUD_PROJECT=<project> \
   uv run uvicorn databridge.server.app:app --port 8080
 ```
 
@@ -91,22 +94,20 @@ green only when every item passes (`PASS`/`FAIL`/`REFUSAL_OK`/`ERROR`). Latest o
 right and the pin was stale.
 
 **Run the ingest and the query path with the same embedder.** `DATABRIDGE_EMBEDDER` is required
-and accepts `hashed` or `vertex`; there is no fallback default. That removes the mismatch that used
-to arise from the two sides defaulting differently, but the processes do not compare their values:
-setting `hashed` for an ingest and `vertex` for the server still runs without error, and both
-produce 768 dimensions so nothing downstream notices. Nor can the setting prove which embedder
-produced an index that already exists. Earlier reports of `DG-004` instability were measured under
-a mismatch.
+and accepts `hashed` or `vertex`; there is no fallback default. Stored generations now record the
+embedding profile. `DATABRIDGE_PROFILE_MODE` is also required: `observe` logs read/startup
+mismatches during rollout, while `strict` rejects them; writes reject mismatches in either mode.
+Earlier reports of `DG-004` instability were measured under a mismatch.
 After re-ingesting with a matching embedder the item answered and cited correctly in 10 of 10
 isolated runs. Ten runs bound the failure rate loosely, so this is not a stability certificate.
 
 The golden file declares the space it targets, and `--space` asserts that value rather than
 overriding it, so a space-key mismatch is blocked before the first question is asked. Embedder
-provenance for stored indexes will be enforced by a follow-up schema migration.
+provenance is checked against the active generation before queries run.
 
 ```bash
 # same embedder as the ingest that built the index, for the same reason as above
-DATABRIDGE_EMBEDDER=vertex GOOGLE_CLOUD_PROJECT=<project> \
+DATABRIDGE_EMBEDDER=vertex DATABRIDGE_PROFILE_MODE=observe GOOGLE_CLOUD_PROJECT=<project> \
   uv run python scripts/run_golden.py
 ```
 

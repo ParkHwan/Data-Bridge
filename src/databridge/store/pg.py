@@ -16,6 +16,7 @@ Space isolation is a plain ``WHERE space_key = %s``.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -25,8 +26,19 @@ from typing import Any
 import psycopg
 from pgvector.psycopg import register_vector
 
-from databridge.embed.base import EMBEDDING_DIM
+from databridge.embed.base import EMBEDDING_DIM, EmbeddingProfile
 from databridge.ingest.chunker import Chunk
+from databridge.store.exceptions import EmbeddingProfileMismatchError
+from databridge.store.provenance import (
+    Generation,
+    GenerationChunkCount,
+    GenerationState,
+    ProfileMode,
+    SpaceProfileReport,
+    profile_id_for,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,8 +57,28 @@ class SearchHit:
 
 
 class PgVectorStore:
-    def __init__(self, dsn: str) -> None:
+    _profile: EmbeddingProfile | None
+    _mode: ProfileMode | None
+
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        profile: EmbeddingProfile,
+        mode: ProfileMode,
+    ) -> None:
         self._dsn = dsn
+        self._profile = profile
+        self._mode = mode
+
+    @classmethod
+    def for_migration(cls, dsn: str) -> PgVectorStore:
+        """Create a schema-only store without requiring runtime embedding config."""
+        store = cls.__new__(cls)
+        store._dsn = dsn
+        store._profile = None
+        store._mode = None
+        return store
 
     def _connect(self, *, register: bool = True) -> psycopg.Connection:
         conn = psycopg.connect(self._dsn)
@@ -68,52 +100,87 @@ class PgVectorStore:
         source_id: str,
         chunks: list[Chunk],
         embeddings: list[list[float]],
+        generation_id: int | None = None,
     ) -> int:
         """Atomically replace all chunks of one source within one space.
 
         Delete + insert run in a single transaction (post-review P1: separate
         delete/upsert calls could leave a source empty on mid-ingest failure).
         """
+        self._require_profile()
         self._validate_batch(chunks, embeddings)
         for chunk in chunks:
             if chunk.space_key != space_key or chunk.source_id != source_id:
                 msg = f"chunk {chunk.chunk_id} does not belong to {space_key}/{source_id}"
                 raise ValueError(msg)
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM chunks WHERE space_key = %s AND source_id = %s",
-                (space_key, source_id),
+            self._lock_space_for_update(cur, space_key)
+            generation = self._resolve_write_generation(
+                cur,
+                space_key=space_key,
+                generation_id=generation_id,
+                allow_empty_bootstrap=True,
             )
-            self._insert_rows(cur, chunks, embeddings)
-        return len(chunks)
-
-    def upsert_chunks(self, chunks: list[Chunk], embeddings: list[list[float]]) -> int:
-        self._validate_batch(chunks, embeddings)
-        with self._connect() as conn, conn.cursor() as cur:
-            self._insert_rows(cur, chunks, embeddings)
-        return len(chunks)
-
-    def delete_source(self, *, space_key: str, source_id: str) -> int:
-        """Space-scoped delete — mutations honor space isolation (post-review P1)."""
-        with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
-                "DELETE FROM chunks WHERE space_key = %s AND source_id = %s",
-                (space_key, source_id),
+                """
+                DELETE FROM chunks
+                 WHERE space_key = %s AND generation_id = %s AND source_id = %s
+                """,
+                (space_key, generation.generation_id, source_id),
+            )
+            self._insert_rows(
+                cur,
+                chunks,
+                embeddings,
+                generation_id=generation.generation_id,
+            )
+        return len(chunks)
+
+    def delete_source(
+        self, *, space_key: str, source_id: str, generation_id: int | None = None
+    ) -> int:
+        """Space-scoped delete — mutations honor space isolation (post-review P1)."""
+        self._require_profile()
+        with self._connect() as conn, conn.cursor() as cur:
+            self._lock_space_for_update(cur, space_key)
+            generation = self._resolve_write_generation(
+                cur,
+                space_key=space_key,
+                generation_id=generation_id,
+                allow_empty_bootstrap=False,
+            )
+            cur.execute(
+                """
+                DELETE FROM chunks
+                 WHERE space_key = %s AND generation_id = %s AND source_id = %s
+                """,
+                (space_key, generation.generation_id, source_id),
             )
             return cur.rowcount or 0
 
-    def list_source_ids(self, *, space_key: str) -> set[str]:
+    def list_source_ids(
+        self, *, space_key: str, generation_id: int | None = None
+    ) -> set[str]:
         """Return the distinct sources currently stored in one isolated space."""
+        self._require_profile()
         with self._connect() as conn, conn.cursor() as cur:
+            generation = self._resolve_read_target(
+                cur, space_key=space_key, generation_id=generation_id
+            )
             cur.execute(
-                "SELECT DISTINCT source_id FROM chunks WHERE space_key = %s",
-                (space_key,),
+                """
+                SELECT DISTINCT source_id
+                  FROM chunks
+                 WHERE space_key = %s AND generation_id = %s
+                """,
+                (space_key, generation.generation_id),
             )
             return {str(row[0]) for row in cur.fetchall()}
 
     @contextmanager
     def advisory_lock(self, key: str) -> Iterator[bool]:
         """Hold a session-level advisory lock for the entire context lifetime."""
+        self._require_profile()
         with self._connect(register=False) as conn, conn.cursor() as cur:
             cur.execute("SELECT pg_try_advisory_lock(hashtextextended(%s, 0))", (key,))
             row = cur.fetchone()
@@ -123,6 +190,390 @@ class PgVectorStore:
             finally:
                 if acquired:
                     cur.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))", (key,))
+
+    @staticmethod
+    def _lock_space_for_update(cur: psycopg.Cursor, space_key: str) -> None:
+        """Serialize provenance mutations for one space until transaction end."""
+        lock_key = f"databridge:embedding-profile:{space_key}"
+        cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock_key,))
+
+    @staticmethod
+    def _ensure_profile(cur: psycopg.Cursor, profile: EmbeddingProfile) -> str:
+        profile_id = profile_id_for(profile)
+        cur.execute(
+            """
+            INSERT INTO embedding_profile
+                (profile_id, provider, model, dimension, config_fingerprint)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+            """,
+            (
+                profile_id,
+                profile.provider,
+                profile.model,
+                profile.dimension,
+                profile.config_fingerprint,
+            ),
+        )
+        cur.execute(
+            """
+            SELECT provider, model, dimension, config_fingerprint
+              FROM embedding_profile
+             WHERE profile_id = %s
+            """,
+            (profile_id,),
+        )
+        row = cur.fetchone()
+        expected = (
+            profile.provider,
+            profile.model,
+            profile.dimension,
+            profile.config_fingerprint,
+        )
+        if row is None or tuple(row) != expected:
+            raise EmbeddingProfileMismatchError("Stored embedding profile identity is inconsistent")
+        return profile_id
+
+    @staticmethod
+    def _generation_from_row(row: tuple[Any, ...]) -> Generation:
+        return Generation(
+            generation_id=int(row[0]),
+            space_key=str(row[1]),
+            profile=EmbeddingProfile(
+                provider=str(row[2]),
+                model=str(row[3]),
+                dimension=int(row[4]),
+                config_fingerprint=str(row[5]),
+            ),
+            state=GenerationState(str(row[6])),
+        )
+
+    @classmethod
+    def _get_generation(
+        cls,
+        cur: psycopg.Cursor,
+        *,
+        space_key: str,
+        generation_id: int,
+        for_update: bool = False,
+    ) -> Generation | None:
+        lock_clause = "FOR UPDATE" if for_update else ""
+        cur.execute(
+            f"""
+            SELECT g.generation_id, g.space_key, p.provider, p.model, p.dimension,
+                   p.config_fingerprint, g.state
+              FROM space_generation g
+              JOIN embedding_profile p ON p.profile_id = g.profile_id
+             WHERE g.space_key = %s AND g.generation_id = %s
+             {lock_clause}
+            """,
+            (space_key, generation_id),
+        )
+        row = cur.fetchone()
+        return None if row is None else cls._generation_from_row(row)
+
+    @classmethod
+    def _get_active_generation(
+        cls, cur: psycopg.Cursor, *, space_key: str, for_update: bool = False
+    ) -> Generation | None:
+        lock_clause = "FOR UPDATE OF g" if for_update else ""
+        cur.execute(
+            f"""
+            SELECT g.generation_id, g.space_key, p.provider, p.model, p.dimension,
+                   p.config_fingerprint, g.state
+              FROM space_generation g
+              JOIN embedding_profile p ON p.profile_id = g.profile_id
+             WHERE g.space_key = %s AND g.state = 'active'
+             {lock_clause}
+            """,
+            (space_key,),
+        )
+        row = cur.fetchone()
+        return None if row is None else cls._generation_from_row(row)
+
+    def _require_profile(self) -> EmbeddingProfile:
+        if self._profile is None:
+            raise RuntimeError("Migration-only store cannot perform vector operations")
+        return self._profile
+
+    def preflight(self, *, space_key: str) -> None:
+        """Validate runtime provenance before startup or a top-level query."""
+        self._require_profile()
+        with self._connect() as conn, conn.cursor() as cur:
+            self._resolve_search_generation(cur, space_key=space_key)
+            report = self._profile_report(cur, space_key=space_key)
+        logger.info("Embedding provenance preflight: %s", report)
+
+    def profile_report(self, *, space_key: str) -> SpaceProfileReport:
+        """Return an operational provenance report for one space."""
+        self._require_profile()
+        with self._connect() as conn, conn.cursor() as cur:
+            return self._profile_report(cur, space_key=space_key)
+
+    def _profile_report(
+        self, cur: psycopg.Cursor, *, space_key: str
+    ) -> SpaceProfileReport:
+        profile = self._require_profile()
+        cur.execute(
+            """
+            SELECT g.generation_id, g.state, count(c.id), p.config_fingerprint
+              FROM space_generation g
+              JOIN embedding_profile p ON p.profile_id = g.profile_id
+              LEFT JOIN chunks c
+                ON c.space_key = g.space_key
+               AND c.generation_id = g.generation_id
+             WHERE g.space_key = %s
+             GROUP BY g.generation_id, g.state, p.config_fingerprint
+             ORDER BY g.generation_id
+            """,
+            (space_key,),
+        )
+        rows = cur.fetchall()
+        counts = tuple(
+            GenerationChunkCount(
+                generation_id=int(row[0]),
+                state=GenerationState(str(row[1])),
+                chunk_count=int(row[2]),
+            )
+            for row in rows
+        )
+        active_rows = [row for row in rows if str(row[1]) == GenerationState.ACTIVE]
+        active = active_rows[0] if active_rows else None
+        stored_fingerprint = None if active is None else str(active[3])
+        cur.execute(
+            """
+            SELECT count(*)
+              FROM chunks
+             WHERE space_key = %s AND generation_id IS NULL
+            """,
+            (space_key,),
+        )
+        null_row = cur.fetchone()
+        cur.execute(
+            """
+            SELECT count(DISTINCT g.profile_id)
+              FROM space_generation g
+             WHERE g.space_key = %s
+            """,
+            (space_key,),
+        )
+        profile_row = cur.fetchone()
+        return SpaceProfileReport(
+            space_key=space_key,
+            active_generation_id=None if active is None else int(active[0]),
+            active_state=None if active is None else GenerationState(str(active[1])),
+            building_generation_exists=any(
+                item.state is GenerationState.BUILDING for item in counts
+            ),
+            generation_chunk_counts=counts,
+            null_generation_chunk_count=int(null_row[0]) if null_row else 0,
+            distinct_profile_count=int(profile_row[0]) if profile_row else 0,
+            stored_fingerprint=stored_fingerprint,
+            runtime_fingerprint=profile.config_fingerprint,
+            fingerprint_matches=(
+                None
+                if stored_fingerprint is None
+                else stored_fingerprint == profile.config_fingerprint
+            ),
+        )
+
+    @staticmethod
+    def _assert_matching_profile(generation: Generation, profile: EmbeddingProfile) -> None:
+        if generation.profile != profile:
+            raise EmbeddingProfileMismatchError(
+                "Embedding profile does not match the target generation"
+            )
+
+    def _resolve_write_generation(
+        self,
+        cur: psycopg.Cursor,
+        *,
+        space_key: str,
+        generation_id: int | None,
+        allow_empty_bootstrap: bool,
+    ) -> Generation:
+        """Resolve and validate a write target while the space xact lock is held."""
+        profile = self._require_profile()
+        if generation_id is not None:
+            generation = self._get_generation(
+                cur,
+                space_key=space_key,
+                generation_id=generation_id,
+                for_update=True,
+            )
+            if generation is None:
+                raise EmbeddingProfileMismatchError(
+                    "Target embedding generation does not exist in this space"
+                )
+            self._assert_matching_profile(generation, profile)
+            if generation.state is not GenerationState.BUILDING:
+                raise EmbeddingProfileMismatchError(
+                    "Explicit write target must be a building generation"
+                )
+            return generation
+
+        active = self._get_active_generation(cur, space_key=space_key, for_update=True)
+        if active is not None:
+            self._assert_matching_profile(active, profile)
+            return active
+
+        cur.execute("SELECT EXISTS (SELECT 1 FROM chunks WHERE space_key = %s)", (space_key,))
+        row = cur.fetchone()
+        populated = bool(row and row[0])
+        if populated or not allow_empty_bootstrap:
+            raise EmbeddingProfileMismatchError(
+                "No active embedding generation is available for this space"
+            )
+
+        profile_id = self._ensure_profile(cur, profile)
+        cur.execute(
+            """
+            INSERT INTO space_generation
+                (space_key, profile_id, state, activated_at)
+            VALUES (%s, %s, 'active', now())
+            RETURNING generation_id
+            """,
+            (space_key, profile_id),
+        )
+        created = cur.fetchone()
+        if created is None:
+            raise RuntimeError("Failed to create the initial embedding generation")
+        generation = self._get_generation(
+            cur,
+            space_key=space_key,
+            generation_id=int(created[0]),
+            for_update=True,
+        )
+        if generation is None:
+            raise RuntimeError("Created embedding generation could not be read back")
+        return generation
+
+    def _resolve_read_target(
+        self,
+        cur: psycopg.Cursor,
+        *,
+        space_key: str,
+        generation_id: int | None,
+    ) -> Generation:
+        """Resolve the active or explicit building generation for batch inspection."""
+        profile = self._require_profile()
+        if generation_id is None:
+            generation = self._get_active_generation(cur, space_key=space_key)
+            if generation is None:
+                raise EmbeddingProfileMismatchError(
+                    "No active embedding generation is available for this space"
+                )
+        else:
+            generation = self._get_generation(
+                cur, space_key=space_key, generation_id=generation_id
+            )
+            if generation is None or generation.state is not GenerationState.BUILDING:
+                raise EmbeddingProfileMismatchError(
+                    "Explicit batch target must be a building generation in this space"
+                )
+        self._assert_matching_profile(generation, profile)
+        return generation
+
+    def _resolve_search_generation(
+        self, cur: psycopg.Cursor, *, space_key: str
+    ) -> Generation | None:
+        """Return the active generation, observing or enforcing its provenance."""
+        profile = self._require_profile()
+        active = self._get_active_generation(cur, space_key=space_key)
+        if active is not None:
+            if active.profile != profile:
+                if self._mode is ProfileMode.STRICT:
+                    raise EmbeddingProfileMismatchError(
+                        "Stored embeddings are incompatible with the query embedder"
+                    )
+                logger.warning(
+                    "Embedding profile mismatch observed for space=%s generation_id=%s",
+                    space_key,
+                    active.generation_id,
+                )
+            return active
+
+        cur.execute("SELECT EXISTS (SELECT 1 FROM chunks WHERE space_key = %s)", (space_key,))
+        row = cur.fetchone()
+        if not bool(row and row[0]):
+            return None
+        if self._mode is ProfileMode.STRICT:
+            raise EmbeddingProfileMismatchError(
+                "Stored embeddings have no active provenance generation"
+            )
+        logger.warning("No active embedding generation observed for populated space=%s", space_key)
+        return None
+
+    def create_building_generation(self, *, space_key: str) -> Generation:
+        """Create an inactive generation for an explicit clean rebuild."""
+        profile = self._require_profile()
+        with self._connect() as conn, conn.cursor() as cur:
+            self._lock_space_for_update(cur, space_key)
+            profile_id = self._ensure_profile(cur, profile)
+            cur.execute(
+                """
+                INSERT INTO space_generation (space_key, profile_id, state)
+                VALUES (%s, %s, 'building')
+                RETURNING generation_id
+                """,
+                (space_key, profile_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise RuntimeError("Failed to create building embedding generation")
+            generation = self._get_generation(
+                cur,
+                space_key=space_key,
+                generation_id=int(row[0]),
+                for_update=True,
+            )
+            if generation is None:
+                raise RuntimeError("Created embedding generation could not be read back")
+            return generation
+
+    def activate_generation(self, *, space_key: str, generation_id: int) -> Generation:
+        """Atomically retire the current generation and activate a verified build."""
+        profile = self._require_profile()
+        with self._connect() as conn, conn.cursor() as cur:
+            self._lock_space_for_update(cur, space_key)
+            target = self._get_generation(
+                cur,
+                space_key=space_key,
+                generation_id=generation_id,
+                for_update=True,
+            )
+            if target is None or target.state is not GenerationState.BUILDING:
+                raise EmbeddingProfileMismatchError(
+                    "Only a building generation in this space can be activated"
+                )
+            self._assert_matching_profile(target, profile)
+            cur.execute(
+                """
+                UPDATE space_generation
+                   SET state = 'retired'
+                 WHERE space_key = %s AND state = 'active'
+                """,
+                (space_key,),
+            )
+            cur.execute(
+                """
+                UPDATE space_generation
+                   SET state = 'active', activated_at = now()
+                 WHERE space_key = %s AND generation_id = %s AND state = 'building'
+                """,
+                (space_key, generation_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("Embedding generation activation did not update one row")
+            activated = self._get_generation(
+                cur,
+                space_key=space_key,
+                generation_id=generation_id,
+                for_update=True,
+            )
+            if activated is None:
+                raise RuntimeError("Activated embedding generation could not be read back")
+            return activated
 
     @staticmethod
     def _validate_batch(chunks: list[Chunk], embeddings: list[list[float]]) -> None:
@@ -139,15 +590,19 @@ class PgVectorStore:
         cur: psycopg.Cursor,
         chunks: list[Chunk],
         embeddings: list[list[float]],
+        *,
+        generation_id: int,
     ) -> None:
         for chunk, emb in zip(chunks, embeddings, strict=True):
             cur.execute(
                 """
                 INSERT INTO chunks
-                    (space_key, chunk_id, source_id, title, heading, breadcrumb,
-                     content, embedding, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
-                ON CONFLICT (space_key, chunk_id) DO UPDATE SET
+                    (space_key, generation_id, chunk_id, source_id, title, heading,
+                     breadcrumb, content, embedding, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (space_key, generation_id, chunk_id)
+                    WHERE generation_id IS NOT NULL
+                DO UPDATE SET
                     source_id = EXCLUDED.source_id,
                     title = EXCLUDED.title,
                     heading = EXCLUDED.heading,
@@ -158,6 +613,7 @@ class PgVectorStore:
                 """,
                 (
                     chunk.space_key,
+                    generation_id,
                     chunk.chunk_id,
                     chunk.source_id,
                     chunk.title,
@@ -172,29 +628,35 @@ class PgVectorStore:
         self,
         query_embedding: list[float],
         *,
-        space_key: str | None = None,
+        space_key: str,
         top_k: int = 5,
     ) -> list[SearchHit]:
-        """Cosine-distance search, optionally isolated to one space."""
+        """Cosine-distance search within one active, profile-checked generation."""
+        self._require_profile()
         if len(query_embedding) != EMBEDDING_DIM:
             msg = f"query embedding dimension {len(query_embedding)} != {EMBEDDING_DIM}"
             raise ValueError(msg)
         if top_k < 1:
             msg = f"top_k must be >= 1, got {top_k}"
             raise ValueError(msg)
-        where = "WHERE space_key = %(space)s" if space_key else ""
-        sql = f"""
+        sql = """
             SELECT chunk_id, source_id, space_key, title, heading, breadcrumb, content,
                    embedding <=> %(query)s::vector AS distance
             FROM chunks
-            {where}
+            WHERE space_key = %(space)s AND generation_id = %(generation)s
             ORDER BY distance
             LIMIT %(k)s
         """
-        params: dict[str, object] = {"query": query_embedding, "k": top_k}
-        if space_key:
-            params["space"] = space_key
         with self._connect() as conn, conn.cursor() as cur:
+            generation = self._resolve_search_generation(cur, space_key=space_key)
+            if generation is None:
+                return []
+            params: dict[str, object] = {
+                "query": query_embedding,
+                "k": top_k,
+                "space": space_key,
+                "generation": generation.generation_id,
+            }
             cur.execute(sql, params)
             rows = cur.fetchall()
         return [
@@ -216,7 +678,7 @@ class PgVectorStore:
         query_embedding: list[float],
         query_text: str,
         *,
-        space_key: str | None = None,
+        space_key: str,
         top_k: int = 5,
         candidate_k: int = 20,
         rrf_k: int = 60,
@@ -229,6 +691,7 @@ class PgVectorStore:
         Like the FTS path, it degrades gracefully to an empty list when nothing clears
         ``trgm_threshold``; RRF simply fuses whichever sources produced candidates.
         """
+        self._require_profile()
         if len(query_embedding) != EMBEDDING_DIM:
             msg = f"query embedding dimension {len(query_embedding)} != {EMBEDDING_DIM}"
             raise ValueError(msg)
@@ -245,7 +708,7 @@ class PgVectorStore:
             msg = f"trgm_threshold must be in [0, 1], got {trgm_threshold}"
             raise ValueError(msg)
 
-        space_filter = "AND space_key = %(space)s" if space_key else ""
+        space_filter = "AND space_key = %(space)s AND generation_id = %(generation)s"
         # Candidate rank feeds straight into RRF scoring, so tie order must be
         # deterministic — Postgres does not guarantee equal-score row order, and a
         # tie at the candidate_k boundary could otherwise flip which chunks (and
@@ -286,15 +749,17 @@ class PgVectorStore:
             ORDER BY trgm_score DESC, space_key, chunk_id
             LIMIT %(candidate_k)s
         """
-        params: dict[str, object] = {
-            "query": query_embedding,
-            "query_text": query_text,
-            "candidate_k": candidate_k,
-        }
-        if space_key:
-            params["space"] = space_key
-
         with self._connect() as conn, conn.cursor() as cur:
+            generation = self._resolve_search_generation(cur, space_key=space_key)
+            if generation is None:
+                return []
+            params: dict[str, object] = {
+                "query": query_embedding,
+                "query_text": query_text,
+                "candidate_k": candidate_k,
+                "space": space_key,
+                "generation": generation.generation_id,
+            }
             cur.execute(vector_sql, params)
             vector_rows = cur.fetchall()
             cur.execute(fts_sql, params)
