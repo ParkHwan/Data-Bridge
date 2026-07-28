@@ -71,6 +71,7 @@ class PgVectorStore:
         source_id: str,
         chunks: list[Chunk],
         embeddings: list[list[float]],
+        generation_id: int | None = None,
     ) -> int:
         """Atomically replace all chunks of one source within one space.
 
@@ -83,34 +84,64 @@ class PgVectorStore:
                 msg = f"chunk {chunk.chunk_id} does not belong to {space_key}/{source_id}"
                 raise ValueError(msg)
         with self._connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM chunks WHERE space_key = %s AND source_id = %s",
-                (space_key, source_id),
+            self._lock_space_for_update(cur, space_key)
+            generation = self._resolve_write_generation(
+                cur,
+                space_key=space_key,
+                generation_id=generation_id,
+                allow_empty_bootstrap=True,
             )
-            self._insert_rows(cur, chunks, embeddings)
+            cur.execute(
+                """
+                DELETE FROM chunks
+                 WHERE space_key = %s AND generation_id = %s AND source_id = %s
+                """,
+                (space_key, generation.generation_id, source_id),
+            )
+            self._insert_rows(
+                cur,
+                chunks,
+                embeddings,
+                generation_id=generation.generation_id,
+            )
         return len(chunks)
 
-    def upsert_chunks(self, chunks: list[Chunk], embeddings: list[list[float]]) -> int:
-        self._validate_batch(chunks, embeddings)
-        with self._connect() as conn, conn.cursor() as cur:
-            self._insert_rows(cur, chunks, embeddings)
-        return len(chunks)
-
-    def delete_source(self, *, space_key: str, source_id: str) -> int:
+    def delete_source(
+        self, *, space_key: str, source_id: str, generation_id: int | None = None
+    ) -> int:
         """Space-scoped delete — mutations honor space isolation (post-review P1)."""
         with self._connect() as conn, conn.cursor() as cur:
+            self._lock_space_for_update(cur, space_key)
+            generation = self._resolve_write_generation(
+                cur,
+                space_key=space_key,
+                generation_id=generation_id,
+                allow_empty_bootstrap=False,
+            )
             cur.execute(
-                "DELETE FROM chunks WHERE space_key = %s AND source_id = %s",
-                (space_key, source_id),
+                """
+                DELETE FROM chunks
+                 WHERE space_key = %s AND generation_id = %s AND source_id = %s
+                """,
+                (space_key, generation.generation_id, source_id),
             )
             return cur.rowcount or 0
 
-    def list_source_ids(self, *, space_key: str) -> set[str]:
+    def list_source_ids(
+        self, *, space_key: str, generation_id: int | None = None
+    ) -> set[str]:
         """Return the distinct sources currently stored in one isolated space."""
         with self._connect() as conn, conn.cursor() as cur:
+            generation = self._resolve_read_target(
+                cur, space_key=space_key, generation_id=generation_id
+            )
             cur.execute(
-                "SELECT DISTINCT source_id FROM chunks WHERE space_key = %s",
-                (space_key,),
+                """
+                SELECT DISTINCT source_id
+                  FROM chunks
+                 WHERE space_key = %s AND generation_id = %s
+                """,
+                (space_key, generation.generation_id),
             )
             return {str(row[0]) for row in cur.fetchall()}
 
@@ -303,6 +334,32 @@ class PgVectorStore:
             raise RuntimeError("Created embedding generation could not be read back")
         return generation
 
+    def _resolve_read_target(
+        self,
+        cur: psycopg.Cursor,
+        *,
+        space_key: str,
+        generation_id: int | None,
+    ) -> Generation:
+        """Resolve the active or explicit building generation for batch inspection."""
+        profile = self._require_profile()
+        if generation_id is None:
+            generation = self._get_active_generation(cur, space_key=space_key)
+            if generation is None:
+                raise EmbeddingProfileMismatchError(
+                    "No active embedding generation is available for this space"
+                )
+        else:
+            generation = self._get_generation(
+                cur, space_key=space_key, generation_id=generation_id
+            )
+            if generation is None or generation.state is not GenerationState.BUILDING:
+                raise EmbeddingProfileMismatchError(
+                    "Explicit batch target must be a building generation in this space"
+                )
+        self._assert_matching_profile(generation, profile)
+        return generation
+
     def create_building_generation(self, *, space_key: str) -> Generation:
         """Create an inactive generation for an explicit clean rebuild."""
         profile = self._require_profile()
@@ -389,15 +446,19 @@ class PgVectorStore:
         cur: psycopg.Cursor,
         chunks: list[Chunk],
         embeddings: list[list[float]],
+        *,
+        generation_id: int,
     ) -> None:
         for chunk, emb in zip(chunks, embeddings, strict=True):
             cur.execute(
                 """
                 INSERT INTO chunks
-                    (space_key, chunk_id, source_id, title, heading, breadcrumb,
-                     content, embedding, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, now())
-                ON CONFLICT (space_key, chunk_id) DO UPDATE SET
+                    (space_key, generation_id, chunk_id, source_id, title, heading,
+                     breadcrumb, content, embedding, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT (space_key, generation_id, chunk_id)
+                    WHERE generation_id IS NOT NULL
+                DO UPDATE SET
                     source_id = EXCLUDED.source_id,
                     title = EXCLUDED.title,
                     heading = EXCLUDED.heading,
@@ -408,6 +469,7 @@ class PgVectorStore:
                 """,
                 (
                     chunk.space_key,
+                    generation_id,
                     chunk.chunk_id,
                     chunk.source_id,
                     chunk.title,
