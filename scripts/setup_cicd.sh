@@ -110,7 +110,7 @@ if gcloud run jobs describe databridge-ingest \
   --project "$PROJECT" --region "$REGION" >/dev/null 2>&1; then
   gcloud run jobs update databridge-ingest --project "$PROJECT" --region "$REGION" \
     --remove-env-vars DATABRIDGE_DSN \
-    --update-env-vars "DATABRIDGE_EMBEDDER=vertex" \
+    --update-env-vars "DATABRIDGE_EMBEDDER=vertex,DATABRIDGE_PROFILE_MODE=observe" \
     --update-secrets "DATABRIDGE_DSN=DATABRIDGE_DSN:latest"
 fi
 
@@ -123,7 +123,7 @@ if ! gcloud run jobs describe databridge-confluence-ingest \
     --project "$PROJECT" --region "$REGION" --image "$IMAGE" \
     --command python --args scripts/ingest_confluence.py \
     --set-cloudsql-instances "${PROJECT}:${REGION}:databridge-demo" \
-    --set-env-vars "DATABRIDGE_EMBEDDER=vertex,CONFLUENCE_BASE_URL=${CONFLUENCE_BASE_URL},CONFLUENCE_EMAIL=${CONFLUENCE_EMAIL},FOLDER_ID=${FOLDER_ID},SPACE_KEY=${SPACE_KEY}" \
+    --set-env-vars "DATABRIDGE_EMBEDDER=vertex,DATABRIDGE_PROFILE_MODE=observe,CONFLUENCE_BASE_URL=${CONFLUENCE_BASE_URL},CONFLUENCE_EMAIL=${CONFLUENCE_EMAIL},FOLDER_ID=${FOLDER_ID},SPACE_KEY=${SPACE_KEY}" \
     --set-secrets "DATABRIDGE_DSN=DATABRIDGE_DSN:latest,CONFLUENCE_API_TOKEN=CONFLUENCE_API_TOKEN:latest" \
     --service-account "$RUNTIME_SA" --max-retries 0 --task-timeout 3600s
 else
@@ -131,7 +131,7 @@ else
     --project "$PROJECT" --region "$REGION" --image "$IMAGE" \
     --command python --args scripts/ingest_confluence.py \
     --set-cloudsql-instances "${PROJECT}:${REGION}:databridge-demo" \
-    --set-env-vars "DATABRIDGE_EMBEDDER=vertex,CONFLUENCE_BASE_URL=${CONFLUENCE_BASE_URL},CONFLUENCE_EMAIL=${CONFLUENCE_EMAIL},FOLDER_ID=${FOLDER_ID},SPACE_KEY=${SPACE_KEY}" \
+    --set-env-vars "DATABRIDGE_EMBEDDER=vertex,DATABRIDGE_PROFILE_MODE=observe,CONFLUENCE_BASE_URL=${CONFLUENCE_BASE_URL},CONFLUENCE_EMAIL=${CONFLUENCE_EMAIL},FOLDER_ID=${FOLDER_ID},SPACE_KEY=${SPACE_KEY}" \
     --update-secrets "DATABRIDGE_DSN=DATABRIDGE_DSN:latest,CONFLUENCE_API_TOKEN=CONFLUENCE_API_TOKEN:latest" \
     --service-account "$RUNTIME_SA" --max-retries 0 --task-timeout 3600s
 fi
@@ -172,12 +172,22 @@ SERVICE_EMBEDDER=$(printf '%s\n' "$SERVICE_EXPORT" | awk '
     }
     f=0
   }')
-if [[ "$SERVICE_DSN_KIND" == "secret" && "$SERVICE_SPACE" == "$DATABRIDGE_SPACE" && "$SERVICE_EMBEDDER" == "vertex" ]]; then
-  echo "databridge service already uses the DSN secret, DATABRIDGE_SPACE=${DATABRIDGE_SPACE}, and DATABRIDGE_EMBEDDER=vertex; skipping update."
+SERVICE_PROFILE_MODE=$(printf '%s\n' "$SERVICE_EXPORT" | awk '
+  /^[[:space:]]*-[[:space:]]*name:[[:space:]]*DATABRIDGE_PROFILE_MODE[[:space:]]*$/ {f=1; next}
+  f {
+    if ($0 ~ /^[[:space:]]*value:/) {
+      sub(/^[[:space:]]*value:[[:space:]]*/, "")
+      print
+      exit
+    }
+    f=0
+  }')
+if [[ "$SERVICE_DSN_KIND" == "secret" && "$SERVICE_SPACE" == "$DATABRIDGE_SPACE" && "$SERVICE_EMBEDDER" == "vertex" && "$SERVICE_PROFILE_MODE" == "observe" ]]; then
+  echo "databridge service already uses the DSN secret, DATABRIDGE_SPACE=${DATABRIDGE_SPACE}, DATABRIDGE_EMBEDDER=vertex, and DATABRIDGE_PROFILE_MODE=observe; skipping update."
 else
   gcloud run services update databridge --project "$PROJECT" --region "$REGION" \
     --remove-env-vars DATABRIDGE_DSN \
-    --update-env-vars "DATABRIDGE_SPACE=${DATABRIDGE_SPACE},DATABRIDGE_EMBEDDER=vertex" \
+    --update-env-vars "DATABRIDGE_SPACE=${DATABRIDGE_SPACE},DATABRIDGE_EMBEDDER=vertex,DATABRIDGE_PROFILE_MODE=observe" \
     --update-secrets "DATABRIDGE_DSN=DATABRIDGE_DSN:latest"
 fi
 
