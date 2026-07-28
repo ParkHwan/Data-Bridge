@@ -14,6 +14,11 @@ class GenerationState(StrEnum):
     RETIRED = "retired"
 
 
+class ProfileMode(StrEnum):
+    OBSERVE = "observe"
+    STRICT = "strict"
+
+
 @dataclass(frozen=True, slots=True)
 class Generation:
     generation_id: int

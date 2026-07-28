@@ -16,6 +16,7 @@ Space isolation is a plain ``WHERE space_key = %s``.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -28,7 +29,9 @@ from pgvector.psycopg import register_vector
 from databridge.embed.base import EMBEDDING_DIM, EmbeddingProfile
 from databridge.ingest.chunker import Chunk
 from databridge.store.exceptions import EmbeddingProfileMismatchError
-from databridge.store.provenance import Generation, GenerationState, profile_id_for
+from databridge.store.provenance import Generation, GenerationState, ProfileMode, profile_id_for
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,9 +50,16 @@ class SearchHit:
 
 
 class PgVectorStore:
-    def __init__(self, dsn: str, *, profile: EmbeddingProfile | None = None) -> None:
+    def __init__(
+        self,
+        dsn: str,
+        *,
+        profile: EmbeddingProfile | None = None,
+        mode: ProfileMode = ProfileMode.OBSERVE,
+    ) -> None:
         self._dsn = dsn
         self._profile = profile
+        self._mode = mode
 
     def _connect(self, *, register: bool = True) -> psycopg.Connection:
         conn = psycopg.connect(self._dsn)
@@ -360,6 +370,36 @@ class PgVectorStore:
         self._assert_matching_profile(generation, profile)
         return generation
 
+    def _resolve_search_generation(
+        self, cur: psycopg.Cursor, *, space_key: str
+    ) -> Generation | None:
+        """Return the active generation, observing or enforcing its provenance."""
+        profile = self._require_profile()
+        active = self._get_active_generation(cur, space_key=space_key)
+        if active is not None:
+            if active.profile != profile:
+                if self._mode is ProfileMode.STRICT:
+                    raise EmbeddingProfileMismatchError(
+                        "Stored embeddings are incompatible with the query embedder"
+                    )
+                logger.warning(
+                    "Embedding profile mismatch observed for space=%s generation_id=%s",
+                    space_key,
+                    active.generation_id,
+                )
+            return active
+
+        cur.execute("SELECT EXISTS (SELECT 1 FROM chunks WHERE space_key = %s)", (space_key,))
+        row = cur.fetchone()
+        if not bool(row and row[0]):
+            return None
+        if self._mode is ProfileMode.STRICT:
+            raise EmbeddingProfileMismatchError(
+                "Stored embeddings have no active provenance generation"
+            )
+        logger.warning("No active embedding generation observed for populated space=%s", space_key)
+        return None
+
     def create_building_generation(self, *, space_key: str) -> Generation:
         """Create an inactive generation for an explicit clean rebuild."""
         profile = self._require_profile()
@@ -484,29 +524,34 @@ class PgVectorStore:
         self,
         query_embedding: list[float],
         *,
-        space_key: str | None = None,
+        space_key: str,
         top_k: int = 5,
     ) -> list[SearchHit]:
-        """Cosine-distance search, optionally isolated to one space."""
+        """Cosine-distance search within one active, profile-checked generation."""
         if len(query_embedding) != EMBEDDING_DIM:
             msg = f"query embedding dimension {len(query_embedding)} != {EMBEDDING_DIM}"
             raise ValueError(msg)
         if top_k < 1:
             msg = f"top_k must be >= 1, got {top_k}"
             raise ValueError(msg)
-        where = "WHERE space_key = %(space)s" if space_key else ""
-        sql = f"""
+        sql = """
             SELECT chunk_id, source_id, space_key, title, heading, breadcrumb, content,
                    embedding <=> %(query)s::vector AS distance
             FROM chunks
-            {where}
+            WHERE space_key = %(space)s AND generation_id = %(generation)s
             ORDER BY distance
             LIMIT %(k)s
         """
-        params: dict[str, object] = {"query": query_embedding, "k": top_k}
-        if space_key:
-            params["space"] = space_key
         with self._connect() as conn, conn.cursor() as cur:
+            generation = self._resolve_search_generation(cur, space_key=space_key)
+            if generation is None:
+                return []
+            params: dict[str, object] = {
+                "query": query_embedding,
+                "k": top_k,
+                "space": space_key,
+                "generation": generation.generation_id,
+            }
             cur.execute(sql, params)
             rows = cur.fetchall()
         return [
@@ -528,7 +573,7 @@ class PgVectorStore:
         query_embedding: list[float],
         query_text: str,
         *,
-        space_key: str | None = None,
+        space_key: str,
         top_k: int = 5,
         candidate_k: int = 20,
         rrf_k: int = 60,
@@ -557,7 +602,7 @@ class PgVectorStore:
             msg = f"trgm_threshold must be in [0, 1], got {trgm_threshold}"
             raise ValueError(msg)
 
-        space_filter = "AND space_key = %(space)s" if space_key else ""
+        space_filter = "AND space_key = %(space)s AND generation_id = %(generation)s"
         # Candidate rank feeds straight into RRF scoring, so tie order must be
         # deterministic — Postgres does not guarantee equal-score row order, and a
         # tie at the candidate_k boundary could otherwise flip which chunks (and
@@ -598,15 +643,17 @@ class PgVectorStore:
             ORDER BY trgm_score DESC, space_key, chunk_id
             LIMIT %(candidate_k)s
         """
-        params: dict[str, object] = {
-            "query": query_embedding,
-            "query_text": query_text,
-            "candidate_k": candidate_k,
-        }
-        if space_key:
-            params["space"] = space_key
-
         with self._connect() as conn, conn.cursor() as cur:
+            generation = self._resolve_search_generation(cur, space_key=space_key)
+            if generation is None:
+                return []
+            params: dict[str, object] = {
+                "query": query_embedding,
+                "query_text": query_text,
+                "candidate_k": candidate_k,
+                "space": space_key,
+                "generation": generation.generation_id,
+            }
             cur.execute(vector_sql, params)
             vector_rows = cur.fetchall()
             cur.execute(fts_sql, params)
