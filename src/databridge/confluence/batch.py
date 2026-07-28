@@ -20,6 +20,7 @@ from databridge.confluence.models import Page, Space
 from databridge.confluence.parser import ADFParser
 from databridge.embed.base import Embedder
 from databridge.ingest.chunker import Chunk, chunk_document
+from databridge.store import SpaceProfileReport
 
 logger = logging.getLogger(__name__)
 
@@ -46,11 +47,18 @@ class BatchStore(Protocol):
         source_id: str,
         chunks: list[Chunk],
         embeddings: list[list[float]],
+        generation_id: int | None = None,
     ) -> int: ...
 
-    def list_source_ids(self, *, space_key: str) -> set[str]: ...
+    def list_source_ids(
+        self, *, space_key: str, generation_id: int | None = None
+    ) -> set[str]: ...
 
-    def delete_source(self, *, space_key: str, source_id: str) -> int: ...
+    def delete_source(
+        self, *, space_key: str, source_id: str, generation_id: int | None = None
+    ) -> int: ...
+
+    def profile_report(self, *, space_key: str) -> SpaceProfileReport: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +116,7 @@ async def run_confluence_batch(
     embedder: Embedder,
     config: ConfluenceBatchConfig,
     parser: ADFParser | None = None,
+    generation_id: int | None = None,
 ) -> BatchResult:
     """Run a full snapshot ingest and garbage-collect only after full success.
 
@@ -126,6 +135,7 @@ async def run_confluence_batch(
             config=config,
             parser=parser or ADFParser(),
             started=started,
+            generation_id=generation_id,
         )
 
 
@@ -137,6 +147,7 @@ async def _run_locked(
     config: ConfluenceBatchConfig,
     parser: ADFParser,
     started: float,
+    generation_id: int | None,
 ) -> BatchResult:
     space = await client.get_space_by_key(config.space_key)
     folder = await client.get_folder(config.folder_id)
@@ -213,16 +224,29 @@ async def _run_locked(
             source_id=item.page_id,
             chunks=item.chunks,
             embeddings=item.embeddings,
+            generation_id=generation_id,
         )
 
-    stale = store.list_source_ids(space_key=config.space_key) - seen
+    stale = store.list_source_ids(
+        space_key=config.space_key, generation_id=generation_id
+    ) - seen
     for source_id in sorted(stale):
-        store.delete_source(space_key=config.space_key, source_id=source_id)
+        store.delete_source(
+            space_key=config.space_key,
+            source_id=source_id,
+            generation_id=generation_id,
+        )
+    report = store.profile_report(space_key=config.space_key)
+    target_generation_id = generation_id or report.active_generation_id
+    if target_generation_id is None:
+        raise RuntimeError("Completed batch has no target embedding generation")
     elapsed = time.monotonic() - started
     logger.info(
-        "Confluence ingest complete: space=%s pages=%s chunks=%s vertex_calls=%s "
+        "Confluence ingest complete: space=%s generation_id=%s pages=%s chunks=%s "
+        "vertex_calls=%s "
         "deleted_sources=%s elapsed_seconds=%.3f skipped_pages=%s suppressed_pages=%s",
         config.space_key,
+        target_generation_id,
         len(prepared),
         total_chunks,
         vertex_calls,
@@ -231,6 +255,7 @@ async def _run_locked(
         skipped_pages,
         suppressed_pages,
     )
+    logger.info("Embedding provenance batch report: %s", report)
     return BatchResult(
         pages=len(prepared),
         chunks=total_chunks,

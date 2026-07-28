@@ -34,6 +34,19 @@ def _positive_env(name: str, default: int) -> int:
     return value
 
 
+def _optional_positive_env(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if value < 1:
+        raise RuntimeError(f"{name} must be positive")
+    return value
+
+
 def _make_embedder() -> Embedder:
     return resolve_embedder()
 
@@ -63,6 +76,7 @@ async def _run() -> None:
             store=store,
             embedder=embedder,
             config=config,
+            generation_id=_optional_positive_env("DATABRIDGE_GENERATION_ID"),
         )
     logging.getLogger(__name__).info("Batch result: %s", result)
 

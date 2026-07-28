@@ -50,6 +50,27 @@ class Generation:
     state: GenerationState
 
 
+@dataclass(frozen=True, slots=True)
+class GenerationChunkCount:
+    generation_id: int
+    state: GenerationState
+    chunk_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class SpaceProfileReport:
+    space_key: str
+    active_generation_id: int | None
+    active_state: GenerationState | None
+    building_generation_exists: bool
+    generation_chunk_counts: tuple[GenerationChunkCount, ...]
+    null_generation_chunk_count: int
+    distinct_profile_count: int
+    stored_fingerprint: str | None
+    runtime_fingerprint: str
+    fingerprint_matches: bool | None
+
+
 def profile_id_for(profile: EmbeddingProfile) -> str:
     """Use the canonical configuration fingerprint as the deterministic row id."""
     return profile.config_fingerprint

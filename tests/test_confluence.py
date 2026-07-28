@@ -30,6 +30,11 @@ from databridge.confluence.models import Body, BodyFormat, Page, Space
 from databridge.confluence.parser import ADFParser
 from databridge.embed import HashedEmbedder
 from databridge.ingest.chunker import Chunk, chunk_document
+from databridge.store import (
+    GenerationChunkCount,
+    GenerationState,
+    SpaceProfileReport,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -629,6 +634,7 @@ class _BatchStore:
         self.acquired = acquired
         self.fail_replace = fail_replace
         self.events: list[str] = []
+        self.generation_ids: list[int | None] = []
 
     @contextmanager
     def advisory_lock(self, key: str) -> Iterator[bool]:
@@ -645,23 +651,53 @@ class _BatchStore:
         source_id: str,
         chunks: list[Chunk],
         embeddings: list[list[float]],
+        generation_id: int | None = None,
     ) -> int:
         assert space_key == "CONF_DEMO"
         assert chunks and len(chunks) == len(embeddings)
         self.events.append(f"replace:{source_id}")
+        self.generation_ids.append(generation_id)
         if source_id == self.fail_replace:
             raise RuntimeError("database write failed")
         return len(chunks)
 
-    def list_source_ids(self, *, space_key: str) -> set[str]:
+    def list_source_ids(
+        self, *, space_key: str, generation_id: int | None = None
+    ) -> set[str]:
         assert space_key == "CONF_DEMO"
         self.events.append("list")
+        self.generation_ids.append(generation_id)
         return set(self.existing)
 
-    def delete_source(self, *, space_key: str, source_id: str) -> int:
+    def delete_source(
+        self,
+        *,
+        space_key: str,
+        source_id: str,
+        generation_id: int | None = None,
+    ) -> int:
         assert space_key == "CONF_DEMO"
         self.events.append(f"delete:{source_id}")
+        self.generation_ids.append(generation_id)
         return 1
+
+    def profile_report(self, *, space_key: str) -> SpaceProfileReport:
+        assert space_key == "CONF_DEMO"
+        profile = HashedEmbedder().profile
+        return SpaceProfileReport(
+            space_key=space_key,
+            active_generation_id=41,
+            active_state=GenerationState.ACTIVE,
+            building_generation_exists=False,
+            generation_chunk_counts=(
+                GenerationChunkCount(41, GenerationState.ACTIVE, len(self.existing)),
+            ),
+            null_generation_chunk_count=0,
+            distinct_profile_count=1,
+            stored_fingerprint=profile.config_fingerprint,
+            runtime_fingerprint=profile.config_fingerprint,
+            fingerprint_matches=True,
+        )
 
 
 @pytest.mark.asyncio

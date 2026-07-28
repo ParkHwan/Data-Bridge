@@ -29,7 +29,14 @@ from pgvector.psycopg import register_vector
 from databridge.embed.base import EMBEDDING_DIM, EmbeddingProfile
 from databridge.ingest.chunker import Chunk
 from databridge.store.exceptions import EmbeddingProfileMismatchError
-from databridge.store.provenance import Generation, GenerationState, ProfileMode, profile_id_for
+from databridge.store.provenance import (
+    Generation,
+    GenerationChunkCount,
+    GenerationState,
+    ProfileMode,
+    SpaceProfileReport,
+    profile_id_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -289,6 +296,80 @@ class PgVectorStore:
         """Validate runtime provenance before startup or a top-level query."""
         with self._connect() as conn, conn.cursor() as cur:
             self._resolve_search_generation(cur, space_key=space_key)
+            report = self._profile_report(cur, space_key=space_key)
+        logger.info("Embedding provenance preflight: %s", report)
+
+    def profile_report(self, *, space_key: str) -> SpaceProfileReport:
+        """Return an operational provenance report for one space."""
+        with self._connect() as conn, conn.cursor() as cur:
+            return self._profile_report(cur, space_key=space_key)
+
+    def _profile_report(
+        self, cur: psycopg.Cursor, *, space_key: str
+    ) -> SpaceProfileReport:
+        profile = self._require_profile()
+        cur.execute(
+            """
+            SELECT g.generation_id, g.state, count(c.id), p.config_fingerprint
+              FROM space_generation g
+              JOIN embedding_profile p ON p.profile_id = g.profile_id
+              LEFT JOIN chunks c
+                ON c.space_key = g.space_key
+               AND c.generation_id = g.generation_id
+             WHERE g.space_key = %s
+             GROUP BY g.generation_id, g.state, p.config_fingerprint
+             ORDER BY g.generation_id
+            """,
+            (space_key,),
+        )
+        rows = cur.fetchall()
+        counts = tuple(
+            GenerationChunkCount(
+                generation_id=int(row[0]),
+                state=GenerationState(str(row[1])),
+                chunk_count=int(row[2]),
+            )
+            for row in rows
+        )
+        active_rows = [row for row in rows if str(row[1]) == GenerationState.ACTIVE]
+        active = active_rows[0] if active_rows else None
+        stored_fingerprint = None if active is None else str(active[3])
+        cur.execute(
+            """
+            SELECT count(*)
+              FROM chunks
+             WHERE space_key = %s AND generation_id IS NULL
+            """,
+            (space_key,),
+        )
+        null_row = cur.fetchone()
+        cur.execute(
+            """
+            SELECT count(DISTINCT g.profile_id)
+              FROM space_generation g
+             WHERE g.space_key = %s
+            """,
+            (space_key,),
+        )
+        profile_row = cur.fetchone()
+        return SpaceProfileReport(
+            space_key=space_key,
+            active_generation_id=None if active is None else int(active[0]),
+            active_state=None if active is None else GenerationState(str(active[1])),
+            building_generation_exists=any(
+                item.state is GenerationState.BUILDING for item in counts
+            ),
+            generation_chunk_counts=counts,
+            null_generation_chunk_count=int(null_row[0]) if null_row else 0,
+            distinct_profile_count=int(profile_row[0]) if profile_row else 0,
+            stored_fingerprint=stored_fingerprint,
+            runtime_fingerprint=profile.config_fingerprint,
+            fingerprint_matches=(
+                None
+                if stored_fingerprint is None
+                else stored_fingerprint == profile.config_fingerprint
+            ),
+        )
 
     @staticmethod
     def _assert_matching_profile(generation: Generation, profile: EmbeddingProfile) -> None:
