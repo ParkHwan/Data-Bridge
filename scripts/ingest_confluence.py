@@ -8,7 +8,7 @@ import os
 import sys
 
 from databridge.confluence import ConfluenceBatchConfig, ConfluenceClient, run_confluence_batch
-from databridge.embed import Embedder, HashedEmbedder
+from databridge.embed import Embedder, resolve_embedder
 from databridge.store import PgVectorStore
 
 DEFAULT_DSN = "postgresql://databridge:databridge@localhost:5433/databridge"
@@ -35,14 +35,7 @@ def _positive_env(name: str, default: int) -> int:
 
 
 def _make_embedder() -> Embedder:
-    kind = os.environ.get("DATABRIDGE_EMBEDDER", os.environ.get("EMBEDDER", "vertex")).lower()
-    if kind == "vertex":
-        from databridge.embed.vertex import VertexEmbedder
-
-        return VertexEmbedder()
-    if kind == "hashed":
-        return HashedEmbedder()
-    raise RuntimeError(f"Unsupported embedder: {kind}")
+    return resolve_embedder()
 
 
 async def _run() -> None:

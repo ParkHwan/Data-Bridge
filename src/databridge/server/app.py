@@ -6,6 +6,8 @@ renderer, never a source of truth (design D-12, §4.1).
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from importlib import resources
 from typing import Any
 
@@ -13,9 +15,19 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
 
+from databridge.agents.deps import get_deps
 from databridge.agents.runtime import NoEvidenceError, ask_async
 
-app = FastAPI(title="Data Bridge", version="0.2.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Fail startup with a configuration error instead of failing the first /ask."""
+    del app
+    get_deps()
+    yield
+
+
+app = FastAPI(title="Data Bridge", version="0.2.0", lifespan=lifespan)
 
 
 class AskRequest(BaseModel):

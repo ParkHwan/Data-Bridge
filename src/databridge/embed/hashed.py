@@ -11,12 +11,33 @@ import hashlib
 import math
 import re
 
-from databridge.embed.base import EMBEDDING_DIM
+from databridge.embed.base import EMBEDDING_DIM, EmbeddingProfile, make_config_fingerprint
 
 _TOKEN_RE = re.compile(r"[\w가-힣]+")
+_PROVIDER = "hashed"
+_MODEL = "sha256-token-hash-bow-v1"
+_PROFILE = EmbeddingProfile(
+    provider=_PROVIDER,
+    model=_MODEL,
+    dimension=EMBEDDING_DIM,
+    config_fingerprint=make_config_fingerprint(
+        provider=_PROVIDER,
+        model=_MODEL,
+        dimension=EMBEDDING_DIM,
+        options={
+            "normalization": "l2",
+            "signed_hash": True,
+            "token_pattern": _TOKEN_RE.pattern,
+        },
+    ),
+)
 
 
 class HashedEmbedder:
+    @property
+    def profile(self) -> EmbeddingProfile:
+        return _PROFILE
+
     def embed(self, texts: list[str]) -> list[list[float]]:
         return [self._embed_one(text) for text in texts]
 

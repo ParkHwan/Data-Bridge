@@ -110,6 +110,7 @@ if gcloud run jobs describe databridge-ingest \
   --project "$PROJECT" --region "$REGION" >/dev/null 2>&1; then
   gcloud run jobs update databridge-ingest --project "$PROJECT" --region "$REGION" \
     --remove-env-vars DATABRIDGE_DSN \
+    --update-env-vars "DATABRIDGE_EMBEDDER=vertex" \
     --update-secrets "DATABRIDGE_DSN=DATABRIDGE_DSN:latest"
 fi
 
@@ -161,12 +162,22 @@ SERVICE_SPACE=$(printf '%s\n' "$SERVICE_EXPORT" | awk '
     }
     f=0
   }')
-if [[ "$SERVICE_DSN_KIND" == "secret" && "$SERVICE_SPACE" == "$DATABRIDGE_SPACE" ]]; then
-  echo "databridge service already uses the DSN secret and DATABRIDGE_SPACE=${DATABRIDGE_SPACE}; skipping update."
+SERVICE_EMBEDDER=$(printf '%s\n' "$SERVICE_EXPORT" | awk '
+  /^[[:space:]]*-[[:space:]]*name:[[:space:]]*DATABRIDGE_EMBEDDER[[:space:]]*$/ {f=1; next}
+  f {
+    if ($0 ~ /^[[:space:]]*value:/) {
+      sub(/^[[:space:]]*value:[[:space:]]*/, "")
+      print
+      exit
+    }
+    f=0
+  }')
+if [[ "$SERVICE_DSN_KIND" == "secret" && "$SERVICE_SPACE" == "$DATABRIDGE_SPACE" && "$SERVICE_EMBEDDER" == "vertex" ]]; then
+  echo "databridge service already uses the DSN secret, DATABRIDGE_SPACE=${DATABRIDGE_SPACE}, and DATABRIDGE_EMBEDDER=vertex; skipping update."
 else
   gcloud run services update databridge --project "$PROJECT" --region "$REGION" \
     --remove-env-vars DATABRIDGE_DSN \
-    --update-env-vars "DATABRIDGE_SPACE=${DATABRIDGE_SPACE}" \
+    --update-env-vars "DATABRIDGE_SPACE=${DATABRIDGE_SPACE},DATABRIDGE_EMBEDDER=vertex" \
     --update-secrets "DATABRIDGE_DSN=DATABRIDGE_DSN:latest"
 fi
 
