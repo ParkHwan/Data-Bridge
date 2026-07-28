@@ -41,6 +41,9 @@ self-authored space only (D-10); the sample corpus above still drives the local 
 [v0.2.5](docs/releases/v0.2.5.md) hardened that path from real operation: an empty page no longer
 fails the nightly run, the Cloud SQL DSN moved to Secret Manager, and the serving space now has a
 declared default in `scripts/setup_cicd.sh` (the release note documents how to change it).
+[v0.2.6](docs/releases/v0.2.6.md) closed four gaps in the quality gate itself — starting with a
+target corpus that was implicit and could disagree with production — and
+[v0.2.7](docs/releases/v0.2.7.md) made a refusal diagnosable.
 
 ### Data Agent guardrails (all enforced in code, never left to the model)
 
@@ -65,15 +68,21 @@ GOOGLE_GENAI_USE_VERTEXAI=TRUE GOOGLE_CLOUD_PROJECT=<project> \
 # → http://localhost:8080
 ```
 
-Quality gates: `uv run pytest -q` (96 tests) / `uv run ruff check .` / `uv run mypy`
+Quality gates: `uv run pytest -q` / `uv run ruff check .` / `uv run mypy`
+(the test count depends on whether the local database is up — integration tests skip without it)
 
 ## Evaluation (golden set)
 
 Eleven questions over the self-authored demo corpus, covering all three specialists and the
 refusal path: 7 knowledge (5 English + 2 Korean exercising trigram recall), 2 data (BigQuery
 NL2SQL), 1 report, 1 refusal. The evaluator checks **observable contracts** — final agent,
-tool subsequence, citation kind, keyword threshold, and refusal — and the gate is green only
-when every item passes (`PASS`/`FAIL`/`REFUSAL_OK`/`ERROR`). Latest owner-run: **11/11**.
+tool subsequence, citation kind, exact values, keyword threshold, and refusal — and the gate is
+green only when every item passes (`PASS`/`FAIL`/`REFUSAL_OK`/`ERROR`). Latest owner-run:
+**10/11**; `DG-004` is unstable (4 of 9 isolated runs passed) and its refusals are diagnosed in
+[v0.2.7](docs/releases/v0.2.7.md).
+
+The golden file declares the space it targets, and `--space` asserts that value rather than
+overriding it, so a space-key mismatch is blocked before the first question is asked.
 
 ```bash
 GOOGLE_CLOUD_PROJECT=<project> uv run python scripts/run_golden.py
