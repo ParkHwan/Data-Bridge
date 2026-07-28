@@ -25,8 +25,10 @@ from typing import Any
 import psycopg
 from pgvector.psycopg import register_vector
 
-from databridge.embed.base import EMBEDDING_DIM
+from databridge.embed.base import EMBEDDING_DIM, EmbeddingProfile
 from databridge.ingest.chunker import Chunk
+from databridge.store.exceptions import EmbeddingProfileMismatchError
+from databridge.store.provenance import Generation, GenerationState, profile_id_for
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +125,106 @@ class PgVectorStore:
             finally:
                 if acquired:
                     cur.execute("SELECT pg_advisory_unlock(hashtextextended(%s, 0))", (key,))
+
+    @staticmethod
+    def _lock_space_for_update(cur: psycopg.Cursor, space_key: str) -> None:
+        """Serialize provenance mutations for one space until transaction end."""
+        lock_key = f"databridge:embedding-profile:{space_key}"
+        cur.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock_key,))
+
+    @staticmethod
+    def _ensure_profile(cur: psycopg.Cursor, profile: EmbeddingProfile) -> str:
+        profile_id = profile_id_for(profile)
+        cur.execute(
+            """
+            INSERT INTO embedding_profile
+                (profile_id, provider, model, dimension, config_fingerprint)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+            """,
+            (
+                profile_id,
+                profile.provider,
+                profile.model,
+                profile.dimension,
+                profile.config_fingerprint,
+            ),
+        )
+        cur.execute(
+            """
+            SELECT provider, model, dimension, config_fingerprint
+              FROM embedding_profile
+             WHERE profile_id = %s
+            """,
+            (profile_id,),
+        )
+        row = cur.fetchone()
+        expected = (
+            profile.provider,
+            profile.model,
+            profile.dimension,
+            profile.config_fingerprint,
+        )
+        if row is None or tuple(row) != expected:
+            raise EmbeddingProfileMismatchError("Stored embedding profile identity is inconsistent")
+        return profile_id
+
+    @staticmethod
+    def _generation_from_row(row: tuple[Any, ...]) -> Generation:
+        return Generation(
+            generation_id=int(row[0]),
+            space_key=str(row[1]),
+            profile=EmbeddingProfile(
+                provider=str(row[2]),
+                model=str(row[3]),
+                dimension=int(row[4]),
+                config_fingerprint=str(row[5]),
+            ),
+            state=GenerationState(str(row[6])),
+        )
+
+    @classmethod
+    def _get_generation(
+        cls,
+        cur: psycopg.Cursor,
+        *,
+        space_key: str,
+        generation_id: int,
+        for_update: bool = False,
+    ) -> Generation | None:
+        lock_clause = "FOR UPDATE" if for_update else ""
+        cur.execute(
+            f"""
+            SELECT g.generation_id, g.space_key, p.provider, p.model, p.dimension,
+                   p.config_fingerprint, g.state
+              FROM space_generation g
+              JOIN embedding_profile p ON p.profile_id = g.profile_id
+             WHERE g.space_key = %s AND g.generation_id = %s
+             {lock_clause}
+            """,
+            (space_key, generation_id),
+        )
+        row = cur.fetchone()
+        return None if row is None else cls._generation_from_row(row)
+
+    @classmethod
+    def _get_active_generation(
+        cls, cur: psycopg.Cursor, *, space_key: str, for_update: bool = False
+    ) -> Generation | None:
+        lock_clause = "FOR UPDATE OF g" if for_update else ""
+        cur.execute(
+            f"""
+            SELECT g.generation_id, g.space_key, p.provider, p.model, p.dimension,
+                   p.config_fingerprint, g.state
+              FROM space_generation g
+              JOIN embedding_profile p ON p.profile_id = g.profile_id
+             WHERE g.space_key = %s AND g.state = 'active'
+             {lock_clause}
+            """,
+            (space_key,),
+        )
+        row = cur.fetchone()
+        return None if row is None else cls._generation_from_row(row)
 
     @staticmethod
     def _validate_batch(chunks: list[Chunk], embeddings: list[list[float]]) -> None:

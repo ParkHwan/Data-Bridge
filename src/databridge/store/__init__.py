@@ -2,5 +2,12 @@
 
 from databridge.store.exceptions import EmbeddingProfileMismatchError
 from databridge.store.pg import PgVectorStore, SearchHit
+from databridge.store.provenance import Generation, GenerationState
 
-__all__ = ["EmbeddingProfileMismatchError", "PgVectorStore", "SearchHit"]
+__all__ = [
+    "EmbeddingProfileMismatchError",
+    "Generation",
+    "GenerationState",
+    "PgVectorStore",
+    "SearchHit",
+]
