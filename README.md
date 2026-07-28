@@ -59,13 +59,21 @@ target corpus that was implicit and could disagree with production — and
 docker compose up -d
 uv pip install -e ".[server,gcp,dev]"
 
-# 2) ingest the sample corpus (no GCP needed: hashed embedder / Vertex: DATABRIDGE_EMBEDDER=vertex)
-uv run python scripts/ingest_samples.py
+# 2) ingest the sample corpus
+#    Set DATABRIDGE_EMBEDDER to the SAME value in step 3 — the defaults differ
+#    (ingest: hashed, runtime: vertex) and a mismatch fails silently, not loudly.
+DATABRIDGE_EMBEDDER=hashed uv run python scripts/ingest_samples.py
 
-# 3) serve (Vertex AI requires ADC)
-GOOGLE_GENAI_USE_VERTEXAI=TRUE GOOGLE_CLOUD_PROJECT=<project> \
+# 3) serve. The hashed embedder keeps embedding local, but the agents still call
+#    Gemini, so Google model credentials are required either way.
+DATABRIDGE_EMBEDDER=hashed GOOGLE_GENAI_USE_VERTEXAI=TRUE GOOGLE_CLOUD_PROJECT=<project> \
   uv run uvicorn databridge.server.app:app --port 8080
 # → http://localhost:8080
+
+# 3') or serve against Vertex (requires ADC) — then re-ingest step 2 with vertex too
+DATABRIDGE_EMBEDDER=vertex uv run python scripts/ingest_samples.py
+DATABRIDGE_EMBEDDER=vertex GOOGLE_GENAI_USE_VERTEXAI=TRUE GOOGLE_CLOUD_PROJECT=<project> \
+  uv run uvicorn databridge.server.app:app --port 8080
 ```
 
 Quality gates: `uv run pytest -q` / `uv run ruff check .` / `uv run mypy`
@@ -78,14 +86,25 @@ refusal path: 7 knowledge (5 English + 2 Korean exercising trigram recall), 2 da
 NL2SQL), 1 report, 1 refusal. The evaluator checks **observable contracts** — final agent,
 tool subsequence, citation kind, exact values, keyword threshold, and refusal — and the gate is
 green only when every item passes (`PASS`/`FAIL`/`REFUSAL_OK`/`ERROR`). Latest owner-run:
-**10/11**; `DG-004` is unstable (4 of 9 isolated runs passed) and its refusals are diagnosed in
-[v0.2.7](docs/releases/v0.2.7.md).
+**10/11**, the failure being `DG-009` — its expected value is a constant pinned against
+`bigquery-public-data.thelook_ecommerce`, which is not a static snapshot, so the agent's answer was
+right and the pin was stale.
+
+**Run the ingest and the query path with the same embedder.** `DATABRIDGE_EMBEDDER` currently
+defaults to `hashed` in `scripts/ingest_samples.py` and to `vertex` in the agent runtime. Both
+produce 768 dimensions, so a mismatch raises no error — it just ranks against a different vector
+space. Earlier reports of `DG-004` instability were measured under that mismatch; after
+re-ingesting with a matching embedder the item answered and cited correctly in 10 of 10 isolated
+runs. Ten runs bound the failure rate loosely, so this is not a stability certificate.
 
 The golden file declares the space it targets, and `--space` asserts that value rather than
-overriding it, so a space-key mismatch is blocked before the first question is asked.
+overriding it, so a space-key mismatch is blocked before the first question is asked. There is no
+equivalent guard for the embedder yet.
 
 ```bash
-GOOGLE_CLOUD_PROJECT=<project> uv run python scripts/run_golden.py
+# same embedder as the ingest that built the index, for the same reason as above
+DATABRIDGE_EMBEDDER=vertex GOOGLE_CLOUD_PROJECT=<project> \
+  uv run python scripts/run_golden.py
 ```
 
 The evaluator itself (`src/databridge/evals/`) is ADK-independent and unit-tested offline; see
