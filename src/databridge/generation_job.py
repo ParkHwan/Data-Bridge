@@ -17,6 +17,10 @@ CLI_PREFIX = "DATABRIDGE_RESULT "
 WRAPPER_PREFIX = "DATABRIDGE_WRAPPER_RESULT "
 _MISSING = object()
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+COMMAND_TIMEOUT_SECONDS = 30.0
+CORRELATION_TIMEOUT_SECONDS = 120.0
+TASK_READ_TIMEOUT_SECONDS = 60.0
+LOG_READ_TIMEOUT_SECONDS = 30.0
 
 REASONS: dict[int, frozenset[str]] = {
     0: frozenset({"ok"}),
@@ -84,6 +88,10 @@ class WrapperUsageError(RuntimeError):
 class WrapperArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> NoReturn:
         raise WrapperUsageError(message)
+
+
+class ReadStageDeadlineExceeded(RuntimeError):
+    """A bounded read stage exhausted its wall-clock deadline."""
 
 
 def _is_json_int(value: object) -> bool:
@@ -253,15 +261,23 @@ def validate_cli_markers(
     return MarkerResult(marker_exit, reason), None
 
 
-RunCommand = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+RunCommand = Callable[[Sequence[str], float], subprocess.CompletedProcess[str]]
 
 
-def _run_command(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, check=False, capture_output=True, text=True)
+def _run_command(
+    command: Sequence[str], timeout_seconds: float
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=max(timeout_seconds, 0.001),
+    )
 
 
-def _gcloud_json(run: RunCommand, command: list[str]) -> object:
-    completed = run([*command, "--format=json"])
+def _gcloud_json(run: RunCommand, command: list[str], *, timeout_seconds: float) -> object:
+    completed = run([*command, "--format=json"], timeout_seconds)
     if completed.returncode != 0:
         raise RuntimeError(completed.stderr or "gcloud read failed")
     return json.loads(completed.stdout)
@@ -272,16 +288,30 @@ def _gcloud_json_retry(
     command: list[str],
     *,
     sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+    deadline: float,
     attempts: int = 3,
 ) -> object:
     last_error: Exception | None = None
     for attempt in range(attempts):
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise ReadStageDeadlineExceeded("gcloud read deadline exhausted") from last_error
         try:
-            return _gcloud_json(run, command)
-        except (RuntimeError, json.JSONDecodeError) as exc:
+            return _gcloud_json(
+                run,
+                command,
+                timeout_seconds=min(COMMAND_TIMEOUT_SECONDS, remaining),
+            )
+        except (OSError, RuntimeError, json.JSONDecodeError, subprocess.TimeoutExpired) as exc:
             last_error = exc
             if attempt + 1 < attempts:
-                sleep(1.0)
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise ReadStageDeadlineExceeded(
+                        "gcloud read deadline exhausted"
+                    ) from last_error
+                sleep(min(1.0, remaining))
     raise RuntimeError("gcloud read retries exhausted") from last_error
 
 
@@ -303,32 +333,46 @@ def _correlate_execution(
     job: str,
     operation_id: str,
     sleep: Callable[[float], None],
+    monotonic: Callable[[], float],
+    deadline: float,
 ) -> tuple[str | None, TaskDecision | None]:
     base = ["gcloud", "run", "jobs", "executions"]
     listed = _gcloud_json_retry(
         run,
         [*base, "list", "--job", job, "--project", project, "--region", region],
         sleep=sleep,
+        monotonic=monotonic,
+        deadline=deadline,
     )
     if not isinstance(listed, list):
         raise RuntimeError("execution list did not return a JSON list")
     matches: list[str] = []
+    indeterminate = False
     for item in listed:
         if not isinstance(item, Mapping):
+            indeterminate = True
             continue
         metadata = item.get("metadata")
         name = metadata.get("name") if isinstance(metadata, Mapping) else None
         if not isinstance(name, str):
+            indeterminate = True
             continue
         described = _gcloud_json_retry(
             run,
             [*base, "describe", name, "--project", project, "--region", region],
             sleep=sleep,
+            monotonic=monotonic,
+            deadline=deadline,
         )
+        if not isinstance(described, Mapping):
+            indeterminate = True
+            continue
         if _contains_operation_id(described, operation_id):
             matches.append(name)
     if len(matches) > 1:
         return None, TaskDecision(87, "duplicate_execution")
+    if indeterminate:
+        return None, TaskDecision(85, "correlation_indeterminate")
     if len(matches) == 1:
         return matches[0], None
     return None, TaskDecision(85, "correlation_indeterminate")
@@ -448,9 +492,13 @@ def execute(
         "--format=value(metadata.name)",
     ]
     try:
-        created = run(command)  # Deliberately exactly once: this call is non-idempotent.
+        created = run(
+            command, COMMAND_TIMEOUT_SECONDS
+        )  # Deliberately exactly once: this call is non-idempotent.
     except OSError:
         return TaskDecision(85, "creation_confirmed_absent"), None, operation_id
+    except subprocess.TimeoutExpired:
+        created = subprocess.CompletedProcess(command, 1, "", "jobs execute timed out")
     execution: str | None = created.stdout.strip() if created.returncode == 0 else None
     if not execution:
         try:
@@ -461,8 +509,10 @@ def execute(
                 job=job,
                 operation_id=operation_id,
                 sleep=sleep,
+                monotonic=monotonic,
+                deadline=monotonic() + CORRELATION_TIMEOUT_SECONDS,
             )
-        except (RuntimeError, json.JSONDecodeError):
+        except (ReadStageDeadlineExceeded, RuntimeError, json.JSONDecodeError):
             return TaskDecision(85, "wrapper_transport_error"), None, operation_id
         if correlation is not None:
             return correlation, None, operation_id
@@ -488,13 +538,20 @@ def execute(
                     region,
                 ],
                 sleep=sleep,
+                monotonic=monotonic,
+                deadline=deadline,
             )
+        except ReadStageDeadlineExceeded:
+            return TaskDecision(80, "wrapper_timeout"), None, operation_id
         except (RuntimeError, json.JSONDecodeError):
             return TaskDecision(85, "wrapper_transport_error"), None, operation_id
         if _execution_complete(state):
             break
-        sleep(1.0)
+        remaining = deadline - monotonic()
+        if remaining > 0:
+            sleep(min(1.0, remaining))
 
+    task_deadline = monotonic() + TASK_READ_TIMEOUT_SECONDS
     try:
         names = _gcloud_json_retry(
             run,
@@ -513,37 +570,43 @@ def execute(
                 region,
             ],
             sleep=sleep,
+            monotonic=monotonic,
+            deadline=task_deadline,
         )
         if not isinstance(names, list):
             raise RuntimeError("task list did not return a JSON list")
-        tasks: list[Mapping[str, object]] = []
-        for item in names:
-            if not isinstance(item, Mapping):
-                continue
-            metadata = item.get("metadata")
-            task_name = metadata.get("name") if isinstance(metadata, Mapping) else None
-            if not isinstance(task_name, str):
-                continue
-            described = _gcloud_json_retry(
-                run,
-                [
-                    "gcloud",
-                    "run",
-                    "jobs",
-                    "executions",
-                    "tasks",
-                    "describe",
-                    task_name,
-                    "--project",
-                    project,
-                    "--region",
-                    region,
-                ],
-                sleep=sleep,
-            )
-            if isinstance(described, Mapping):
-                tasks.append(described)
-    except (RuntimeError, json.JSONDecodeError):
+        if len(names) != 1:
+            return TaskDecision(83, "task_result_unavailable"), None, operation_id
+        item = names[0]
+        if not isinstance(item, Mapping):
+            return TaskDecision(83, "task_result_unavailable"), None, operation_id
+        metadata = item.get("metadata")
+        task_name = metadata.get("name") if isinstance(metadata, Mapping) else None
+        if not isinstance(task_name, str):
+            return TaskDecision(83, "task_result_unavailable"), None, operation_id
+        described = _gcloud_json_retry(
+            run,
+            [
+                "gcloud",
+                "run",
+                "jobs",
+                "executions",
+                "tasks",
+                "describe",
+                task_name,
+                "--project",
+                project,
+                "--region",
+                region,
+            ],
+            sleep=sleep,
+            monotonic=monotonic,
+            deadline=task_deadline,
+        )
+        if not isinstance(described, Mapping):
+            return TaskDecision(83, "task_result_unavailable"), None, operation_id
+        tasks = [described]
+    except (ReadStageDeadlineExceeded, RuntimeError, json.JSONDecodeError):
         return TaskDecision(85, "wrapper_transport_error"), None, operation_id
 
     decision = evaluate_tasks(tasks)
@@ -564,10 +627,19 @@ def execute(
         "--limit=100",
     ]
     lines: list[str] = []
+    log_deadline = monotonic() + LOG_READ_TIMEOUT_SECONDS
     for attempt in range(10):
+        if monotonic() >= log_deadline:
+            break
         try:
-            logs = _gcloud_json_retry(run, log_command, sleep=sleep)
-        except RuntimeError:
+            logs = _gcloud_json_retry(
+                run,
+                log_command,
+                sleep=sleep,
+                monotonic=monotonic,
+                deadline=log_deadline,
+            )
+        except (ReadStageDeadlineExceeded, RuntimeError):
             return TaskDecision(85, "wrapper_transport_error"), None, operation_id
         if isinstance(logs, list):
             lines = [
@@ -578,7 +650,9 @@ def execute(
         if any(line.startswith(CLI_PREFIX) for line in lines):
             break
         if attempt < 9:
-            sleep(1.0)
+            remaining = log_deadline - monotonic()
+            if remaining > 0:
+                sleep(min(1.0, remaining))
     marker, marker_error = validate_cli_markers(
         lines, operation_id=operation_id, expected_exit=decision.exit_code
     )

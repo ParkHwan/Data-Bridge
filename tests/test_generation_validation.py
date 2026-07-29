@@ -2568,3 +2568,165 @@ def test_delete_legacy_lock_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         lock_conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock_key,))
         with pytest.raises(psycopg.errors.LockNotAvailable):
             store.delete_legacy_chunks(space_key=space_key, generation_id=generation_id)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+def test_delete_legacy_cli_success_output_and_marker_follow_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space("DELETE_CLI_SUCCESS")
+    generation_id = _prepare_legacy_cleanup(store, space_key=space_key, tmp_path=tmp_path)
+    cli = _load_cli()
+    monkeypatch.setenv("DATABRIDGE_DSN", DSN)
+    monkeypatch.setenv("DATABRIDGE_EMBEDDER", "hashed")
+    monkeypatch.setenv("DATABRIDGE_PROFILE_MODE", "observe")
+    original_emit = cli._emit_marker
+    commit_visible_at_marker = False
+
+    def assert_commit_then_emit(**kwargs: object) -> None:
+        nonlocal commit_visible_at_marker
+        with psycopg.connect(DSN) as observer:
+            row = observer.execute(
+                "SELECT count(*) FROM chunks WHERE space_key=%s AND generation_id IS NULL",
+                (space_key,),
+            ).fetchone()
+        commit_visible_at_marker = row == (0,)
+        original_emit(**kwargs)
+
+    monkeypatch.setattr(cli, "_emit_marker", assert_commit_then_emit)
+    assert (
+        cli.main(
+            [
+                "delete-legacy",
+                "--space",
+                space_key,
+                "--generation-id",
+                str(generation_id),
+                "--yes",
+            ]
+        )
+        == 0
+    )
+    assert commit_visible_at_marker is True
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 2
+    output = json.loads(lines[0])
+    assert set(output) == {
+        "space_key",
+        "generation_id",
+        "legacy_count_before",
+        "deleted_count",
+    }
+    assert output == {
+        "space_key": space_key,
+        "generation_id": generation_id,
+        "legacy_count_before": 1,
+        "deleted_count": 1,
+    }
+    assert isinstance(output["space_key"], str)
+    for field in ("generation_id", "legacy_count_before", "deleted_count"):
+        assert isinstance(output[field], int) and not isinstance(output[field], bool)
+    marker = json.loads(lines[1].split(" ", 1)[1])
+    assert marker["exit_code"] == 0
+    assert marker["reason"] == "ok"
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+@pytest.mark.parametrize("stale", ["checksum", "chunk_count", "manifest_revision"])
+def test_delete_legacy_cli_noop_ignores_each_stale_content_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    stale: str,
+) -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space(f"DELETE_CLI_NOOP_{stale.upper()}")
+    generation_id = _prepare_legacy_cleanup(store, space_key=space_key, tmp_path=tmp_path)
+    assignments = {
+        "checksum": "checksum=repeat('0', 64)",
+        "chunk_count": "chunk_count=chunk_count + 1",
+        "manifest_revision": "manifest_revision=manifest_revision + 1",
+    }
+    with psycopg.connect(DSN) as conn:
+        conn.execute(
+            "DELETE FROM chunks WHERE space_key=%s AND generation_id IS NULL",
+            (space_key,),
+        )
+        conn.execute(
+            f"UPDATE generation_validation SET {assignments[stale]} "
+            "WHERE space_key=%s AND generation_id=%s",
+            (space_key, generation_id),
+        )
+
+    cli = _load_cli()
+    monkeypatch.setenv("DATABRIDGE_DSN", DSN)
+    monkeypatch.setenv("DATABRIDGE_EMBEDDER", "hashed")
+    monkeypatch.setenv("DATABRIDGE_PROFILE_MODE", "observe")
+    assert (
+        cli.main(
+            [
+                "delete-legacy",
+                "--space",
+                space_key,
+                "--generation-id",
+                str(generation_id),
+                "--yes",
+            ]
+        )
+        == 0
+    )
+    lines = capsys.readouterr().out.splitlines()
+    output = json.loads(lines[0])
+    marker = json.loads(lines[1].split(" ", 1)[1])
+    assert output["legacy_count_before"] == 0
+    assert output["deleted_count"] == 0
+    assert marker["exit_code"] == 0
+    assert marker["reason"] == "ok"
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+def test_delete_legacy_cli_lock_timeout_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space("DELETE_CLI_LOCK")
+    generation_id = _prepare_legacy_cleanup(store, space_key=space_key, tmp_path=tmp_path)
+
+    def set_short_timeout(cur: psycopg.Cursor[object]) -> None:
+        cur.execute("SET LOCAL lock_timeout = '50ms'")
+
+    monkeypatch.setattr(PgVectorStore, "_set_lock_timeout", staticmethod(set_short_timeout))
+    cli = _load_cli()
+    monkeypatch.setenv("DATABRIDGE_DSN", DSN)
+    monkeypatch.setenv("DATABRIDGE_EMBEDDER", "hashed")
+    monkeypatch.setenv("DATABRIDGE_PROFILE_MODE", "observe")
+    lock_key = f"databridge:embedding-profile:{space_key}"
+    with psycopg.connect(DSN) as lock_conn:
+        lock_conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock_key,))
+        assert (
+            cli.main(
+                [
+                    "delete-legacy",
+                    "--space",
+                    space_key,
+                    "--generation-id",
+                    str(generation_id),
+                    "--yes",
+                ]
+            )
+            == 5
+        )
+    marker = json.loads(capsys.readouterr().out.split(" ", 1)[1])
+    assert marker["exit_code"] == 5
+    assert marker["reason"] == "lock_timeout"

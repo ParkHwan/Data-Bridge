@@ -181,6 +181,43 @@ def test_completed_requires_exact_true_string(bad_status: object) -> None:
     assert generation_job.evaluate_tasks([task]).exit_code == 83
 
 
+def test_completed_type_must_be_exact_string() -> None:
+    task = _task()
+    status = task["status"]
+    assert isinstance(status, dict)
+    status["conditions"] = [{"type": "completed", "status": "True"}]
+    assert generation_job.evaluate_tasks([task]).exit_code == 83
+
+
+@pytest.mark.parametrize("bad_code", [False, "0"])
+def test_attempt_status_code_requires_json_integer(bad_code: object) -> None:
+    task = _task()
+    status = task["status"]
+    assert isinstance(status, dict)
+    attempt = status["lastAttemptResult"]
+    assert isinstance(attempt, dict)
+    attempt["status"] = {"code": bad_code}
+    assert generation_job.evaluate_tasks([task]).exit_code == 83
+
+
+@pytest.mark.parametrize("exit_code", range(1, 6))
+def test_cli_failures_bypass_success_helper(
+    monkeypatch: pytest.MonkeyPatch, exit_code: int
+) -> None:
+    def forbidden(_task_value: Mapping[str, object]) -> generation_job.TaskDecision:
+        raise AssertionError("success helper must not run for CLI failures")
+
+    monkeypatch.setattr(generation_job, "_evaluate_success_gate", forbidden)
+    task = _task(exit_code=exit_code)
+    status = task["status"]
+    assert isinstance(status, dict)
+    status["conditions"] = [{"type": "Completed", "status": "False"}]
+    attempt = status["lastAttemptResult"]
+    assert isinstance(attempt, dict)
+    attempt["status"] = {"code": 10}
+    assert generation_job.evaluate_tasks([task]).exit_code == exit_code
+
+
 def _marker(operation_id: str, *, exit_code: object = 0, reason: object = "ok") -> str:
     payload = {
         "operation_id": operation_id,
@@ -282,7 +319,7 @@ def test_execute_success_uses_two_step_task_lookup_and_one_execute() -> None:
     commands: list[list[str]] = []
     operation_id = ""
 
-    def run(command: object) -> subprocess.CompletedProcess[str]:
+    def run(command: object, _timeout: float) -> subprocess.CompletedProcess[str]:
         nonlocal operation_id
         argv = list(command)  # type: ignore[arg-type]
         commands.append(argv)
@@ -326,10 +363,301 @@ def test_execute_success_uses_two_step_task_lookup_and_one_execute() -> None:
     assert "--execution" not in task_describe
 
 
+@pytest.mark.parametrize(
+    ("exit_code", "reason"),
+    [(3, "structural_validation_failed"), (1, "unexpected_error")],
+)
+def test_measured_cli_failure_shapes_reach_real_marker_validation(
+    exit_code: int, reason: str
+) -> None:
+    operation_id = ""
+
+    def run(command: object, _timeout: float) -> subprocess.CompletedProcess[str]:
+        nonlocal operation_id
+        argv = list(command)  # type: ignore[arg-type]
+        joined = " ".join(argv)
+        if " jobs execute " in f" {joined} ":
+            env_arg = next(item for item in argv if item.startswith("--update-env-vars="))
+            operation_id = env_arg.rsplit("=", 1)[1]
+            return subprocess.CompletedProcess(argv, 0, "execution-1\n", "")
+        if "executions describe execution-1" in joined:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"status": {"completionTime": "done"}}), ""
+            )
+        if "tasks list --execution execution-1" in joined:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps([{"metadata": {"name": "task-1"}}]), ""
+            )
+        if "tasks describe task-1" in joined:
+            task = _task(exit_code=exit_code)
+            status = task["status"]
+            assert isinstance(status, dict)
+            status["conditions"] = [{"type": "Completed", "status": "False"}]
+            attempt = status["lastAttemptResult"]
+            assert isinstance(attempt, dict)
+            attempt["status"] = {"code": 10}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(task), "")
+        if "logging read" in joined:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps(
+                    [{"textPayload": _marker(operation_id, exit_code=exit_code, reason=reason)}]
+                ),
+                "",
+            )
+        raise AssertionError(argv)
+
+    decision, marker, _ = generation_job.execute(
+        project="p",
+        region="r",
+        job="j",
+        job_args=["delete-legacy"],
+        run=run,
+        sleep=lambda _seconds: None,
+    )
+    assert decision == generation_job.TaskDecision(exit_code, reason)
+    assert marker == generation_job.MarkerResult(exit_code, reason)
+
+
+def test_read_only_retry_exhaustion_is_wrapper_transport_error() -> None:
+    describe_calls = 0
+
+    def run(command: object, _timeout: float) -> subprocess.CompletedProcess[str]:
+        nonlocal describe_calls
+        argv = list(command)  # type: ignore[arg-type]
+        joined = " ".join(argv)
+        if " jobs execute " in f" {joined} ":
+            return subprocess.CompletedProcess(argv, 0, "execution-1\n", "")
+        if "executions describe execution-1" in joined:
+            describe_calls += 1
+            return subprocess.CompletedProcess(argv, 1, "", "transport")
+        raise AssertionError(argv)
+
+    decision, marker, _ = generation_job.execute(
+        project="p",
+        region="r",
+        job="j",
+        job_args=["list"],
+        run=run,
+        monotonic=lambda: 0.0,
+        sleep=lambda _seconds: None,
+    )
+    assert describe_calls == 3
+    assert decision == generation_job.TaskDecision(85, "wrapper_transport_error")
+    assert marker is None
+
+
+def test_polling_wall_clock_deadline_returns_wrapper_timeout() -> None:
+    now = 0.0
+
+    def monotonic() -> float:
+        return now
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+
+    def run(command: object, _timeout: float) -> subprocess.CompletedProcess[str]:
+        argv = list(command)  # type: ignore[arg-type]
+        joined = " ".join(argv)
+        if " jobs execute " in f" {joined} ":
+            return subprocess.CompletedProcess(argv, 0, "execution-1\n", "")
+        if "executions describe execution-1" in joined:
+            return subprocess.CompletedProcess(argv, 0, json.dumps({"status": {}}), "")
+        raise AssertionError(argv)
+
+    decision, marker, _ = generation_job.execute(
+        project="p",
+        region="r",
+        job="j",
+        job_args=["list"],
+        run=run,
+        monotonic=monotonic,
+        sleep=sleep,
+        timeout_seconds=2.0,
+    )
+    assert decision == generation_job.TaskDecision(80, "wrapper_timeout")
+    assert marker is None
+
+
+def test_default_command_runner_passes_subprocess_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run(command: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        observed.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    generation_job._run_command(["gcloud", "version"], 7.0)
+    assert observed["timeout"] == 7.0
+
+
+@pytest.mark.parametrize(
+    ("candidates", "expected"),
+    [
+        (["execution-1"], generation_job.TaskDecision(0, "ok")),
+        (
+            ["execution-1", "execution-2"],
+            generation_job.TaskDecision(87, "duplicate_execution"),
+        ),
+        (
+            ["execution-1", None],
+            generation_job.TaskDecision(85, "correlation_indeterminate"),
+        ),
+    ],
+)
+def test_failed_creation_correlation_one_duplicate_and_malformed(
+    candidates: list[str | None], expected: generation_job.TaskDecision
+) -> None:
+    operation_id = ""
+
+    def run(command: object, _timeout: float) -> subprocess.CompletedProcess[str]:
+        nonlocal operation_id
+        argv = list(command)  # type: ignore[arg-type]
+        joined = " ".join(argv)
+        if " jobs execute " in f" {joined} ":
+            env_arg = next(item for item in argv if item.startswith("--update-env-vars="))
+            operation_id = env_arg.rsplit("=", 1)[1]
+            return subprocess.CompletedProcess(argv, 1, "", "lost response")
+        if "executions list" in joined:
+            listed = [
+                {"metadata": {"name": name}} if name is not None else {"metadata": {}}
+                for name in candidates
+            ]
+            return subprocess.CompletedProcess(argv, 0, json.dumps(listed), "")
+        if "executions describe execution-" in joined:
+            value = {
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "containers": [
+                                {
+                                    "env": [
+                                        {
+                                            "name": "DATABRIDGE_OPERATION_ID",
+                                            "value": operation_id,
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+            if len(candidates) == 1:
+                value["status"] = {"completionTime": "done"}
+            return subprocess.CompletedProcess(argv, 0, json.dumps(value), "")
+        if "tasks list --execution execution-1" in joined:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps([{"metadata": {"name": "task-1"}}]), ""
+            )
+        if "tasks describe task-1" in joined:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(_task()), "")
+        if "logging read" in joined:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps([{"textPayload": _marker(operation_id)}]), ""
+            )
+        raise AssertionError(argv)
+
+    decision, _, _ = generation_job.execute(
+        project="p",
+        region="r",
+        job="j",
+        job_args=["list"],
+        run=run,
+        monotonic=lambda: 0.0,
+        sleep=lambda _seconds: None,
+    )
+    assert decision == expected
+
+
+@pytest.mark.parametrize("malformed", ["extra_task", "bad_item", "bad_description"])
+def test_task_collection_malformed_shapes_are_83(malformed: str) -> None:
+    def run(command: object, _timeout: float) -> subprocess.CompletedProcess[str]:
+        argv = list(command)  # type: ignore[arg-type]
+        joined = " ".join(argv)
+        if " jobs execute " in f" {joined} ":
+            return subprocess.CompletedProcess(argv, 0, "execution-1\n", "")
+        if "executions describe execution-1" in joined:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"status": {"completionTime": "done"}}), ""
+            )
+        if "tasks list --execution execution-1" in joined:
+            if malformed == "extra_task":
+                value: object = [
+                    {"metadata": {"name": "task-1"}},
+                    {"metadata": {}},
+                ]
+            elif malformed == "bad_item":
+                value = ["task-1"]
+            else:
+                value = [{"metadata": {"name": "task-1"}}]
+            return subprocess.CompletedProcess(argv, 0, json.dumps(value), "")
+        if "tasks describe task-1" in joined and malformed == "bad_description":
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        raise AssertionError(argv)
+
+    decision, marker, _ = generation_job.execute(
+        project="p",
+        region="r",
+        job="j",
+        job_args=["list"],
+        run=run,
+        sleep=lambda _seconds: None,
+    )
+    assert decision == generation_job.TaskDecision(83, "task_result_unavailable")
+    assert marker is None
+
+
+def test_term_signal_wins_before_marker_lookup_in_full_execute_path() -> None:
+    logging_called = False
+
+    def run(command: object, _timeout: float) -> subprocess.CompletedProcess[str]:
+        nonlocal logging_called
+        argv = list(command)  # type: ignore[arg-type]
+        joined = " ".join(argv)
+        if " jobs execute " in f" {joined} ":
+            return subprocess.CompletedProcess(argv, 0, "execution-1\n", "")
+        if "executions describe execution-1" in joined:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"status": {"completionTime": "done"}}), ""
+            )
+        if "tasks list --execution execution-1" in joined:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps([{"metadata": {"name": "task-1"}}]), ""
+            )
+        if "tasks describe task-1" in joined:
+            task = _task()
+            status = task["status"]
+            assert isinstance(status, dict)
+            attempt = status["lastAttemptResult"]
+            assert isinstance(attempt, dict)
+            attempt["termSignal"] = 9
+            return subprocess.CompletedProcess(argv, 0, json.dumps(task), "")
+        if "logging read" in joined:
+            logging_called = True
+        raise AssertionError(argv)
+
+    decision, marker, _ = generation_job.execute(
+        project="p",
+        region="r",
+        job="j",
+        job_args=["activate"],
+        run=run,
+        sleep=lambda _seconds: None,
+    )
+    assert decision == generation_job.TaskDecision(84, "task_terminated_by_signal")
+    assert marker is None
+    assert logging_called is False
+
+
 def test_failed_execute_is_never_retried_and_zero_correlation_is_indeterminate() -> None:
     execute_calls = 0
 
-    def run(command: object) -> subprocess.CompletedProcess[str]:
+    def run(command: object, _timeout: float) -> subprocess.CompletedProcess[str]:
         nonlocal execute_calls
         argv = list(command)  # type: ignore[arg-type]
         if "execute" in argv:
@@ -397,6 +725,24 @@ def test_wrapper_result_contract_is_fail_closed() -> None:
         generation_job.validate_wrapper_result([_wrapper_line(valid) + "garbage"], process_exit=0)
         is None
     )
+    assert (
+        generation_job.validate_wrapper_result(
+            [generation_job.WRAPPER_PREFIX + "{not-json}"], process_exit=0
+        )
+        is None
+    )
+    missing_field = dict(valid)
+    missing_field.pop("cli_reason")
+    assert (
+        generation_job.validate_wrapper_result([_wrapper_line(missing_field)], process_exit=0)
+        is None
+    )
+    bad_reason = {**valid, "wrapper_exit": 85, "wrapper_reason": "wrapper_timeout"}
+    bad_reason["cli_exit"] = None
+    bad_reason["cli_reason"] = None
+    assert (
+        generation_job.validate_wrapper_result([_wrapper_line(bad_reason)], process_exit=85) is None
+    )
 
 
 @pytest.mark.parametrize("exit_code", range(6))
@@ -435,7 +781,7 @@ def test_wrapper_result_for_every_wrapper_exit(exit_code: int) -> None:
 
 
 def test_post_id_pre_request_failure_keeps_operation_id() -> None:
-    def unavailable(_command: object) -> subprocess.CompletedProcess[str]:
+    def unavailable(_command: object, _timeout: float) -> subprocess.CompletedProcess[str]:
         raise FileNotFoundError("gcloud")
 
     decision, marker, operation_id = generation_job.execute(
