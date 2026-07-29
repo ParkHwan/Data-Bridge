@@ -1113,10 +1113,13 @@ def test_wrapper_result_cli_exit_true_is_fail_closed() -> None:
         "wrapper_exit": 1,
         "wrapper_reason": "passthrough",
         "cli_exit": True,
-        "cli_reason": "ok",
+        "cli_reason": "unexpected_error",
         "cli_generation_id": 1,
     }
+    # The reason is valid for exit 1, so only the boolean check can reject this line.
     assert generation_job.validate_wrapper_result([_wrapper_line(payload)], process_exit=1) is None
+    ok = {**payload, "cli_exit": 1}
+    assert generation_job.validate_wrapper_result([_wrapper_line(ok)], process_exit=1) == ok
 
 
 def test_two_valid_cli_markers_reach_mismatch_through_the_real_log_path() -> None:
