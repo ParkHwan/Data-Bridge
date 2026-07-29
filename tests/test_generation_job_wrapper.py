@@ -966,16 +966,26 @@ def _complete_task_run(
     return run, monotonic
 
 
-def test_log_stage_deadline_with_healthy_reads_is_marker_missing_not_transport() -> None:
-    """Reads all succeeded; the eventual-consistency window merely ran out.
+def test_log_stage_deadline_raised_inside_the_retry_helper_is_marker_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The window is spent *inside* the retry helper, with no read having failed.
 
-    That must not be reported as a transport failure. Before the fix this was
-    race-dependent: the outer deadline check gave 81, while crossing the deadline
-    inside the retry helper gave 85 for the very same situation.
+    This is the branch the fix added. Letting the outer deadline check fire instead
+    would pass either way, so the exception is raised where the helper raises it:
+    every read succeeded, the deadline simply arrived. That is 81, not 85.
     """
-    run, monotonic = _complete_task_run(
-        log_stdout="[]", log_delay=generation_job.LOG_READ_TIMEOUT_SECONDS + 1.0
-    )
+    run, monotonic = _complete_task_run(log_stdout="[]")
+    real_retry = generation_job._gcloud_json_retry
+
+    def retry(
+        run_command: object, command: list[str], **kwargs: object
+    ) -> object:
+        if "logging" in command:
+            raise generation_job.ReadStageDeadlineExceeded("gcloud read deadline exhausted")
+        return real_retry(run_command, command, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(generation_job, "_gcloud_json_retry", retry)
     decision, marker, _ = generation_job.execute(
         project="p",
         region="r",
@@ -987,6 +997,33 @@ def test_log_stage_deadline_with_healthy_reads_is_marker_missing_not_transport()
     )
     assert decision == generation_job.TaskDecision(81, "result_marker_missing")
     assert marker is None
+
+
+def test_log_stage_transport_failure_is_still_eighty_five(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The sibling branch must not have been widened by the fix."""
+    run, monotonic = _complete_task_run(log_stdout="[]")
+    real_retry = generation_job._gcloud_json_retry
+
+    def retry(
+        run_command: object, command: list[str], **kwargs: object
+    ) -> object:
+        if "logging" in command:
+            raise generation_job.ReadTransportFailure("gcloud read retries exhausted")
+        return real_retry(run_command, command, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(generation_job, "_gcloud_json_retry", retry)
+    decision, _marker, _ = generation_job.execute(
+        project="p",
+        region="r",
+        job="j",
+        job_args=["list"],
+        run=run,
+        monotonic=monotonic,
+        sleep=lambda _seconds: None,
+    )
+    assert decision == generation_job.TaskDecision(85, "wrapper_transport_error")
 
 
 def test_log_stage_non_list_response_is_transport_error() -> None:
@@ -1080,11 +1117,19 @@ def test_wrapper_result_cli_exit_true_is_fail_closed() -> None:
 
 
 def test_two_valid_cli_markers_reach_mismatch_through_the_real_log_path() -> None:
+    """Each marker is individually valid, so only the count can reject the pair.
+
+    With a reason that does not belong to the task's exit code, a log layer that
+    collapsed the two into one would still return 82 — for the wrong reason.
+    """
     operation_id = "00000000-0000-0000-0000-000000000001"
-    entries = [
-        {"textPayload": _marker(operation_id, exit_code=3, reason="target_not_found")},
-        {"textPayload": _marker(operation_id, exit_code=3, reason="target_not_found")},
-    ]
+    valid = _marker(operation_id, exit_code=3, reason="structural_validation_failed")
+    single, error = generation_job.validate_cli_markers(
+        [valid], operation_id=operation_id, expected_exit=3
+    )
+    assert single == generation_job.MarkerResult(3, "structural_validation_failed")
+    assert error is None
+    entries = [{"textPayload": valid}, {"textPayload": valid}]
     run, monotonic = _complete_task_run(log_stdout=json.dumps(entries))
     decision, marker, _ = generation_job.execute(
         project="p",
