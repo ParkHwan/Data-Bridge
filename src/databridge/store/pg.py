@@ -30,9 +30,13 @@ from psycopg.types.json import Jsonb
 from databridge.embed.base import EMBEDDING_DIM, EmbeddingProfile
 from databridge.ingest.chunker import Chunk
 from databridge.store.exceptions import (
+    ActivationIntegrityError,
     EmbeddingProfileMismatchError,
     GenerationConcurrencyError,
     GenerationTargetError,
+    GenerationTargetNotFoundError,
+    GenerationTargetStateMismatchError,
+    LegacyCleanupWindowClosedError,
 )
 from databridge.store.provenance import (
     Generation,
@@ -40,6 +44,7 @@ from databridge.store.provenance import (
     GenerationInventory,
     GenerationSourceInventory,
     GenerationState,
+    LegacyCleanupResult,
     ProfileMode,
     SpaceProfileReport,
     profile_id_for,
@@ -181,9 +186,7 @@ class PgVectorStore:
             )
             return cur.rowcount or 0
 
-    def list_source_ids(
-        self, *, space_key: str, generation_id: int | None = None
-    ) -> set[str]:
+    def list_source_ids(self, *, space_key: str, generation_id: int | None = None) -> set[str]:
         """Return the distinct sources currently stored in one isolated space."""
         self._require_profile()
         with self._connect() as conn, conn.cursor() as cur:
@@ -371,9 +374,7 @@ class PgVectorStore:
                 for row in cur.fetchall()
             ]
 
-    def generation_inventory(
-        self, *, space_key: str, generation_id: int
-    ) -> GenerationInventory:
+    def generation_inventory(self, *, space_key: str, generation_id: int) -> GenerationInventory:
         """Inspect one generation without a state gate, profile check, or lock."""
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute(
@@ -401,7 +402,7 @@ class PgVectorStore:
             )
             rows = cur.fetchall()
         if not rows:
-            raise GenerationTargetError("Inventory target was not found in this space")
+            raise GenerationTargetNotFoundError("Inventory target was not found in this space")
 
         sources: dict[str, GenerationSourceInventory] = {}
         for row in rows:
@@ -421,9 +422,7 @@ class PgVectorStore:
             sources=sources,
         )
 
-    def _profile_report(
-        self, cur: psycopg.Cursor, *, space_key: str
-    ) -> SpaceProfileReport:
+    def _profile_report(self, cur: psycopg.Cursor, *, space_key: str) -> SpaceProfileReport:
         profile = self._require_profile()
         cur.execute(
             """
@@ -486,9 +485,7 @@ class PgVectorStore:
                 if stored_fingerprint is None
                 else stored_fingerprint == profile.config_fingerprint
             ),
-            sealed_generation_exists=any(
-                item.state is GenerationState.SEALED for item in counts
-            ),
+            sealed_generation_exists=any(item.state is GenerationState.SEALED for item in counts),
         )
 
     @staticmethod
@@ -585,13 +582,9 @@ class PgVectorStore:
                     "No active embedding generation is available for this space"
                 )
         else:
-            generation = self._get_generation(
-                cur, space_key=space_key, generation_id=generation_id
-            )
+            generation = self._get_generation(cur, space_key=space_key, generation_id=generation_id)
             if generation is None:
-                raise GenerationTargetError(
-                    "Explicit batch target was not found in this space"
-                )
+                raise GenerationTargetError("Explicit batch target was not found in this space")
             if generation.state not in (GenerationState.BUILDING, GenerationState.ACTIVE):
                 raise GenerationTargetError(
                     f"Explicit batch target is {generation.state.value}; "
@@ -682,20 +675,17 @@ class PgVectorStore:
                     GenerationState.SEALED,
                 ):
                     raise GenerationTargetError(
-                        "Discard target must be building or sealed, got "
-                        f"{inflight.state.value}"
+                        f"Discard target must be building or sealed, got {inflight.state.value}"
                     )
                 # Destructive cleanup is deliberately visible and ordered: the audit
                 # receipt is removed only through this explicit operator command.
                 params = (space_key, inflight.generation_id)
                 cur.execute(
-                    "DELETE FROM generation_validation "
-                    "WHERE space_key = %s AND generation_id = %s",
+                    "DELETE FROM generation_validation WHERE space_key = %s AND generation_id = %s",
                     params,
                 )
                 cur.execute(
-                    "DELETE FROM generation_manifest "
-                    "WHERE space_key = %s AND generation_id = %s",
+                    "DELETE FROM generation_manifest WHERE space_key = %s AND generation_id = %s",
                     params,
                 )
                 cur.execute(
@@ -740,9 +730,7 @@ class PgVectorStore:
                 raise RuntimeError("Created embedding generation could not be read back")
             return generation, "created"
 
-    def resolve_batch_target(
-        self, *, space_key: str, generation_id: int | None
-    ) -> Generation:
+    def resolve_batch_target(self, *, space_key: str, generation_id: int | None) -> Generation:
         """Resolve one immutable target before a batch starts mutating storage."""
         profile = self._require_profile()
         with self._connect() as conn, conn.cursor() as cur:
@@ -792,9 +780,7 @@ class PgVectorStore:
         with self._connect() as conn, conn.cursor() as cur:
             self._set_lock_timeout(cur)
             self._lock_space_for_update(cur, space_key)
-            self._assert_manifest_target(
-                cur, space_key=space_key, generation_id=generation_id
-            )
+            self._assert_manifest_target(cur, space_key=space_key, generation_id=generation_id)
             cur.execute(
                 """
                 INSERT INTO generation_manifest
@@ -831,9 +817,7 @@ class PgVectorStore:
         with self._connect() as conn, conn.cursor() as cur:
             self._set_lock_timeout(cur)
             self._lock_space_for_update(cur, space_key)
-            self._assert_manifest_target(
-                cur, space_key=space_key, generation_id=generation_id
-            )
+            self._assert_manifest_target(cur, space_key=space_key, generation_id=generation_id)
             cur.execute(
                 """
                 UPDATE generation_manifest
@@ -905,9 +889,9 @@ class PgVectorStore:
                 for_update=True,
             )
             if target is None:
-                raise GenerationTargetError("Activation target was not found in this space")
+                raise GenerationTargetNotFoundError("Activation target was not found in this space")
             if target.state is not GenerationState.SEALED:
-                raise GenerationTargetError(
+                raise GenerationTargetStateMismatchError(
                     f"Activation target must be sealed, got {target.state.value}"
                 )
             self._assert_matching_profile(target, profile)
@@ -931,13 +915,9 @@ class PgVectorStore:
                     "Sealed generation has no validation receipt or manifest"
                 )
             if str(receipt[0]) != checksum:
-                raise GenerationConcurrencyError(
-                    "Generation content changed after validation"
-                )
+                raise GenerationConcurrencyError("Generation content changed after validation")
             if int(receipt[1]) != int(receipt[2]):
-                raise GenerationConcurrencyError(
-                    "Manifest revision changed after validation"
-                )
+                raise GenerationConcurrencyError("Manifest revision changed after validation")
             cur.execute(
                 """
                 UPDATE space_generation
@@ -967,6 +947,85 @@ class PgVectorStore:
             if activated is None:
                 raise RuntimeError("Activated embedding generation could not be read back")
             return activated
+
+    def delete_legacy_chunks(self, *, space_key: str, generation_id: int) -> LegacyCleanupResult:
+        """Delete legacy null-generation chunks after an activation-integrity gate."""
+        profile = self._require_profile()
+        with self._connect() as conn, conn.cursor() as cur:
+            self._set_lock_timeout(cur)
+            self._lock_space_for_update(cur, space_key)
+            target = self._get_generation(
+                cur,
+                space_key=space_key,
+                generation_id=generation_id,
+                for_update=True,
+            )
+            if target is None:
+                raise GenerationTargetNotFoundError(
+                    "Legacy cleanup target was not found in this space"
+                )
+            if target.state is not GenerationState.ACTIVE:
+                raise GenerationTargetStateMismatchError(
+                    f"Legacy cleanup target must be active, got {target.state.value}"
+                )
+            self._assert_matching_profile(target, profile)
+
+            checksum, chunk_count = self.generation_checksum(
+                cur, space_key=space_key, generation_id=generation_id
+            )
+            if chunk_count <= 0:
+                raise ActivationIntegrityError("Active generation contains zero chunks")
+
+            cur.execute(
+                """
+                SELECT g.profile_id,
+                       v.checksum, v.chunk_count, v.manifest_revision, v.profile_id,
+                       m.state, m.revision
+                  FROM space_generation g
+                  LEFT JOIN generation_validation v
+                    ON v.space_key = g.space_key AND v.generation_id = g.generation_id
+                  LEFT JOIN generation_manifest m
+                    ON m.space_key = g.space_key AND m.generation_id = g.generation_id
+                 WHERE g.space_key = %s AND g.generation_id = %s
+                """,
+                (space_key, generation_id),
+            )
+            evidence = cur.fetchone()
+            if evidence is None or any(evidence[index] is None for index in (1, 2, 3, 4)):
+                raise ActivationIntegrityError(
+                    "Active generation has no complete validation receipt"
+                )
+            if str(evidence[0]) != str(evidence[4]):
+                raise ActivationIntegrityError(
+                    "Validation receipt profile does not match the generation"
+                )
+            if evidence[5] is None or str(evidence[5]) != "complete":
+                raise ActivationIntegrityError("Active generation manifest is not complete")
+
+            cur.execute(
+                "SELECT count(*) FROM chunks WHERE space_key = %s AND generation_id IS NULL",
+                (space_key,),
+            )
+            legacy_row = cur.fetchone()
+            legacy_count = int(legacy_row[0]) if legacy_row is not None else 0
+            if legacy_count == 0:
+                return LegacyCleanupResult(space_key, generation_id, 0, 0)
+
+            if (
+                str(evidence[1]) != checksum
+                or int(evidence[2]) != chunk_count
+                or int(evidence[3]) != int(evidence[6])
+            ):
+                raise LegacyCleanupWindowClosedError("Active generation changed after validation")
+
+            cur.execute(
+                "DELETE FROM chunks WHERE space_key = %s AND generation_id IS NULL",
+                (space_key,),
+            )
+            deleted = cur.rowcount or 0
+            if deleted != legacy_count:
+                raise GenerationConcurrencyError("Legacy chunk count changed during cleanup")
+            return LegacyCleanupResult(space_key, generation_id, legacy_count, deleted)
 
     @staticmethod
     def _validate_batch(chunks: list[Chunk], embeddings: list[list[float]]) -> None:
@@ -1236,9 +1295,7 @@ class PgVectorStore:
         rows_by_key = {key_for(row): row for row in vector_rows}
         rows_by_key.update({key_for(row): row for row in fts_rows})
         rows_by_key.update({key_for(row): row for row in trgm_rows})
-        vector_ranks = {
-            key_for(row): rank for rank, row in enumerate(vector_rows, start=1)
-        }
+        vector_ranks = {key_for(row): rank for rank, row in enumerate(vector_rows, start=1)}
         fts_ranks = {key_for(row): rank for rank, row in enumerate(fts_rows, start=1)}
         trgm_ranks = {key_for(row): rank for rank, row in enumerate(trgm_rows, start=1)}
 
