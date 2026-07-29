@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import inspect
+import json
 import os
+import threading
 import uuid
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import ModuleType
 from urllib.parse import quote
@@ -177,6 +181,10 @@ queries:
     return path
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _prepare_building(
     store: PgVectorStore, *, space_key: str, source_id: str = "source"
 ) -> int:
@@ -339,6 +347,72 @@ def test_query_file_rejects_unknown_fields_duplicate_ids_and_space_mismatch(
         load_validation_queries(path, space_key="OTHER")
 
 
+def test_query_sha256_is_checked_before_yaml_parsing(tmp_path: Path) -> None:
+    malformed = tmp_path / "malformed.yaml"
+    malformed.write_text("queries: [", encoding="utf-8")
+
+    with pytest.raises(ValidationQueryConfigurationError, match="64 hexadecimal"):
+        load_validation_queries(
+            malformed, space_key="MFS", expected_sha256="not-a-sha"
+        )
+    with pytest.raises(ValidationQueryConfigurationError, match="SHA-256") as mismatch:
+        load_validation_queries(
+            malformed, space_key="MFS", expected_sha256="0" * 64
+        )
+    assert "Invalid validation query file" not in str(mismatch.value)
+
+    with pytest.raises(ValidationQueryConfigurationError, match="Invalid validation"):
+        load_validation_queries(
+            malformed,
+            space_key="MFS",
+            expected_sha256=_sha256(malformed),
+        )
+
+
+def test_query_sha256_accepts_matching_bytes(tmp_path: Path) -> None:
+    path = _write_queries(
+        tmp_path / "queries.yaml", space_key="MFS", source_id="source"
+    )
+    query_file, observed = load_validation_queries(
+        path,
+        space_key="MFS",
+        expected_sha256=_sha256(path).upper(),
+    )
+    assert query_file.space_key == "MFS"
+    assert observed == _sha256(path)
+
+
+def test_cli_query_sha256_errors_are_exit_two_and_precede_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    malformed = tmp_path / "malformed.yaml"
+    malformed.write_text("queries: [", encoding="utf-8")
+    cli = _load_cli()
+    monkeypatch.setenv("DATABRIDGE_DSN", DSN)
+    monkeypatch.setenv("DATABRIDGE_EMBEDDER", "hashed")
+    monkeypatch.setenv("DATABRIDGE_PROFILE_MODE", "observe")
+
+    base = [
+        "validate",
+        "--space",
+        "MFS",
+        "--generation-id",
+        "1",
+        "--queries",
+        str(malformed),
+        "--expected-queries-sha256",
+    ]
+    assert cli.main([*base, "bad"]) == 2
+    assert "64 hexadecimal" in capsys.readouterr().err
+
+    assert cli.main([*base, "0" * 64]) == 2
+    error = capsys.readouterr().err
+    assert "SHA-256" in error
+    assert "Invalid validation query file" not in error
+
+
 def test_validation_defaults_match_production_and_agents_do_not_import_module() -> None:
     production = inspect.signature(PgVectorStore.search_hybrid).parameters
     validation = inspect.signature(search_hybrid_in_generation).parameters
@@ -382,6 +456,19 @@ def test_cli_requires_yes_and_explicit_validate_arguments() -> None:
     with pytest.raises(SystemExit) as validate:
         cli.main(["validate", "--space", "MFS", "--generation-id", "1"])
     assert validate.value.code == 2
+    with pytest.raises(SystemExit) as unpinned:
+        cli.main(
+            [
+                "validate",
+                "--space",
+                "MFS",
+                "--generation-id",
+                "1",
+                "--queries",
+                "queries.yaml",
+            ]
+        )
+    assert unpinned.value.code == 2
 
 
 def test_heading_coverage_does_not_overreach_zero_or_one_heading(tmp_path: Path) -> None:
@@ -588,6 +675,7 @@ def test_normal_revision_two_validate_receipt_and_atomic_activation(tmp_path: Pa
         space_key=space_key,
         generation_id=generation_id,
         queries_path=queries,
+        expected_queries_sha256=_sha256(queries),
     )
     assert result.manifest_revision == 2
     report = store.profile_report(space_key=space_key)
@@ -820,6 +908,8 @@ async def test_batch_target_retirement_stops_next_write_and_validate_exits_four(
                 str(generation_id),
                 "--queries",
                 str(queries),
+                "--expected-queries-sha256",
+                _sha256(queries),
             ]
         )
         == 4
@@ -1084,6 +1174,7 @@ def test_stable_search_failure_is_exit_three_class_and_does_not_seal(
             space_key=space_key,
             generation_id=generation_id,
             queries_path=queries,
+            expected_queries_sha256=_sha256(queries),
         )
     with psycopg.connect(DSN) as conn:
         state = conn.execute(
@@ -1125,6 +1216,8 @@ def test_cli_validate_rejects_in_progress_manifest_with_exit_three(
                 str(generation_id),
                 "--queries",
                 str(queries),
+                "--expected-queries-sha256",
+                _sha256(queries),
             ]
         )
         == 3
@@ -1172,6 +1265,8 @@ def test_cli_validate_uses_initial_four_but_concurrent_change_five(
                 "9223372036854775000",
                 "--queries",
                 str(missing_queries),
+                "--expected-queries-sha256",
+                _sha256(missing_queries),
             ]
         )
         == 4
@@ -1213,6 +1308,8 @@ def test_cli_validate_uses_initial_four_but_concurrent_change_five(
                 str(generation_id),
                 "--queries",
                 str(queries),
+                "--expected-queries-sha256",
+                _sha256(queries),
             ]
         )
         == 5
@@ -1283,6 +1380,7 @@ def test_t2_detects_every_generation_or_manifest_change(
             space_key=space_key,
             generation_id=generation_id,
             queries_path=queries,
+            expected_queries_sha256=_sha256(queries),
         )
     with psycopg.connect(DSN) as conn:
         receipt_count = conn.execute(
@@ -1354,6 +1452,8 @@ def test_t2_lock_timeout_does_not_seal_or_write_receipt(
                     str(generation_id),
                     "--queries",
                     str(queries),
+                    "--expected-queries-sha256",
+                    _sha256(queries),
                 ]
             )
             == 5
@@ -1409,6 +1509,7 @@ def test_activate_rechecks_receipt_and_preserves_existing_active(
         space_key=space_key,
         generation_id=generation_id,
         queries_path=queries,
+        expected_queries_sha256=_sha256(queries),
     )
     with psycopg.connect(DSN) as conn:
         if change == "checksum":
@@ -1517,6 +1618,7 @@ def test_activation_rolls_back_if_target_update_fails_after_retiring_active(
         space_key=space_key,
         generation_id=generation_id,
         queries_path=queries,
+        expected_queries_sha256=_sha256(queries),
     )
 
     suffix = uuid.uuid4().hex
@@ -1645,6 +1747,7 @@ def test_vector_validator_rejects_zero_and_degenerate_vectors(
             space_key=space_key,
             generation_id=generation.generation_id,
             queries_path=queries,
+            expected_queries_sha256=_sha256(queries),
         )
 
 
@@ -1741,6 +1844,211 @@ def test_cli_well_formed_unreachable_dsn_is_an_operational_exit_one(
 
 @pytest.mark.integration
 @pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+def test_inventory_empty_generation_and_missing_target_contract(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space("INVENTORY_EMPTY")
+    generation_id = store.create_building_generation(
+        space_key=space_key
+    ).generation_id
+    cli = _load_cli()
+    monkeypatch.setenv("DATABRIDGE_DSN", DSN)
+    monkeypatch.setenv("DATABRIDGE_EMBEDDER", "hashed")
+    monkeypatch.setenv("DATABRIDGE_PROFILE_MODE", "observe")
+
+    assert (
+        cli.main(
+            [
+                "inventory",
+                "--space",
+                space_key,
+                "--generation-id",
+                str(generation_id),
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["generation_state"] == "building"
+    assert payload["sources"] == {}
+    assert payload["total_chunks"] == 0
+    assert isinstance(payload["total_chunks"], int)
+
+    assert (
+        cli.main(
+            [
+                "inventory",
+                "--space",
+                space_key,
+                "--generation-id",
+                str(generation_id + 9_000_000_000),
+            ]
+        )
+        == 4
+    )
+    assert "not found" in capsys.readouterr().err
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+def test_inventory_sorts_headings_and_reads_retired_profile_mismatch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    alternate_profile = EmbeddingProfile(
+        provider="hashed",
+        model="inventory-alternate",
+        dimension=768,
+        config_fingerprint=uuid.uuid4().hex * 2,
+    )
+    store = PgVectorStore(
+        DSN, profile=alternate_profile, mode=ProfileMode.OBSERVE
+    )
+    store.ensure_schema()
+    space_key = _space("INVENTORY_RETIRED")
+    generation_id = store.create_building_generation(
+        space_key=space_key
+    ).generation_id
+    embedder = HashedEmbedder()
+    documents = (
+        SourceDocument(
+            source_id="multi",
+            title="Multi",
+            space_key=space_key,
+            body="## Zebra\nz body\n## Alpha\na body\n## Alpha\na second body",
+        ),
+        SourceDocument(
+            source_id="plain",
+            title="Plain",
+            space_key=space_key,
+            body="plain body",
+        ),
+    )
+    expected_total = 0
+    for document in documents:
+        chunks = chunk_document(document)
+        expected_total += len(chunks)
+        store.replace_source(
+            space_key=space_key,
+            source_id=document.source_id,
+            chunks=chunks,
+            embeddings=embedder.embed([chunk.embedding_text for chunk in chunks]),
+            generation_id=generation_id,
+        )
+    with psycopg.connect(DSN) as conn:
+        conn.execute(
+            "UPDATE space_generation SET state='retired', activated_at=now() "
+            "WHERE space_key=%s AND generation_id=%s",
+            (space_key, generation_id),
+        )
+
+    cli = _load_cli()
+    monkeypatch.setenv("DATABRIDGE_DSN", DSN)
+    monkeypatch.setenv("DATABRIDGE_EMBEDDER", "hashed")
+    monkeypatch.setenv("DATABRIDGE_PROFILE_MODE", "observe")
+    assert (
+        cli.main(
+            [
+                "inventory",
+                "--space",
+                space_key,
+                "--generation-id",
+                str(generation_id),
+            ]
+        )
+        == 0
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["generation_state"] == "retired"
+    assert payload["profile_fingerprint"] == alternate_profile.config_fingerprint
+    assert payload["sources"]["multi"]["headings"] == ["Alpha", "Zebra"]
+    assert payload["sources"]["multi"]["chunk_count"] == 3
+    assert payload["sources"]["plain"] == {"chunk_count": 1, "headings": []}
+    assert payload["total_chunks"] == expected_total
+    assert isinstance(payload["total_chunks"], int)
+    assert all(
+        isinstance(source["chunk_count"], int)
+        for source in payload["sources"].values()
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+def test_inventory_counts_and_headings_share_one_snapshot() -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space("INVENTORY_SNAPSHOT")
+    generation_id = store.create_building_generation(
+        space_key=space_key
+    ).generation_id
+    embedder = HashedEmbedder()
+
+    def write_version(body: str) -> None:
+        document = SourceDocument(
+            source_id="source",
+            title="Snapshot",
+            space_key=space_key,
+            body=body,
+        )
+        chunks = chunk_document(document)
+        store.replace_source(
+            space_key=space_key,
+            source_id="source",
+            chunks=chunks,
+            embeddings=embedder.embed([chunk.embedding_text for chunk in chunks]),
+            generation_id=generation_id,
+        )
+
+    versions = (
+        (1, ("Alpha",)),
+        (2, ("Beta", "Gamma")),
+    )
+    write_version("## Alpha\none")
+    start = threading.Barrier(2)
+    first_write_committed = threading.Event()
+    continue_writes = threading.Event()
+
+    def mutate() -> None:
+        start.wait()
+        write_version("## Beta\ntwo\n## Gamma\nthree")
+        first_write_committed.set()
+        if not continue_writes.wait(timeout=10):
+            raise TimeoutError("inventory reader did not release concurrent writer")
+        write_version("## Alpha\none")
+        for _ in range(9):
+            write_version("## Beta\ntwo\n## Gamma\nthree")
+            write_version("## Alpha\none")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(mutate)
+        start.wait()
+
+        inventory_reads = 0
+
+        def assert_consistent_inventory() -> None:
+            nonlocal inventory_reads
+            inventory = _store().generation_inventory(
+                space_key=space_key, generation_id=generation_id
+            )
+            inventory_reads += 1
+            source = inventory.sources["source"]
+            assert (source.chunk_count, source.headings) in versions
+            assert inventory.total_chunks == source.chunk_count
+
+        assert first_write_committed.wait(timeout=10)
+        try:
+            assert_consistent_inventory()
+        finally:
+            continue_writes.set()
+        while not future.done():
+            assert_consistent_inventory()
+        future.result()
+        assert inventory_reads > 0
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
 def test_every_cli_command_has_an_actual_success_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1757,6 +2065,18 @@ def test_every_cli_command_has_an_actual_success_path(
 
     store = _store()
     generation_id = _prepare_building(store, space_key=space_key)
+    assert (
+        cli.main(
+            [
+                "inventory",
+                "--space",
+                space_key,
+                "--generation-id",
+                str(generation_id),
+            ]
+        )
+        == 0
+    )
     _complete_manifest(store, space_key=space_key, generation_id=generation_id)
     queries = _write_queries(
         tmp_path / "queries.yaml", space_key=space_key, source_id="source"
@@ -1771,6 +2091,8 @@ def test_every_cli_command_has_an_actual_success_path(
                 str(generation_id),
                 "--queries",
                 str(queries),
+                "--expected-queries-sha256",
+                _sha256(queries),
             ]
         )
         == 0
@@ -1862,6 +2184,7 @@ def test_discard_deletes_a_real_receipt_and_dependents_in_audited_order(
         space_key=space_key,
         generation_id=generation_id,
         queries_path=queries,
+        expected_queries_sha256=_sha256(queries),
     )
 
     suffix = uuid.uuid4().hex

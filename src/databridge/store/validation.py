@@ -33,6 +33,7 @@ from databridge.store.provenance import GenerationState
 
 _VALIDATOR_VERSION = "generation-validator-v1"
 _QUERY_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+_SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 class QueryCategory(StrEnum):
@@ -152,18 +153,36 @@ class ValidationResult:
     query_count: int
 
 
-def load_validation_queries(path: Path, *, space_key: str) -> tuple[ValidationQueryFile, str]:
+def load_validation_queries(
+    path: Path, *, space_key: str, expected_sha256: str | None = None
+) -> tuple[ValidationQueryFile, str]:
     try:
         payload = path.read_bytes()
+    except OSError as exc:
+        raise ValidationQueryConfigurationError(f"Invalid validation query file: {exc}") from exc
+
+    actual_sha256 = hashlib.sha256(payload).hexdigest()
+    if expected_sha256 is not None:
+        if not _SHA256.fullmatch(expected_sha256):
+            raise ValidationQueryConfigurationError(
+                "--expected-queries-sha256 must be exactly 64 hexadecimal characters"
+            )
+        if actual_sha256 != expected_sha256.lower():
+            raise ValidationQueryConfigurationError(
+                "Validation query file SHA-256 does not match "
+                "--expected-queries-sha256"
+            )
+
+    try:
         raw: Any = yaml.safe_load(payload.decode("utf-8"))
         query_file = ValidationQueryFile.model_validate(raw)
-    except (OSError, UnicodeDecodeError, yaml.YAMLError, ValidationError) as exc:
+    except (UnicodeDecodeError, yaml.YAMLError, ValidationError) as exc:
         raise ValidationQueryConfigurationError(f"Invalid validation query file: {exc}") from exc
     if query_file.space_key != space_key:
         raise ValidationQueryConfigurationError(
             f"Query file space {query_file.space_key!r} does not match --space {space_key!r}"
         )
-    return query_file, hashlib.sha256(payload).hexdigest()
+    return query_file, actual_sha256
 
 
 def search_hybrid_in_generation(
@@ -210,10 +229,13 @@ def validate_generation(
     space_key: str,
     generation_id: int,
     queries_path: Path,
+    expected_queries_sha256: str,
 ) -> ValidationResult:
     """Run T1, unlocked searches, then T2 with concurrency checks first."""
     query_file, query_file_sha256 = load_validation_queries(
-        queries_path, space_key=space_key
+        queries_path,
+        space_key=space_key,
+        expected_sha256=expected_queries_sha256,
     )
     snapshot = _validate_t1(
         store,

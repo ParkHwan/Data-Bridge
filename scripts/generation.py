@@ -60,6 +60,11 @@ def _parser() -> argparse.ArgumentParser:
     validate.add_argument("--space", required=True)
     validate.add_argument("--generation-id", required=True, type=int)
     validate.add_argument("--queries", required=True, type=Path)
+    validate.add_argument("--expected-queries-sha256", required=True)
+
+    inventory = commands.add_parser("inventory")
+    inventory.add_argument("--space", required=True)
+    inventory.add_argument("--generation-id", required=True, type=int)
 
     activate = commands.add_parser("activate")
     activate.add_argument("--space", required=True)
@@ -117,6 +122,27 @@ def _run(args: argparse.Namespace) -> None:
     if command == "report":
         _json({"space_key": space_key, **_reference_report(store, space_key=space_key)})
         return
+    if command == "inventory":
+        inventory = store.generation_inventory(
+            space_key=space_key, generation_id=int(args.generation_id)
+        )
+        _json(
+            {
+                "space_key": inventory.space_key,
+                "generation_id": inventory.generation_id,
+                "generation_state": inventory.generation_state.value,
+                "profile_fingerprint": inventory.profile_fingerprint,
+                "total_chunks": inventory.total_chunks,
+                "sources": {
+                    source_id: {
+                        "chunk_count": source.chunk_count,
+                        "headings": source.headings,
+                    }
+                    for source_id, source in inventory.sources.items()
+                },
+            }
+        )
+        return
     if command == "validate":
         result = validate_generation(
             store,
@@ -124,6 +150,7 @@ def _run(args: argparse.Namespace) -> None:
             space_key=space_key,
             generation_id=int(args.generation_id),
             queries_path=args.queries,
+            expected_queries_sha256=str(args.expected_queries_sha256),
         )
         _json(
             {

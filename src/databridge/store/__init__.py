@@ -11,6 +11,8 @@ from databridge.store.pg import PgVectorStore, SearchHit
 from databridge.store.provenance import (
     Generation,
     GenerationChunkCount,
+    GenerationInventory,
+    GenerationSourceInventory,
     GenerationState,
     ProfileMode,
     ProfileModeConfigurationError,
@@ -23,6 +25,8 @@ __all__ = [
     "Generation",
     "GenerationConcurrencyError",
     "GenerationChunkCount",
+    "GenerationInventory",
+    "GenerationSourceInventory",
     "GenerationState",
     "GenerationTargetError",
     "GenerationValidationError",
