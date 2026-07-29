@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 from collections.abc import Mapping
@@ -481,6 +482,40 @@ def test_polling_wall_clock_deadline_returns_wrapper_timeout() -> None:
     assert marker is None
 
 
+def test_polling_read_timeout_that_consumes_deadline_is_transport_error() -> None:
+    now = 0.0
+    describe_calls = 0
+
+    def monotonic() -> float:
+        return now
+
+    def run(command: object, timeout: float) -> subprocess.CompletedProcess[str]:
+        nonlocal now, describe_calls
+        argv = list(command)  # type: ignore[arg-type]
+        joined = " ".join(argv)
+        if " jobs execute " in f" {joined} ":
+            return subprocess.CompletedProcess(argv, 0, "execution-1\n", "")
+        if "executions describe execution-1" in joined:
+            describe_calls += 1
+            now += timeout
+            raise subprocess.TimeoutExpired(argv, timeout)
+        raise AssertionError(argv)
+
+    decision, marker, _ = generation_job.execute(
+        project="p",
+        region="r",
+        job="j",
+        job_args=["list"],
+        run=run,
+        monotonic=monotonic,
+        sleep=lambda _seconds: None,
+        timeout_seconds=2.0,
+    )
+    assert describe_calls == 1
+    assert decision == generation_job.TaskDecision(85, "wrapper_transport_error")
+    assert marker is None
+
+
 def test_default_command_runner_passes_subprocess_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -816,3 +851,73 @@ def test_pre_id_wrapper_failure_has_null_operation_and_confirmed_absent(
     assert payload is not None
     assert payload["operation_id"] is None
     assert payload["wrapper_reason"] == "creation_confirmed_absent"
+
+
+def test_timeout_default_and_custom_value_are_passed_to_execute(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    observed: list[float] = []
+
+    def fake_execute(
+        **kwargs: object,
+    ) -> tuple[generation_job.TaskDecision, generation_job.MarkerResult | None, str]:
+        observed.append(float(kwargs["timeout_seconds"]))
+        return (
+            generation_job.TaskDecision(85, "creation_confirmed_absent"),
+            None,
+            "00000000-0000-0000-0000-000000000001",
+        )
+
+    monkeypatch.setattr(generation_job, "execute", fake_execute)
+    base = ["--project", "p", "--region", "r"]
+    assert generation_job.main([*base, "--", "list"]) == 85
+    capsys.readouterr()
+    assert generation_job.main([*base, "--timeout-seconds", "4200", "--", "list"]) == 85
+    assert observed == [float(generation_job.DEFAULT_EXECUTION_TIMEOUT_SECONDS), 4200.0]
+
+
+@pytest.mark.parametrize("bad_value", ["0", "-1", "1.5", "true"])
+def test_timeout_option_rejects_non_positive_and_non_integer_values(
+    monkeypatch: pytest.MonkeyPatch, bad_value: str
+) -> None:
+    called = False
+
+    def forbidden(
+        **_kwargs: object,
+    ) -> tuple[generation_job.TaskDecision, generation_job.MarkerResult | None, str]:
+        nonlocal called
+        called = True
+        raise AssertionError("execute must not run for invalid wrapper arguments")
+
+    monkeypatch.setattr(generation_job, "execute", forbidden)
+    assert (
+        generation_job.main(
+            [
+                "--project",
+                "p",
+                "--region",
+                "r",
+                "--timeout-seconds",
+                bad_value,
+                "--",
+                "list",
+            ]
+        )
+        == 85
+    )
+    assert called is False
+
+
+def test_timeout_type_rejects_boolean_and_help_exposes_default(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(argparse.ArgumentTypeError):
+        generation_job._positive_timeout_seconds(True)
+    assert generation_job.DEFAULT_EXECUTION_TIMEOUT_SECONDS > 3600
+    with pytest.raises(SystemExit) as exc_info:
+        generation_job.main(["--help"])
+    assert exc_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "--timeout-seconds" in help_text
+    assert str(generation_job.DEFAULT_EXECUTION_TIMEOUT_SECONDS) in help_text
+    assert "3600s task timeout plus 300s observation margin" in help_text

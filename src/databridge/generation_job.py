@@ -21,6 +21,7 @@ COMMAND_TIMEOUT_SECONDS = 30.0
 CORRELATION_TIMEOUT_SECONDS = 120.0
 TASK_READ_TIMEOUT_SECONDS = 60.0
 LOG_READ_TIMEOUT_SECONDS = 30.0
+DEFAULT_EXECUTION_TIMEOUT_SECONDS = 3900
 
 REASONS: dict[int, frozenset[str]] = {
     0: frozenset({"ok"}),
@@ -92,6 +93,22 @@ class WrapperArgumentParser(argparse.ArgumentParser):
 
 class ReadStageDeadlineExceeded(RuntimeError):
     """A bounded read stage exhausted its wall-clock deadline."""
+
+
+class ReadTransportFailure(RuntimeError):
+    """A read command failed or hung until its retry budget was exhausted."""
+
+
+def _positive_timeout_seconds(raw: object) -> int:
+    if isinstance(raw, bool) or not isinstance(raw, str):
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return value
 
 
 def _is_json_int(value: object) -> bool:
@@ -296,7 +313,9 @@ def _gcloud_json_retry(
     for attempt in range(attempts):
         remaining = deadline - monotonic()
         if remaining <= 0:
-            raise ReadStageDeadlineExceeded("gcloud read deadline exhausted") from last_error
+            if last_error is None:
+                raise ReadStageDeadlineExceeded("gcloud read deadline exhausted")
+            raise ReadTransportFailure("gcloud read failed before its deadline") from last_error
         try:
             return _gcloud_json(
                 run,
@@ -308,11 +327,11 @@ def _gcloud_json_retry(
             if attempt + 1 < attempts:
                 remaining = deadline - monotonic()
                 if remaining <= 0:
-                    raise ReadStageDeadlineExceeded(
-                        "gcloud read deadline exhausted"
+                    raise ReadTransportFailure(
+                        "gcloud read failed before its deadline"
                     ) from last_error
                 sleep(min(1.0, remaining))
-    raise RuntimeError("gcloud read retries exhausted") from last_error
+    raise ReadTransportFailure("gcloud read retries exhausted") from last_error
 
 
 def _contains_operation_id(value: object, operation_id: str) -> bool:
@@ -474,7 +493,7 @@ def execute(
     run: RunCommand = _run_command,
     monotonic: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
-    timeout_seconds: float = 900.0,
+    timeout_seconds: float = DEFAULT_EXECUTION_TIMEOUT_SECONDS,
 ) -> tuple[TaskDecision, MarkerResult | None, str]:
     operation_id = str(uuid.uuid4())
     command = [
@@ -512,7 +531,12 @@ def execute(
                 monotonic=monotonic,
                 deadline=monotonic() + CORRELATION_TIMEOUT_SECONDS,
             )
-        except (ReadStageDeadlineExceeded, RuntimeError, json.JSONDecodeError):
+        except (
+            ReadStageDeadlineExceeded,
+            ReadTransportFailure,
+            RuntimeError,
+            json.JSONDecodeError,
+        ):
             return TaskDecision(85, "wrapper_transport_error"), None, operation_id
         if correlation is not None:
             return correlation, None, operation_id
@@ -543,7 +567,7 @@ def execute(
             )
         except ReadStageDeadlineExceeded:
             return TaskDecision(80, "wrapper_timeout"), None, operation_id
-        except (RuntimeError, json.JSONDecodeError):
+        except (ReadTransportFailure, RuntimeError, json.JSONDecodeError):
             return TaskDecision(85, "wrapper_transport_error"), None, operation_id
         if _execution_complete(state):
             break
@@ -606,7 +630,12 @@ def execute(
         if not isinstance(described, Mapping):
             return TaskDecision(83, "task_result_unavailable"), None, operation_id
         tasks = [described]
-    except (ReadStageDeadlineExceeded, RuntimeError, json.JSONDecodeError):
+    except (
+        ReadStageDeadlineExceeded,
+        ReadTransportFailure,
+        RuntimeError,
+        json.JSONDecodeError,
+    ):
         return TaskDecision(85, "wrapper_transport_error"), None, operation_id
 
     decision = evaluate_tasks(tasks)
@@ -639,7 +668,7 @@ def execute(
                 monotonic=monotonic,
                 deadline=log_deadline,
             )
-        except (ReadStageDeadlineExceeded, RuntimeError):
+        except (ReadStageDeadlineExceeded, ReadTransportFailure, RuntimeError):
             return TaskDecision(85, "wrapper_transport_error"), None, operation_id
         if isinstance(logs, list):
             lines = [
@@ -667,6 +696,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--project", required=True)
     parser.add_argument("--region", required=True)
     parser.add_argument("--job", default="databridge-generation")
+    parser.add_argument(
+        "--timeout-seconds",
+        type=_positive_timeout_seconds,
+        default=DEFAULT_EXECUTION_TIMEOUT_SECONDS,
+        help=(
+            "execution polling deadline in seconds "
+            f"(default: {DEFAULT_EXECUTION_TIMEOUT_SECONDS}; "
+            "3600s task timeout plus 300s observation margin)"
+        ),
+    )
     parser.add_argument("job_args", nargs=argparse.REMAINDER)
     try:
         args = parser.parse_args(argv)
@@ -691,6 +730,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         region=str(args.region),
         job=str(args.job),
         job_args=job_args,
+        timeout_seconds=float(args.timeout_seconds),
     )
     print(
         WRAPPER_PREFIX
