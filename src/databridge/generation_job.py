@@ -227,6 +227,8 @@ def validate_cli_markers(
         or marker_exit != expected_exit
         or not isinstance(reason, str)
         or reason not in REASONS[marker_exit]
+        or not isinstance(payload["operation_id"], str)
+        or _UUID.fullmatch(payload["operation_id"]) is None
         or payload["operation_id"] != operation_id
     ):
         return None, TaskDecision(82, "result_marker_mismatch")
@@ -668,14 +670,23 @@ def execute(
                 monotonic=monotonic,
                 deadline=log_deadline,
             )
-        except (ReadStageDeadlineExceeded, ReadTransportFailure, RuntimeError):
+        except ReadStageDeadlineExceeded:
+            # Every read succeeded; the eventual-consistency window simply ran out.
+            # That is not a transport failure — judge on the lines collected so far,
+            # which yields 81 when the marker never appeared. Returning 85 here would
+            # make the outcome depend on which deadline check happened to fire first.
+            break
+        except (ReadTransportFailure, RuntimeError):
             return TaskDecision(85, "wrapper_transport_error"), None, operation_id
-        if isinstance(logs, list):
-            lines = [
-                str(item["textPayload"])
-                for item in logs
-                if isinstance(item, Mapping) and "textPayload" in item
-            ]
+        if not isinstance(logs, list):
+            # The canonical logging response is a JSON list. Anything else means we did
+            # not read the log, which is different from reading an empty log.
+            return TaskDecision(85, "wrapper_transport_error"), None, operation_id
+        lines = [
+            str(item["textPayload"])
+            for item in logs
+            if isinstance(item, Mapping) and "textPayload" in item
+        ]
         if any(line.startswith(CLI_PREFIX) for line in lines):
             break
         if attempt < 9:

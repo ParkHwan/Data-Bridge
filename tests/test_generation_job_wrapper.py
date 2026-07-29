@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 
 import pytest
@@ -921,3 +921,198 @@ def test_timeout_type_rejects_boolean_and_help_exposes_default(
     assert "--timeout-seconds" in help_text
     assert str(generation_job.DEFAULT_EXECUTION_TIMEOUT_SECONDS) in help_text
     assert "3600s task timeout plus 300s observation margin" in help_text
+
+
+def _complete_task_run(
+    *, log_stdout: str | None = None, log_returncode: int = 0, log_delay: float = 0.0
+) -> tuple[Callable[[object, float], subprocess.CompletedProcess[str]], Callable[[], float]]:
+    """A run/monotonic pair whose execution finishes with CLI exit 3 and one task."""
+    now = 0.0
+
+    def monotonic() -> float:
+        return now
+
+    task = {
+        "status": {
+            "completionTime": "2026-07-29T15:57:57Z",
+            "conditions": [{"type": "Completed", "status": "False"}],
+            "lastAttemptResult": {"exitCode": 3, "status": {"code": 10}},
+        }
+    }
+
+    def run(command: object, _timeout: float) -> subprocess.CompletedProcess[str]:
+        nonlocal now
+        argv = list(command)  # type: ignore[arg-type]
+        joined = " ".join(argv)
+        if " jobs execute " in f" {joined} ":
+            return subprocess.CompletedProcess(argv, 0, "execution-1\n", "")
+        if "executions describe execution-1" in joined:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"status": {"completionTime": "t"}}), ""
+            )
+        if "tasks list" in joined:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps([{"metadata": {"name": "task0"}}]), ""
+            )
+        if "tasks describe" in joined:
+            return subprocess.CompletedProcess(argv, 0, json.dumps(task), "")
+        if "logging read" in joined:
+            now += log_delay
+            if log_returncode != 0:
+                return subprocess.CompletedProcess(argv, log_returncode, "", "boom")
+            return subprocess.CompletedProcess(argv, 0, log_stdout or "[]", "")
+        raise AssertionError(argv)
+
+    return run, monotonic
+
+
+def test_log_stage_deadline_with_healthy_reads_is_marker_missing_not_transport() -> None:
+    """Reads all succeeded; the eventual-consistency window merely ran out.
+
+    That must not be reported as a transport failure. Before the fix this was
+    race-dependent: the outer deadline check gave 81, while crossing the deadline
+    inside the retry helper gave 85 for the very same situation.
+    """
+    run, monotonic = _complete_task_run(
+        log_stdout="[]", log_delay=generation_job.LOG_READ_TIMEOUT_SECONDS + 1.0
+    )
+    decision, marker, _ = generation_job.execute(
+        project="p",
+        region="r",
+        job="j",
+        job_args=["list"],
+        run=run,
+        monotonic=monotonic,
+        sleep=lambda _seconds: None,
+    )
+    assert decision == generation_job.TaskDecision(81, "result_marker_missing")
+    assert marker is None
+
+
+def test_log_stage_non_list_response_is_transport_error() -> None:
+    """A canonical logging response is a JSON list.
+
+    An object is not an empty log — it means we did not read the log at all.
+    """
+    run, monotonic = _complete_task_run(log_stdout=json.dumps({"entries": []}))
+    decision, marker, _ = generation_job.execute(
+        project="p",
+        region="r",
+        job="j",
+        job_args=["list"],
+        run=run,
+        monotonic=monotonic,
+        sleep=lambda _seconds: None,
+    )
+    assert decision == generation_job.TaskDecision(85, "wrapper_transport_error")
+    assert marker is None
+
+
+@pytest.mark.parametrize(
+    "operation_id",
+    [
+        "not-a-uuid",
+        "00000000000000000000000000000001",
+        "0000000000-0000-0000-0000-00000000001",
+        "00000000-0000-0000-0000-00000000000G",
+        "00000000-0000-0000-0000-000000000001 ",
+    ],
+)
+def test_marker_operation_id_must_be_canonical_even_when_it_matches(operation_id: str) -> None:
+    """Equality with the wrapper's own id is not enough — the format is a field contract.
+
+    Both sides carrying the same non-canonical string used to pass.
+    """
+    marker, error = generation_job.validate_cli_markers(
+        [_marker(operation_id)], operation_id=operation_id, expected_exit=0
+    )
+    assert marker is None
+    assert error == generation_job.TaskDecision(82, "result_marker_mismatch")
+
+
+def test_marker_generation_id_boolean_is_mismatch() -> None:
+    operation_id = "00000000-0000-0000-0000-000000000001"
+    payload = {
+        "operation_id": operation_id,
+        "command": "delete-legacy",
+        "space_key": "MFS",
+        "generation_id": True,
+        "exit_code": 0,
+        "reason": "ok",
+    }
+    line = generation_job.CLI_PREFIX + json.dumps(payload, separators=(",", ":"))
+    marker, error = generation_job.validate_cli_markers(
+        [line], operation_id=operation_id, expected_exit=0
+    )
+    assert marker is None
+    assert error == generation_job.TaskDecision(82, "result_marker_mismatch")
+
+
+def test_wrapper_exit_must_match_the_real_process_exit() -> None:
+    """The line claims one code while the process ended with another — distrust the line.
+
+    Kept distinct from the passthrough invariant: cli_exit agrees with wrapper_exit
+    here, so only the process-exit comparison can reject it.
+    """
+    payload = {
+        "operation_id": "00000000-0000-0000-0000-000000000001",
+        "wrapper_exit": 4,
+        "wrapper_reason": "passthrough",
+        "cli_exit": 4,
+        "cli_reason": "target_not_found",
+    }
+    assert (
+        generation_job.validate_wrapper_result([_wrapper_line(payload)], process_exit=4) == payload
+    )
+    assert generation_job.validate_wrapper_result([_wrapper_line(payload)], process_exit=0) is None
+    assert generation_job.validate_wrapper_result([_wrapper_line(payload)], process_exit=85) is None
+
+
+def test_wrapper_result_cli_exit_true_is_fail_closed() -> None:
+    payload = {
+        "operation_id": "00000000-0000-0000-0000-000000000001",
+        "wrapper_exit": 1,
+        "wrapper_reason": "passthrough",
+        "cli_exit": True,
+        "cli_reason": "ok",
+    }
+    assert generation_job.validate_wrapper_result([_wrapper_line(payload)], process_exit=1) is None
+
+
+def test_two_valid_cli_markers_reach_mismatch_through_the_real_log_path() -> None:
+    operation_id = "00000000-0000-0000-0000-000000000001"
+    entries = [
+        {"textPayload": _marker(operation_id, exit_code=3, reason="target_not_found")},
+        {"textPayload": _marker(operation_id, exit_code=3, reason="target_not_found")},
+    ]
+    run, monotonic = _complete_task_run(log_stdout=json.dumps(entries))
+    decision, marker, _ = generation_job.execute(
+        project="p",
+        region="r",
+        job="j",
+        job_args=["list"],
+        run=run,
+        monotonic=monotonic,
+        sleep=lambda _seconds: None,
+    )
+    assert decision == generation_job.TaskDecision(82, "result_marker_mismatch")
+    assert marker is None
+
+
+def test_unknown_wrapper_option_fails_before_any_execution_exists(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An unusable wrapper invocation must not look like a CLI usage error.
+
+    The wrapper fails before issuing an operation id, so no execution can exist and
+    a manual re-run is permitted — that is 85 creation_confirmed_absent with a null
+    operation_id, not exit 2.
+    """
+    assert generation_job.main(["--project", "p", "--region", "r", "--no-such-option"]) == 85
+    payload = generation_job.validate_wrapper_result(
+        capsys.readouterr().out.splitlines(), process_exit=85
+    )
+    assert payload is not None
+    assert payload["wrapper_reason"] == "creation_confirmed_absent"
+    assert payload["operation_id"] is None
+    assert payload["cli_exit"] is None and payload["cli_reason"] is None

@@ -595,6 +595,12 @@ def test_cli_requires_yes_and_explicit_validate_arguments(
         == 2
     )
     assert '"reason":"cli_usage_error"' in capsys.readouterr().out
+    # An unknown option is a usage error like any other, and it must still emit a
+    # marker — a silent argparse exit would leave the wrapper with nothing to read.
+    assert cli.main(["list", "--space", "MFS", "--no-such-option"]) == 2
+    unknown = capsys.readouterr().out
+    assert '"reason":"cli_usage_error"' in unknown
+    assert '"generation_id":null' in unknown
 
 
 def test_heading_coverage_does_not_overreach_zero_or_one_heading(tmp_path: Path) -> None:
