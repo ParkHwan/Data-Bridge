@@ -237,7 +237,7 @@ def test_marker_validation_count_content_and_derived_exit() -> None:
     marker, error = generation_job.validate_cli_markers(
         [valid], operation_id=operation_id, expected_exit=0
     )
-    assert marker == generation_job.MarkerResult(0, "ok")
+    assert marker == generation_job.MarkerResult(0, "ok", 1)
     assert error is None
     assert generation_job.validate_cli_markers([], operation_id=operation_id, expected_exit=0)[
         1
@@ -357,7 +357,7 @@ def test_execute_success_uses_two_step_task_lookup_and_one_execute() -> None:
         sleep=lambda _seconds: None,
     )
     assert decision == generation_job.TaskDecision(0, "ok")
-    assert marker == generation_job.MarkerResult(0, "ok")
+    assert marker == generation_job.MarkerResult(0, "ok", 1)
     assert observed_id == operation_id
     assert sum(" jobs execute " in f" {' '.join(command)} " for command in commands) == 1
     task_describe = next(command for command in commands if "task-1" in command)
@@ -418,7 +418,7 @@ def test_measured_cli_failure_shapes_reach_real_marker_validation(
         sleep=lambda _seconds: None,
     )
     assert decision == generation_job.TaskDecision(exit_code, reason)
-    assert marker == generation_job.MarkerResult(exit_code, reason)
+    assert marker == generation_job.MarkerResult(exit_code, reason, 1)
 
 
 def test_read_only_retry_exhaustion_is_wrapper_transport_error() -> None:
@@ -727,6 +727,7 @@ def test_wrapper_result_contract_is_fail_closed() -> None:
         "wrapper_reason": "passthrough",
         "cli_exit": 0,
         "cli_reason": "ok",
+        "cli_generation_id": 1,
     }
     assert generation_job.validate_wrapper_result([_wrapper_line(valid)], process_exit=0) == valid
     invalid_payloads = [
@@ -784,7 +785,7 @@ def test_wrapper_result_contract_is_fail_closed() -> None:
 def test_wrapper_result_passthrough_for_every_cli_exit(exit_code: int) -> None:
     operation_id = "00000000-0000-0000-0000-000000000001"
     reason = sorted(generation_job.REASONS[exit_code])[0]
-    marker = generation_job.MarkerResult(exit_code, reason)
+    marker = generation_job.MarkerResult(exit_code, reason, 1)
     decision = generation_job.TaskDecision(exit_code, reason)
     payload = generation_job._wrapper_payload(
         operation_id=operation_id, decision=decision, marker=marker
@@ -1097,6 +1098,7 @@ def test_wrapper_exit_must_match_the_real_process_exit() -> None:
         "wrapper_reason": "passthrough",
         "cli_exit": 4,
         "cli_reason": "target_not_found",
+        "cli_generation_id": 7,
     }
     assert (
         generation_job.validate_wrapper_result([_wrapper_line(payload)], process_exit=4) == payload
@@ -1112,6 +1114,7 @@ def test_wrapper_result_cli_exit_true_is_fail_closed() -> None:
         "wrapper_reason": "passthrough",
         "cli_exit": True,
         "cli_reason": "ok",
+        "cli_generation_id": 1,
     }
     assert generation_job.validate_wrapper_result([_wrapper_line(payload)], process_exit=1) is None
 
@@ -1127,7 +1130,7 @@ def test_two_valid_cli_markers_reach_mismatch_through_the_real_log_path() -> Non
     single, error = generation_job.validate_cli_markers(
         [valid], operation_id=operation_id, expected_exit=3
     )
-    assert single == generation_job.MarkerResult(3, "structural_validation_failed")
+    assert single == generation_job.MarkerResult(3, "structural_validation_failed", 1)
     assert error is None
     entries = [{"textPayload": valid}, {"textPayload": valid}]
     run, monotonic = _complete_task_run(log_stdout=json.dumps(entries))
@@ -1161,3 +1164,86 @@ def test_unknown_wrapper_option_fails_before_any_execution_exists(
     assert payload["wrapper_reason"] == "creation_confirmed_absent"
     assert payload["operation_id"] is None
     assert payload["cli_exit"] is None and payload["cli_reason"] is None
+
+
+def test_wrapper_surfaces_the_generation_id_the_operator_cannot_get_elsewhere() -> None:
+    """create-building's whole output to the operator is this one number.
+
+    The marker carries it, but the marker goes to the job's log, not to the wrapper's
+    stdout. Without this field the rollout cannot name the generation it just created.
+    """
+    operation_id = "00000000-0000-0000-0000-000000000001"
+    marker, error = generation_job.validate_cli_markers(
+        [_marker(operation_id)], operation_id=operation_id, expected_exit=0
+    )
+    assert error is None
+    assert marker is not None
+    assert marker.generation_id == 1
+    payload = generation_job._wrapper_payload(
+        operation_id=operation_id,
+        decision=generation_job.TaskDecision(0, "ok"),
+        marker=marker,
+    )
+    assert payload["cli_generation_id"] == 1
+    assert generation_job.validate_wrapper_result(
+        [_wrapper_line(dict(payload))], process_exit=0
+    ) == payload
+
+
+def test_generation_id_is_null_whenever_no_valid_cli_result_was_read() -> None:
+    payload = generation_job._wrapper_payload(
+        operation_id="00000000-0000-0000-0000-000000000001",
+        decision=generation_job.TaskDecision(83, "task_result_unavailable"),
+        marker=None,
+    )
+    assert payload["cli_generation_id"] is None
+    assert generation_job.validate_wrapper_result(
+        [_wrapper_line(dict(payload))], process_exit=83
+    ) == payload
+    # A wrapper-code result that still claims a generation id is malformed.
+    claiming = dict(payload)
+    claiming["cli_generation_id"] = 1
+    assert (
+        generation_job.validate_wrapper_result([_wrapper_line(claiming)], process_exit=83) is None
+    )
+
+
+@pytest.mark.parametrize("bad", [True, False, 0, -1, "1", 1.0])
+def test_generation_id_field_rejects_non_positive_and_non_integer(bad: object) -> None:
+    payload = {
+        "operation_id": "00000000-0000-0000-0000-000000000001",
+        "wrapper_exit": 0,
+        "wrapper_reason": "passthrough",
+        "cli_exit": 0,
+        "cli_reason": "ok",
+        "cli_generation_id": bad,
+    }
+    assert generation_job.validate_wrapper_result([_wrapper_line(payload)], process_exit=0) is None
+
+
+def test_list_and_report_carry_a_null_generation_id_through_the_wrapper() -> None:
+    """These two commands must report null, and that must not look malformed."""
+    operation_id = "00000000-0000-0000-0000-000000000001"
+    body = {
+        "operation_id": operation_id,
+        "command": "report",
+        "space_key": "MFS",
+        "generation_id": None,
+        "exit_code": 0,
+        "reason": "ok",
+    }
+    line = generation_job.CLI_PREFIX + json.dumps(body, separators=(",", ":"))
+    marker, error = generation_job.validate_cli_markers(
+        [line], operation_id=operation_id, expected_exit=0
+    )
+    assert error is None
+    assert marker is not None and marker.generation_id is None
+    payload = generation_job._wrapper_payload(
+        operation_id=operation_id,
+        decision=generation_job.TaskDecision(0, "ok"),
+        marker=marker,
+    )
+    assert payload["cli_generation_id"] is None
+    assert generation_job.validate_wrapper_result(
+        [_wrapper_line(dict(payload))], process_exit=0
+    ) == payload

@@ -80,6 +80,7 @@ class TaskDecision:
 class MarkerResult:
     exit_code: int
     reason: str
+    generation_id: int | None
 
 
 class WrapperUsageError(RuntimeError):
@@ -277,7 +278,7 @@ def validate_cli_markers(
             return None, TaskDecision(82, "result_marker_mismatch")
         if command in {"list", "report"} and generation_id is not None:
             return None, TaskDecision(82, "result_marker_mismatch")
-    return MarkerResult(marker_exit, reason), None
+    return MarkerResult(marker_exit, reason, generation_id), None
 
 
 RunCommand = Callable[[Sequence[str], float], subprocess.CompletedProcess[str]]
@@ -423,12 +424,17 @@ def _wrapper_payload(
     cli_valid = marker is not None and decision.exit_code in REASONS
     cli_exit = marker.exit_code if cli_valid and marker is not None else None
     cli_reason = marker.reason if cli_valid and marker is not None else None
+    # The generation id is the one thing an operator cannot obtain any other way: the
+    # marker carries it, but it is written to the job's log, not to this stdout. Without
+    # it the rollout cannot name the generation it just created.
+    cli_generation_id = marker.generation_id if cli_valid and marker is not None else None
     return {
         "operation_id": operation_id,
         "wrapper_exit": decision.exit_code,
         "wrapper_reason": "passthrough" if decision.exit_code in REASONS else decision.reason,
         "cli_exit": cli_exit,
         "cli_reason": cli_reason,
+        "cli_generation_id": cli_generation_id,
     }
 
 
@@ -446,6 +452,7 @@ def validate_wrapper_result(
         "wrapper_reason",
         "cli_exit",
         "cli_reason",
+        "cli_generation_id",
     }
     if payload is None or set(payload) != required:
         return None
@@ -468,11 +475,17 @@ def validate_wrapper_result(
             or cli_reason not in REASONS[wrapper_exit]
         ):
             return None
+        generation_id = payload["cli_generation_id"]
+        if generation_id is not None and (
+            not _is_json_int(generation_id) or cast(int, generation_id) <= 0
+        ):
+            return None
     elif wrapper_exit in WRAPPER_REASONS:
         if (
             wrapper_reason not in WRAPPER_REASONS[wrapper_exit]
             or payload["cli_exit"] is not None
             or payload["cli_reason"] is not None
+            or payload["cli_generation_id"] is not None
         ):
             return None
     else:
