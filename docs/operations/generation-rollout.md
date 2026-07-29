@@ -51,34 +51,7 @@ Budget the window. A clean ingest of the MFS corpus plus validation is the domin
 
 ## Before you start
 
-- [ ] `scripts/setup_cicd.sh` has been run, so `databridge-generation` exists with
-      `--max-retries 0 --tasks 1 --parallelism 1 --task-timeout 3600s`.
-- [ ] **Your own account** has `run.tasks.get` and `run.tasks.list`. The wrapper reads Task
-      resources as the operator. `setup_cicd.sh` grants job and build service-account roles —
-      those are separate, and it does **not** grant these to you.
-- [ ] You can author the validation query file. It does not exist in the repository yet; it is
-      written from `inventory` output between steps 4 and 5 (see step 4a).
-- [ ] Point-in-time recovery covers the whole window. Check the retention setting, not just
-      that PITR is enabled:
-
-```bash
-gcloud sql instances describe databridge-demo --project "$PROJECT" \
-  --format='value(settings.backupConfiguration.pointInTimeRecoveryEnabled,settings.backupConfiguration.transactionLogRetentionDays)'
-gcloud sql instances get-latest-recovery-time databridge-demo --project "$PROJECT"
-```
-
-Record the recovery window before you start; a recovery point that predates it is useless to
-you. **If this command fails, stop and find out why** — an unverified recovery window is not a
-recovery plan, and suppressing the error would turn this precondition into decoration.
-
-**PITR is not a rollback button.** Understand the whole cost before relying on it:
-
-- It **restores into a new Cloud SQL instance**. The original is untouched.
-- Using it means: stop every writer → verify the restored instance → repoint `DATABRIDGE_DSN`
-  → redeploy the service and jobs against it.
-- **Everything else written after the recovery point is lost too**, not just this rollout.
-- Decide the **acceptable RTO before starting**. If that number is smaller than the sequence
-  above takes, PITR is not your recovery plan and you should not start the rollout relying on it.
+Set the variables and helpers first — the checks below use them.
 
 Set these once:
 
@@ -116,11 +89,18 @@ PYEOF
     | OP="$op" python3 -c '
 import json, os, sys
 op = os.environ["OP"]
-hits = []
+hits, unreadable = [], []
 for ex in json.load(sys.stdin):
-    env = ex["spec"]["template"]["spec"]["containers"][0].get("env", [])
+    name = ex.get("metadata", {}).get("name", "<unnamed>")
+    try:
+        env = ex["spec"]["template"]["spec"]["containers"][0].get("env", [])
+    except (KeyError, IndexError, TypeError):
+        unreadable.append(name)   # could not inspect it: not the same as "does not match"
+        continue
     if any(e.get("name") == "DATABRIDGE_OPERATION_ID" and e.get("value") == op for e in env):
-        hits.append(ex["metadata"]["name"])
+        hits.append(name)
+if unreadable:
+    sys.exit("cannot inspect executions %s — refusing to guess which one is yours" % unreadable)
 if len(hits) != 1:
     sys.exit("expected exactly one execution for %s, found %d" % (op, len(hits)))
 print(hits[0])
@@ -149,6 +129,42 @@ PYEOF
 }
 ```
 
+
+---
+
+### Preconditions
+
+
+
+- [ ] `scripts/setup_cicd.sh` has been run, so `databridge-generation` exists with
+      `--max-retries 0 --tasks 1 --parallelism 1 --task-timeout 3600s`.
+- [ ] **Your own account** has `run.tasks.get` and `run.tasks.list`. The wrapper reads Task
+      resources as the operator. `setup_cicd.sh` grants job and build service-account roles —
+      those are separate, and it does **not** grant these to you.
+- [ ] You can author the validation query file. It does not exist in the repository yet; it is
+      written from `inventory` output between steps 4 and 5 (see step 4a).
+- [ ] Point-in-time recovery covers the whole window. Check the retention setting, not just
+      that PITR is enabled:
+
+```bash
+gcloud sql instances describe databridge-demo --project "$PROJECT" \
+  --format='value(settings.backupConfiguration.pointInTimeRecoveryEnabled,settings.backupConfiguration.transactionLogRetentionDays)'
+gcloud sql instances get-latest-recovery-time databridge-demo --project "$PROJECT"
+```
+
+Record the recovery window before you start; a recovery point that predates it is useless to
+you. **If this command fails, stop and find out why** — an unverified recovery window is not a
+recovery plan, and suppressing the error would turn this precondition into decoration.
+
+**PITR is not a rollback button.** Understand the whole cost before relying on it:
+
+- It **restores into a new Cloud SQL instance**. The original is untouched.
+- Using it means: stop every writer → verify the restored instance → repoint `DATABRIDGE_DSN`
+  → redeploy the service and jobs against it.
+- **Everything else written after the recovery point is lost too**, not just this rollout.
+- Decide the **acceptable RTO before starting**. If that number is smaller than the sequence
+  above takes, PITR is not your recovery plan and you should not start the rollout relying on it.
+
 `$GENERATION` appears from step 3 onward. It does not exist before then — do not guess it.
 
 ---
@@ -158,7 +174,7 @@ PYEOF
 The wrapper prints one line to stdout and exits with the code below.
 
 ```
-DATABRIDGE_WRAPPER_RESULT {"operation_id":…,"wrapper_exit":…,"wrapper_reason":…,"cli_exit":…,"cli_reason":…}
+DATABRIDGE_WRAPPER_RESULT {"operation_id":…,"wrapper_exit":…,"wrapper_reason":…,"cli_exit":…,"cli_reason":…,"cli_generation_id":…}
 ```
 
 | Exit | Meaning | Re-run? |
@@ -404,12 +420,22 @@ generation serves correctly.
 ## Step 7 — Verify serving before deleting anything
 
 ```bash
-curl -s -X POST "$SERVICE_URL/ask" -H 'Content-Type: application/json' \
+curl -sf -X POST "$SERVICE_URL/ask" -H 'Content-Type: application/json' \
   -d '{"question":"<a question you know this corpus answers>"}' | head -40
 ```
 
-Then run the golden set for this space. Confirm that answers carry citations resolving into this
-corpus, and that a question with no support is still refused.
+`-f` matters: without it an HTTP error is not a shell failure and the block would look fine.
+
+Check by hand that the answer carries citations resolving into this corpus, and that a question
+with no support is still refused. **This judgement cannot be automated for a space that has no
+golden file** — the repository's golden set targets `DEMO`, and the runner refuses a space
+mismatch, so there is no command that can decide this for `$SPACE`.
+
+Because the judgement is human, the gate is an explicit token. Record what you verified:
+
+```bash
+SERVING_VERIFIED="${GENERATION:?}"     # set this only after you have read the answers
+```
 
 **If anything is wrong, stop. Do not proceed to step 8.** Recovery is forward-only: build,
 validate, and activate a new generation. Do not reactivate a retired generation, and do not
@@ -420,8 +446,18 @@ change lifecycle state with SQL.
 Only after step 7 passed. First-cutover-only, and irreversible.
 
 ```bash
+serving_verified_ok() {
+  [ "${SERVING_VERIFIED:-}" = "${GENERATION:?}" ] || {
+    echo "STOP: step 7 was not completed for generation ${GENERATION}" >&2; return 1; }
+}
+
+serving_verified_ok && \
 run_generation delete-legacy --space "$SPACE" --generation-id "${GENERATION:?}" --yes
 ```
+
+The deletion runs only as a consequence of that check. Setting `SERVING_VERIFIED` without having
+read step 7's answers defeats the gate — it exists so the irreversible command cannot be reached
+by scrolling past a failed verification, not to certify that you looked.
 
 The command re-checks activation integrity every time: the target must be the active
 generation, its receipt must match the current profile and chunk count, and its manifest must be
@@ -495,17 +531,34 @@ print("%s OK" % job)
   # The service must actually answer under strict — a preflight failure shows at startup.
   curl -sf -X POST "$SERVICE_URL/ask" -H 'Content-Type: application/json' \
     -d '{"question":"<a question you know this corpus answers>"}' >/dev/null || return 1
+
+  # The active generation must be the one this rollout activated, with no legacy left.
+  run_generation report --space "$SPACE" >/tmp/report.out || return 1
+  show_output /tmp/report.out > /tmp/report.body || return 1
+  GENERATION="${GENERATION:?}" python3 - /tmp/report.body <<'PYEOF' || return 1
+import json, os, sys
+want = int(os.environ["GENERATION"])
+body = open(sys.argv[1]).read()
+rows = [json.loads(l) for l in body.splitlines() if l.strip().startswith("{")]
+if not rows:
+    sys.exit("report produced no parseable output; cannot confirm the active generation")
+report = rows[-1]
+if report.get("active_generation_id") != want:
+    sys.exit("active generation is %r, expected %r" % (report.get("active_generation_id"), want))
+if report.get("legacy_chunks") not in (0, None):
+    sys.exit("legacy chunks remain: %r" % (report.get("legacy_chunks"),))
+print("active generation OK")
+PYEOF
   echo "strict preflight OK"
 }
 ```
 
-Confirm the active generation is the one you activated, and that legacy is gone:
+`strict_preflight_ok` already includes the active-generation and legacy-count checks, so a wrong
+active id or leftover legacy rows block the resume rather than merely printing.
 
-```bash
-run_generation report --space "$SPACE" | tee /tmp/report.out && show_output /tmp/report.out
-```
-
-`${GENERATION:?}` must be the active generation and the legacy count must be 0.
+> The field names in that assertion (`active_generation_id`, `legacy_chunks`) must match what
+> `report` actually prints. Confirm them against one real `report` run before the rollout, and
+> adjust if they differ — a mismatch would make the check pass vacuously.
 
 The permanent-override check is a cheap guard against operational drift — a stray `jobs update`,
 a leftover setting, a runbook that disagreed with what was actually run. The step-4 override is
