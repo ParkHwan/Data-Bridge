@@ -90,24 +90,50 @@ SERVICE_URL=$(gcloud run services describe databridge --project "$PROJECT" --reg
   --format='value(status.url)')
 set -o pipefail    # required: without it a failing wrapper is masked by tee
 
+FOLDER_ID_EXPECTED=98380      # the Confluence folder that holds $SPACE
+
 run_generation() { scripts/run_generation_job.sh --project "$PROJECT" --region "$REGION" "$@"; }
 
-# The wrapper reports the outcome, not the command's own output. inventory, report and
-# list write their body to the job's log. Read it back for the execution that just ran:
+# --- Read the body of the command the wrapper just ran -----------------------------
+# The wrapper reports an outcome; inventory, report and list write their body to the
+# job's log. Correlate by the operation id the wrapper reported — never by "latest
+# execution", which would show another operator's run.
 show_output() {
-  local exec_name
+  local result_file="${1:?usage: show_output <wrapper-result-file>}" op exec_name
+  op=$(python3 - "$result_file" <<'PYEOF'
+import json, sys
+lines = [l for l in open(sys.argv[1]) if l.startswith("DATABRIDGE_WRAPPER_RESULT ")]
+if len(lines) != 1:
+    sys.exit("expected exactly one wrapper result line, got %d" % len(lines))
+op = json.loads(lines[0].split(" ", 1)[1]).get("operation_id")
+if not isinstance(op, str) or not op:
+    sys.exit("wrapper reported no operation id; there is nothing to correlate")
+print(op)
+PYEOF
+  ) || return 1
   exec_name=$(gcloud run jobs executions list --job databridge-generation \
-    --project "$PROJECT" --region "$REGION" \
-    --sort-by=~metadata.creationTimestamp --limit 1 --format='value(metadata.name)') || return 1
-  [ -n "$exec_name" ] || { echo "no execution found" >&2; return 1; }
+      --project "$PROJECT" --region "$REGION" --format=json \
+    | OP="$op" python3 -c '
+import json, os, sys
+op = os.environ["OP"]
+hits = []
+for ex in json.load(sys.stdin):
+    env = ex["spec"]["template"]["spec"]["containers"][0].get("env", [])
+    if any(e.get("name") == "DATABRIDGE_OPERATION_ID" and e.get("value") == op for e in env):
+        hits.append(ex["metadata"]["name"])
+if len(hits) != 1:
+    sys.exit("expected exactly one execution for %s, found %d" % (op, len(hits)))
+print(hits[0])
+') || return 1
   gcloud logging read \
-    "logName:\"run.googleapis.com%2Fstdout\" labels.\"run.googleapis.com/execution_name\"=\"$exec_name\"" \
-    --project "$PROJECT" --limit 200 --order asc --format='value(textPayload)'
+    "logName:\"run.googleapis.com%2Fstdout\" labels.\"run.googleapis.com/execution_name\"=\"$exec_name\" labels.\"run.googleapis.com/task_index\"=\"0\" labels.\"run.googleapis.com/task_attempt\"=\"0\"" \
+    --project "$PROJECT" --limit 1000 --order desc --format='value(textPayload)' \
+    | python3 -c 'import sys; sys.stdout.writelines(reversed(sys.stdin.readlines()))'
 }
 
-# Read the generation id from a create-building run, refusing anything unclear.
+# --- Read the generation id, refusing anything unclear -----------------------------
 read_generation_id() {
-  python3 - "$1" <<'PYEOF'
+  python3 - "${1:?usage: read_generation_id <wrapper-result-file>}" <<'PYEOF'
 import json, sys
 lines = [l for l in open(sys.argv[1]) if l.startswith("DATABRIDGE_WRAPPER_RESULT ")]
 if len(lines) != 1:
@@ -205,14 +231,18 @@ worse, because the old reader returns legacy and building rows together.
 
 ```bash
 run_generation create-building --space "$SPACE" | tee /tmp/create.out
-GENERATION=$(read_generation_id /tmp/create.out) || { echo "STOP: no usable generation id"; }
-echo "GENERATION=$GENERATION"
+unset GENERATION
+GENERATION=$(read_generation_id /tmp/create.out)
+echo "GENERATION=${GENERATION:?STOP: no usable generation id — do not continue}"
 ```
 
-`read_generation_id` accepts the id only when there is exactly one wrapper result line, the
-wrapper exited 0, the CLI exited 0, and `cli_generation_id` is a positive integer. Anything else
-aborts with a message. **Do not continue with an empty or guessed `$GENERATION`** — every later
-step takes it as an argument and would act on the wrong generation.
+`read_generation_id` yields the id only when there is exactly one wrapper result line, the
+wrapper exited 0, the CLI exited 0, and `cli_generation_id` is a positive integer. Otherwise it
+prints why and leaves `GENERATION` unset.
+
+**The `:?` is the gate, not the prose.** An interactive shell does not stop just because a
+command failed, so every later step references `${GENERATION:?}`; with the variable unset those
+commands refuse to run instead of acting on the wrong generation.
 
 `create-building` is idempotent: an existing `building` generation with the same embedding
 profile is reused and the output says so. A `sealed` one blocks with exit 4. Use
@@ -229,24 +259,30 @@ structurally — `env` is a list of `{name, value}` objects, so splitting on com
 name from its own value:
 
 ```bash
-gcloud run jobs describe databridge-confluence-ingest --project "$PROJECT" --region "$REGION" \
-  --format=json | python3 -c '
-import json,sys
-env = json.load(sys.stdin)["spec"]["template"]["spec"]["template"]["spec"]["containers"][0].get("env", [])
-got = {e["name"]: e.get("value") for e in env}
-for key in ("SPACE_KEY", "FOLDER_ID", "DATABRIDGE_GENERATION_ID"):
-    print(f"{key}={got.get(key)!r}")
+verify_ingest_scope() {
+  gcloud run jobs describe databridge-confluence-ingest \
+      --project "$PROJECT" --region "$REGION" --format=json \
+    | SPACE="$SPACE" FOLDER_ID_EXPECTED="$FOLDER_ID_EXPECTED" python3 -c '
+import json, os, sys
+env = {e["name"]: e.get("value") for e in
+       json.load(sys.stdin)["spec"]["template"]["spec"]["template"]["spec"]["containers"][0].get("env", [])}
+problems = []
+if env.get("SPACE_KEY") != os.environ["SPACE"]:
+    problems.append("SPACE_KEY=%r, expected %r" % (env.get("SPACE_KEY"), os.environ["SPACE"]))
+if env.get("FOLDER_ID") != os.environ["FOLDER_ID_EXPECTED"]:
+    problems.append("FOLDER_ID=%r, expected %r" % (env.get("FOLDER_ID"), os.environ["FOLDER_ID_EXPECTED"]))
+if "DATABRIDGE_GENERATION_ID" in env:
+    problems.append("job carries a permanent DATABRIDGE_GENERATION_ID")
+if problems:
+    sys.exit("ingest scope is wrong: " + "; ".join(problems))
+print("ingest scope OK")
 '
-```
+}
 
-`SPACE_KEY` must equal `$SPACE`, `FOLDER_ID` must be the folder that holds it, and
-`DATABRIDGE_GENERATION_ID` must be absent. If any is wrong, fix the job definition **before**
-running the ingest — a mismatch ingests the wrong corpus into your new generation. Once
-verified, do not change these during the rollout.
-
-```bash
+# The ingest runs only if the scope check passes. Do not split these two.
+verify_ingest_scope && \
 gcloud run jobs execute databridge-confluence-ingest --project "$PROJECT" --region "$REGION" \
-  --update-env-vars "DATABRIDGE_GENERATION_ID=$GENERATION" --wait
+  --update-env-vars "DATABRIDGE_GENERATION_ID=${GENERATION:?}" --wait
 ```
 
 > This is the one `jobs execute` in the runbook. The ingest job is **not** a generation command
@@ -271,11 +307,12 @@ again before doing anything else:
 
 ```bash
 run_generation create-building --space "$SPACE" --discard-inflight | tee /tmp/create.out
-GENERATION=$(read_generation_id /tmp/create.out) || { echo "STOP: no usable generation id"; }
-echo "GENERATION=$GENERATION"    # a different id from the discarded one
+unset GENERATION
+GENERATION=$(read_generation_id /tmp/create.out)
+echo "GENERATION=${GENERATION:?STOP: no usable generation id — do not continue}"    # a new id
 
 gcloud run jobs execute databridge-confluence-ingest --project "$PROJECT" --region "$REGION" \
-  --update-env-vars "DATABRIDGE_GENERATION_ID=$GENERATION" --wait
+  --update-env-vars "DATABRIDGE_GENERATION_ID=${GENERATION:?}" --wait
 ```
 
 Running `inventory` against the old id after a discard reports on a generation that no longer
@@ -284,7 +321,7 @@ exists. Always re-read `$GENERATION` first.
 Then confirm what landed:
 
 ```bash
-run_generation inventory --space "$SPACE" --generation-id "$GENERATION" && show_output
+run_generation inventory --space "$SPACE" --generation-id "${GENERATION:?}" | tee /tmp/inv.out && show_output /tmp/inv.out
 ```
 
 Check the source set and per-source chunk counts against what you expect from Confluence. The
@@ -315,7 +352,7 @@ QUERY_BUCKET="${PROJECT}-databridge-validation-queries"
 LOCAL=./evals/mfs_validation_queries.yaml     # authored locally, not committed yet
 
 SHA=$(shasum -a 256 "$LOCAL" | cut -d' ' -f1)   # shasum: present on macOS and Linux
-OBJECT="validation-queries/${SPACE}/${GENERATION}/${SHA}.yaml"
+OBJECT="validation-queries/${SPACE}/${GENERATION:?}/${SHA}.yaml"
 QUERIES="/queries/${OBJECT}"
 
 gcloud storage cp "$LOCAL" "gs://${QUERY_BUCKET}/${OBJECT}" --project "$PROJECT"
@@ -334,7 +371,7 @@ right file to the right place. **Upload as the operator**, not as a deployment s
 ## Step 5 — Validate, which seals on success
 
 ```bash
-run_generation validate --space "$SPACE" --generation-id "$GENERATION" \
+run_generation validate --space "$SPACE" --generation-id "${GENERATION:?}" \
   --queries "$QUERIES" --expected-queries-sha256 "$SHA"
 ```
 
@@ -354,7 +391,7 @@ sealed and a receipt carrying a checksum is written. Nothing can write to it aft
 ## Step 6 — Activate
 
 ```bash
-run_generation activate --space "$SPACE" --generation-id "$GENERATION" --yes
+run_generation activate --space "$SPACE" --generation-id "${GENERATION:?}" --yes
 ```
 
 Activation accepts only a sealed generation, re-verifies the receipt, checksum, manifest
@@ -383,7 +420,7 @@ change lifecycle state with SQL.
 Only after step 7 passed. First-cutover-only, and irreversible.
 
 ```bash
-run_generation delete-legacy --space "$SPACE" --generation-id "$GENERATION" --yes
+run_generation delete-legacy --space "$SPACE" --generation-id "${GENERATION:?}" --yes
 ```
 
 The command re-checks activation integrity every time: the target must be the active
@@ -398,7 +435,7 @@ carries `space_key`, `generation_id`, `legacy_count_before`, `deleted_count`.
 Confirm:
 
 ```bash
-run_generation report --space "$SPACE" && show_output
+run_generation report --space "$SPACE" | tee /tmp/report.out && show_output /tmp/report.out
 ```
 
 Legacy count is 0, and the active generation's count matches step 4.
@@ -422,58 +459,64 @@ for JOB in databridge-migrate databridge-ingest databridge-confluence-ingest dat
 done
 ```
 
-Verify all four things mechanically. Do not eyeball the output — parse it:
+Verify everything mechanically, in **one function that returns non-zero on any failure** — a
+`for` loop over jobs reports the status of its *last* iteration, so an early failure would be
+hidden by a later success.
 
 ```bash
-# 1. Service is strict, and 2. no permanent generation override on the service
-gcloud run services describe databridge --project "$PROJECT" --region "$REGION" --format=json \
-  | python3 -c '
-import json,sys
+strict_preflight_ok() {
+  gcloud run services describe databridge --project "$PROJECT" --region "$REGION" --format=json \
+    | python3 -c '
+import json, sys
 env = {e["name"]: e.get("value") for e in
        json.load(sys.stdin)["spec"]["template"]["spec"]["containers"][0].get("env", [])}
-assert env.get("DATABRIDGE_PROFILE_MODE") == "strict", env.get("DATABRIDGE_PROFILE_MODE")
-assert "DATABRIDGE_GENERATION_ID" not in env, "service carries a permanent generation override"
+if env.get("DATABRIDGE_PROFILE_MODE") != "strict":
+    sys.exit("service DATABRIDGE_PROFILE_MODE=%r" % env.get("DATABRIDGE_PROFILE_MODE"))
+if "DATABRIDGE_GENERATION_ID" in env:
+    sys.exit("service carries a permanent generation override")
 print("service OK")
-'
+' || return 1
 
-# 3. Every job is strict and carries no permanent generation override
-for JOB in databridge-migrate databridge-ingest databridge-confluence-ingest databridge-generation; do
-  gcloud run jobs describe "$JOB" --project "$PROJECT" --region "$REGION" --format=json \
-    | JOB="$JOB" python3 -c '
-import json,os,sys
+  for JOB in databridge-migrate databridge-ingest databridge-confluence-ingest databridge-generation; do
+    gcloud run jobs describe "$JOB" --project "$PROJECT" --region "$REGION" --format=json \
+      | JOB="$JOB" python3 -c '
+import json, os, sys
 env = {e["name"]: e.get("value") for e in
        json.load(sys.stdin)["spec"]["template"]["spec"]["template"]["spec"]["containers"][0].get("env", [])}
 job = os.environ["JOB"]
-assert env.get("DATABRIDGE_PROFILE_MODE") == "strict", (job, env.get("DATABRIDGE_PROFILE_MODE"))
-assert "DATABRIDGE_GENERATION_ID" not in env, (job, "permanent generation override")
-print(f"{job} OK")
-'
-done
+if env.get("DATABRIDGE_PROFILE_MODE") != "strict":
+    sys.exit("%s DATABRIDGE_PROFILE_MODE=%r" % (job, env.get("DATABRIDGE_PROFILE_MODE")))
+if "DATABRIDGE_GENERATION_ID" in env:
+    sys.exit("%s carries a permanent generation override" % job)
+print("%s OK" % job)
+' || return 1
+  done
 
-# 4. The service actually started under strict — a preflight failure shows up at startup
-gcloud run services describe databridge --project "$PROJECT" --region "$REGION" \
-  --format='value(status.conditions)'
-curl -sf -X POST "$SERVICE_URL/ask" -H 'Content-Type: application/json' \
-  -d '{"question":"<a question you know this corpus answers>"}' >/dev/null \
-  && echo "serving OK under strict"
+  # The service must actually answer under strict — a preflight failure shows at startup.
+  curl -sf -X POST "$SERVICE_URL/ask" -H 'Content-Type: application/json' \
+    -d '{"question":"<a question you know this corpus answers>"}' >/dev/null || return 1
+  echo "strict preflight OK"
+}
 ```
 
-Then confirm the active generation is the one you activated:
+Confirm the active generation is the one you activated, and that legacy is gone:
 
 ```bash
-run_generation report --space "$SPACE" && show_output
+run_generation report --space "$SPACE" | tee /tmp/report.out && show_output /tmp/report.out
 ```
 
-`$GENERATION` must be the active one, and the legacy count must be 0.
+`${GENERATION:?}` must be the active generation and the legacy count must be 0.
 
 The permanent-override check is a cheap guard against operational drift — a stray `jobs update`,
 a leftover setting, a runbook that disagreed with what was actually run. The step-4 override is
 execution-scoped and does not persist (measured), so these assertions should always pass.
 
-Only now resume:
+Resume **only as a consequence of the check**, in one chained command:
 
 ```bash
+strict_preflight_ok && \
 gcloud scheduler jobs resume databridge-confluence-ingest --project "$PROJECT" --location "$REGION"
+
 gcloud scheduler jobs describe databridge-confluence-ingest --project "$PROJECT" --location "$REGION" \
   --format='value(state)'
 ```
@@ -496,7 +539,7 @@ long: the space serves no evidence in that window.
   when you have confirmed the space holds **zero** non-null-generation chunks:
 
   ```bash
-  run_generation report --space "$SPACE" && show_output
+  run_generation report --space "$SPACE" | tee /tmp/report.out && show_output /tmp/report.out
   ```
 
   Leave the generation in place, or discard it on the next attempt with `--discard-inflight`.
