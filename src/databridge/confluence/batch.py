@@ -20,7 +20,7 @@ from databridge.confluence.models import Page, Space
 from databridge.confluence.parser import ADFParser
 from databridge.embed.base import Embedder
 from databridge.ingest.chunker import Chunk, chunk_document
-from databridge.store import SpaceProfileReport
+from databridge.store import Generation, SpaceProfileReport
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,12 @@ class BatchClient(Protocol):
 
 class BatchStore(Protocol):
     def advisory_lock(self, key: str) -> AbstractContextManager[bool]: ...
+
+    def resolve_batch_target(
+        self, *, space_key: str, generation_id: int | None
+    ) -> Generation: ...
+
+    def begin_manifest(self, *, space_key: str, generation_id: int) -> int: ...
 
     def replace_source(
         self,
@@ -59,6 +65,18 @@ class BatchStore(Protocol):
     ) -> int: ...
 
     def profile_report(self, *, space_key: str) -> SpaceProfileReport: ...
+
+    def finalize_manifest(
+        self,
+        *,
+        space_key: str,
+        generation_id: int,
+        source_counts: dict[str, int],
+        total_chunks: int,
+        page_count: int,
+        skipped_pages: int,
+        suppressed_pages: int,
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -218,28 +236,46 @@ async def _run_locked(
     if not prepared:
         raise BatchSafetyError("All pages produced no content; refusing destructive GC")
 
+    target = store.resolve_batch_target(
+        space_key=config.space_key, generation_id=generation_id
+    )
+    target_generation_id = target.generation_id
+    store.begin_manifest(
+        space_key=config.space_key, generation_id=target_generation_id
+    )
+
     for item in prepared:
         store.replace_source(
             space_key=config.space_key,
             source_id=item.page_id,
             chunks=item.chunks,
             embeddings=item.embeddings,
-            generation_id=generation_id,
+            generation_id=target_generation_id,
         )
 
     stale = store.list_source_ids(
-        space_key=config.space_key, generation_id=generation_id
+        space_key=config.space_key, generation_id=target_generation_id
     ) - seen
     for source_id in sorted(stale):
         store.delete_source(
             space_key=config.space_key,
             source_id=source_id,
-            generation_id=generation_id,
+            generation_id=target_generation_id,
         )
+    store.finalize_manifest(
+        space_key=config.space_key,
+        generation_id=target_generation_id,
+        # This records what the batch believes it wrote. It detects storage-side
+        # partial writes/GC errors, but cannot prove that the upstream fetch itself was
+        # complete. Exact source-set validation also intentionally rejects incremental
+        # runs against a generation that already contains rows outside this snapshot.
+        source_counts={item.page_id: len(item.chunks) for item in prepared},
+        total_chunks=total_chunks,
+        page_count=len(prepared),
+        skipped_pages=skipped_pages,
+        suppressed_pages=suppressed_pages,
+    )
     report = store.profile_report(space_key=config.space_key)
-    target_generation_id = generation_id or report.active_generation_id
-    if target_generation_id is None:
-        raise RuntimeError("Completed batch has no target embedding generation")
     elapsed = time.monotonic() - started
     logger.info(
         "Confluence ingest complete: space=%s generation_id=%s pages=%s chunks=%s "
