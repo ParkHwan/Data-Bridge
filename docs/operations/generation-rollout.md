@@ -59,6 +59,12 @@ Set these once:
 PROJECT=genaiacademy-ph
 REGION=us-central1
 SPACE=MFS
+
+# The digest you intend to roll out. Take it from the build that produced it — the Cloud
+# Build result for the merge — not from what is currently deployed. Reading it back from
+# the service would make the check compare the deployment against itself.
+EXPECTED_IMAGE='us-central1-docker.pkg.dev/genaiacademy-ph/cloud-run-source-deploy/databridge@sha256:CHANGE_ME'
+
 SERVICE_URL=$(gcloud run services describe databridge --project "$PROJECT" --region "$REGION" \
   --format='value(status.url)')
 set -o pipefail    # required: without it a failing wrapper is masked by tee
@@ -142,6 +148,60 @@ PYEOF
 ---
 
 ### Preconditions
+
+Most of this is checkable. Run the function; the checklist below it covers only what a
+command cannot decide.
+
+```bash
+preconditions_ok() {
+  case "${EXPECTED_IMAGE:?set EXPECTED_IMAGE first}" in
+    *@sha256:*CHANGE_ME*) echo "EXPECTED_IMAGE still holds the placeholder" >&2; return 1;;
+    *@sha256:*) ;;
+    *) echo "EXPECTED_IMAGE is not digest-pinned" >&2; return 1;;
+  esac
+  [ -n "${SERVICE_URL:-}" ] || { echo "SERVICE_URL is empty" >&2; return 1; }
+
+  # The generation job exists and is configured the way the wrapper's contract assumes.
+  gcloud run jobs describe databridge-generation --project "$PROJECT" --region "$REGION" \
+      --format=json \
+    | python3 -c '
+import json, sys
+job = json.load(sys.stdin)
+spec = job["spec"]["template"]["spec"]
+task = spec["template"]["spec"]
+problems = []
+if spec.get("taskCount", 1) != 1:
+    problems.append("taskCount=%r" % spec.get("taskCount"))
+if spec.get("parallelism", 1) not in (1, None):
+    problems.append("parallelism=%r" % spec.get("parallelism"))
+if task.get("maxRetries", 0) not in (0, None):
+    problems.append("maxRetries=%r" % task.get("maxRetries"))
+# The DSN must be a secret reference, never a literal: a literal is readable by anyone
+# with viewer access and is copied into every execution spec.
+for e in task["containers"][0].get("env", []):
+    if e.get("name") == "DATABRIDGE_DSN" and e.get("value") is not None:
+        problems.append("DATABRIDGE_DSN is a literal value, not a secret reference")
+if problems:
+    sys.exit("generation job misconfigured: " + "; ".join(problems))
+print("generation job OK")
+' || return 1
+
+  # We can read Tasks — the wrapper runs as the operator and needs run.tasks.get/list.
+  gcloud run jobs executions list --job databridge-generation \
+    --project "$PROJECT" --region "$REGION" --limit 1 >/dev/null \
+    || { echo "cannot list executions — check run.tasks.get / run.tasks.list" >&2; return 1; }
+
+  gcloud sql instances describe databridge-demo --project "$PROJECT" \
+      --format='value(settings.backupConfiguration.pointInTimeRecoveryEnabled)' \
+    | grep -qx True || { echo "point-in-time recovery is not enabled" >&2; return 1; }
+
+  echo "preconditions OK"
+}
+
+preconditions_ok
+```
+
+What no command can decide, and you must judge yourself:
 
 
 
@@ -458,8 +518,17 @@ curl -sf -X POST "$SERVICE_URL/ask" -H 'Content-Type: application/json' \
 
 `-f` matters: without it an HTTP error is not a shell failure and the block would look fine.
 
-Check by hand that the answer carries citations resolving into this corpus, and that a question
-with no support is still refused. **This judgement cannot be automated for a space that has no
+Then ask something this corpus does not cover, and confirm it is refused rather than answered:
+
+```bash
+curl -sf -X POST "$SERVICE_URL/ask" -H 'Content-Type: application/json' \
+  -d '{"question":"What is the approved catering menu for the Neptune office holiday party?"}' \
+  | head -20
+```
+
+Check by hand that the first answer carries citations resolving into this corpus, and that the
+second is a refusal. Both halves matter: citations prove the generation serves, and the refusal
+proves it is not answering from something else. **This judgement cannot be automated for a space that has no
 golden file** — the repository's golden set targets `DEMO`, and the runner refuses a space
 mismatch, so there is no command that can decide this for `$SPACE`.
 
