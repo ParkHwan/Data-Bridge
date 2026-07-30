@@ -73,6 +73,7 @@ run_generation() { scripts/run_generation_job.sh --project "$PROJECT" --region "
 # execution", which would show another operator's run.
 show_output() {
   local result_file="${1:?usage: show_output <wrapper-result-file>}" op exec_name
+
   op=$(python3 - "$result_file" <<'PYEOF'
 import json, sys
 lines = [l for l in open(sys.argv[1]) if l.startswith("DATABRIDGE_WRAPPER_RESULT ")]
@@ -84,27 +85,30 @@ if not isinstance(op, str) or not op:
 print(op)
 PYEOF
   ) || return 1
-  exec_name=$(gcloud run jobs executions list --job databridge-generation \
-      --project "$PROJECT" --region "$REGION" --format=json \
-    | OP="$op" python3 -c '
+
+  # Describe every candidate. A list entry is not guaranteed to carry per-execution env
+  # overrides, and an execution we cannot inspect is not the same as one that does not match.
+  local names n hits=""
+  names=$(gcloud run jobs executions list --job databridge-generation \
+    --project "$PROJECT" --region "$REGION" --format='value(metadata.name)') || return 1
+  for n in $names; do
+    local match
+    match=$(gcloud run jobs executions describe "$n" \
+        --project "$PROJECT" --region "$REGION" --format=json \
+      | OP="$op" NAME="$n" python3 -c '
 import json, os, sys
-op = os.environ["OP"]
-hits, unreadable = [], []
-for ex in json.load(sys.stdin):
-    name = ex.get("metadata", {}).get("name", "<unnamed>")
-    try:
-        env = ex["spec"]["template"]["spec"]["containers"][0].get("env", [])
-    except (KeyError, IndexError, TypeError):
-        unreadable.append(name)   # could not inspect it: not the same as "does not match"
-        continue
-    if any(e.get("name") == "DATABRIDGE_OPERATION_ID" and e.get("value") == op for e in env):
-        hits.append(name)
-if unreadable:
-    sys.exit("cannot inspect executions %s — refusing to guess which one is yours" % unreadable)
-if len(hits) != 1:
-    sys.exit("expected exactly one execution for %s, found %d" % (op, len(hits)))
-print(hits[0])
-') || return 1
+op, name = os.environ["OP"], os.environ["NAME"]
+env = json.load(sys.stdin)["spec"]["template"]["spec"]["containers"][0].get("env", [])
+if any(e.get("name") == "DATABRIDGE_OPERATION_ID" and e.get("value") == op for e in env):
+    print(name)
+') || { echo "cannot inspect execution $n — refusing to guess which one is yours" >&2; return 1; }
+    [ -n "$match" ] && hits="$hits $match"
+  done
+
+  set -- $hits
+  [ "$#" -eq 1 ] || { echo "expected exactly one execution for $op, found $#" >&2; return 1; }
+  exec_name="$1"
+
   gcloud logging read \
     "logName:\"run.googleapis.com%2Fstdout\" labels.\"run.googleapis.com/execution_name\"=\"$exec_name\" labels.\"run.googleapis.com/task_index\"=\"0\" labels.\"run.googleapis.com/task_attempt\"=\"0\"" \
     --project "$PROJECT" --limit 1000 --order desc --format='value(textPayload)' \
@@ -207,12 +211,21 @@ Three things worth knowing before you need them:
 ## Step 1 — Pause the scheduler
 
 ```bash
-gcloud scheduler jobs pause databridge-confluence-ingest --project "$PROJECT" --location "$REGION"
-gcloud scheduler jobs describe databridge-confluence-ingest --project "$PROJECT" --location "$REGION" \
-  --format='value(state)'
+scheduler_paused_ok() {
+  gcloud scheduler jobs pause databridge-confluence-ingest \
+    --project "$PROJECT" --location "$REGION" || return 1
+  local state
+  state=$(gcloud scheduler jobs describe databridge-confluence-ingest \
+    --project "$PROJECT" --location "$REGION" --format='value(state)') || return 1
+  [ "$state" = "PAUSED" ] || { echo "scheduler state is $state, expected PAUSED" >&2; return 1; }
+  echo "scheduler PAUSED"
+}
+
+scheduler_paused_ok
 ```
 
-Expect `PAUSED`. A batch starting mid-rollout writes into the wrong generation.
+A batch starting mid-rollout writes into the wrong generation. The function asserts the state
+rather than printing it; step 2 chains onto it.
 
 ## Step 2 — Update every job image, then verify each
 
@@ -220,24 +233,29 @@ Expect `PAUSED`. A batch starting mid-rollout writes into the wrong generation.
 job images drift silently. Check digests rather than assuming.
 
 ```bash
-gcloud run services describe databridge --project "$PROJECT" --region "$REGION" \
-  --format='value(spec.template.spec.containers[0].image)'
+images_aligned_ok() {
+  local want got job
+  want=$(gcloud run services describe databridge --project "$PROJECT" --region "$REGION" \
+    --format='value(spec.template.spec.containers[0].image)') || return 1
+  case "$want" in *@sha256:*) ;; *) echo "service image is not digest-pinned: $want" >&2; return 1;; esac
+  echo "target digest: $want"
+  for job in databridge-migrate databridge-ingest databridge-confluence-ingest databridge-generation; do
+    got=$(gcloud run jobs describe "$job" --project "$PROJECT" --region "$REGION" \
+      --format='value(spec.template.spec.template.spec.containers[0].image)') || return 1
+    [ "$got" = "$want" ] || { echo "$job is on $got, expected $want" >&2; return 1; }
+    echo "$job OK"
+  done
+}
 
-for JOB in databridge-migrate databridge-ingest databridge-confluence-ingest databridge-generation; do
-  printf '%s\t' "$JOB"
-  gcloud run jobs describe "$JOB" --project "$PROJECT" --region "$REGION" \
-    --format='value(spec.template.spec.template.spec.containers[0].image)'
-done
-```
-
-Every line must carry the digest you intend to roll out. A job left on the old image writes
-with old schema assumptions and fails against the migrated schema.
-
-Then move traffic to the new revision:
-
-```bash
+scheduler_paused_ok && images_aligned_ok && \
 gcloud run services update-traffic databridge --project "$PROJECT" --region "$REGION" --to-latest
 ```
+
+A job left on the old image writes with old schema assumptions and fails against the migrated
+schema, so the traffic move is chained onto the digest check. `update-jobs` runs before `deploy`
+in the build, but a failed deploy can skip the job update — which is exactly how digests drift
+without anyone noticing.
+
 
 **From here `/ask` returns no evidence for this space until step 8.** That is specified
 behaviour. Do not roll back on seeing it — rolling the image back once building rows exist is
@@ -327,9 +345,13 @@ unset GENERATION
 GENERATION=$(read_generation_id /tmp/create.out)
 echo "GENERATION=${GENERATION:?STOP: no usable generation id — do not continue}"    # a new id
 
+verify_ingest_scope && \
 gcloud run jobs execute databridge-confluence-ingest --project "$PROJECT" --region "$REGION" \
   --update-env-vars "DATABRIDGE_GENERATION_ID=${GENERATION:?}" --wait
 ```
+
+The retry path takes the same scope gate as the first run — an unguarded retry was how the
+original draft let a wrong corpus through.
 
 Running `inventory` against the old id after a discard reports on a generation that no longer
 exists. Always re-read `$GENERATION` first.
@@ -538,15 +560,22 @@ print("%s OK" % job)
   GENERATION="${GENERATION:?}" python3 - /tmp/report.body <<'PYEOF' || return 1
 import json, os, sys
 want = int(os.environ["GENERATION"])
-body = open(sys.argv[1]).read()
-rows = [json.loads(l) for l in body.splitlines() if l.strip().startswith("{")]
+rows = [json.loads(l) for l in open(sys.argv[1]) if l.lstrip().startswith("{")]
 if not rows:
     sys.exit("report produced no parseable output; cannot confirm the active generation")
 report = rows[-1]
-if report.get("active_generation_id") != want:
-    sys.exit("active generation is %r, expected %r" % (report.get("active_generation_id"), want))
-if report.get("legacy_chunks") not in (0, None):
-    sys.exit("legacy chunks remain: %r" % (report.get("legacy_chunks"),))
+# Field names verified against scripts/generation.py (_reference_report) and
+# PgVectorStore.generation_report.
+legacy = report.get("legacy_null_generation_chunks")
+if legacy != 0:
+    sys.exit("legacy_null_generation_chunks=%r, expected 0" % (legacy,))
+active = [g for g in report.get("generations", []) if g.get("state") == "active"]
+if len(active) != 1:
+    sys.exit("expected exactly one active generation, found %d" % len(active))
+if active[0].get("generation_id") != want:
+    sys.exit("active generation is %r, expected %r" % (active[0].get("generation_id"), want))
+if active[0].get("chunk_count", 0) <= 0:
+    sys.exit("active generation holds no chunks")
 print("active generation OK")
 PYEOF
   echo "strict preflight OK"
@@ -556,9 +585,11 @@ PYEOF
 `strict_preflight_ok` already includes the active-generation and legacy-count checks, so a wrong
 active id or leftover legacy rows block the resume rather than merely printing.
 
-> The field names in that assertion (`active_generation_id`, `legacy_chunks`) must match what
-> `report` actually prints. Confirm them against one real `report` run before the rollout, and
-> adjust if they differ — a mismatch would make the check pass vacuously.
+The field names come from the code, not from guesswork: `report` prints
+`legacy_null_generation_chunks` at the top level and a `generations` list whose rows carry
+`generation_id`, `state` and `chunk_count` (`scripts/generation.py` → `_reference_report`,
+`PgVectorStore.generation_report`). A check written against invented names would pass vacuously,
+which is worse than no check.
 
 The permanent-override check is a cheap guard against operational drift — a stray `jobs update`,
 a leftover setting, a runbook that disagreed with what was actually run. The step-4 override is
