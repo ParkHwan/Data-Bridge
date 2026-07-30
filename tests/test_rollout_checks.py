@@ -15,9 +15,12 @@ from databridge.rollout_checks import (
     check_env_absent,
     check_generation_job,
     check_images,
+    check_ingest_scope,
     check_report,
+    check_strict_mode,
     correlate_execution,
     read_generation_id,
+    read_operation_id,
 )
 
 _MISSING = object()
@@ -226,11 +229,15 @@ def test_correlate_execution_rejects_any_unreadable_candidate() -> None:
 
 
 def _wrapper_line(
-    *, wrapper_exit: object = 0, cli_exit: object = 0, generation_id: object = 7
+    *,
+    wrapper_exit: object = 0,
+    cli_exit: object = 0,
+    generation_id: object = 7,
+    operation_id: object = "00000000-0000-4000-8000-000000000001",
 ) -> str:
     return WRAPPER_PREFIX + json.dumps(
         {
-            "operation_id": "00000000-0000-4000-8000-000000000001",
+            "operation_id": operation_id,
             "wrapper_exit": wrapper_exit,
             "wrapper_reason": "passthrough",
             "cli_exit": cli_exit,
@@ -301,3 +308,79 @@ def test_env_absent_reports_presence_without_exposing_values() -> None:
     problems = check_env_absent([{"name": "FORBIDDEN", "value": "secret"}], "FORBIDDEN")
     assert problems
     assert "secret" not in " ".join(problems)
+
+
+def _env(**values: str) -> list[dict[str, object]]:
+    return [{"name": key, "value": value} for key, value in values.items()]
+
+
+def test_ingest_scope_rejects_a_different_corpus() -> None:
+    """setup_cicd tells the provisioner to use a dedicated key, so this cannot be assumed."""
+    good = _env(SPACE_KEY="MFS", FOLDER_ID="98380")
+    assert check_ingest_scope(good, space_key="MFS", folder_id="98380") == []
+    assert check_ingest_scope(
+        _env(SPACE_KEY="CONF_DEMO", FOLDER_ID="98380"), space_key="MFS", folder_id="98380"
+    ) != []
+    assert check_ingest_scope(
+        _env(SPACE_KEY="MFS", FOLDER_ID="1"), space_key="MFS", folder_id="98380"
+    ) != []
+    assert check_ingest_scope([], space_key="MFS", folder_id="98380") != []
+
+
+def test_ingest_scope_rejects_a_permanent_generation_override() -> None:
+    """An execution-time override is fine; a permanent one retargets every future run."""
+    env = _env(SPACE_KEY="MFS", FOLDER_ID="98380", DATABRIDGE_GENERATION_ID="7")
+    assert check_ingest_scope(env, space_key="MFS", folder_id="98380") != []
+
+
+def test_strict_mode_requires_the_service_and_every_job() -> None:
+    strict = _env(DATABRIDGE_PROFILE_MODE="strict")
+    observe = _env(DATABRIDGE_PROFILE_MODE="observe")
+    assert check_strict_mode(
+        service_env=strict, job_envs=dict.fromkeys(ROLLOUT_JOBS, strict)
+    ) == []
+    # A job left on observe keeps writing under the condition strict exists to reject.
+    for name in ROLLOUT_JOBS:
+        envs: dict[str, list[dict[str, object]]] = dict.fromkeys(ROLLOUT_JOBS, strict)
+        envs[name] = observe
+        problems = check_strict_mode(service_env=strict, job_envs=envs)
+        assert any(name in problem for problem in problems), name
+    assert check_strict_mode(
+        service_env=observe, job_envs=dict.fromkeys(ROLLOUT_JOBS, strict)
+    ) != []
+
+
+def test_strict_mode_rejects_an_unread_job() -> None:
+    """A job whose environment was never read must not count as compliant."""
+    strict = _env(DATABRIDGE_PROFILE_MODE="strict")
+    assert check_strict_mode(service_env=strict, job_envs={}) != []
+    for name in ROLLOUT_JOBS:
+        partial: dict[str, list[dict[str, object]]] = dict.fromkeys(ROLLOUT_JOBS, strict)
+        del partial[name]
+        assert any(
+            name in problem
+            for problem in check_strict_mode(service_env=strict, job_envs=partial)
+        ), name
+
+
+def test_strict_mode_rejects_a_permanent_generation_override() -> None:
+    strict = _env(DATABRIDGE_PROFILE_MODE="strict")
+    leaked = _env(DATABRIDGE_PROFILE_MODE="strict", DATABRIDGE_GENERATION_ID="7")
+    assert check_strict_mode(service_env=leaked, job_envs=dict.fromkeys(ROLLOUT_JOBS, strict)) != []
+    envs: dict[str, list[dict[str, object]]] = dict.fromkeys(ROLLOUT_JOBS, strict)
+    envs["databridge-generation"] = leaked
+    assert check_strict_mode(service_env=strict, job_envs=envs) != []
+
+
+def test_operation_id_refuses_anything_ambiguous() -> None:
+    line = _wrapper_line()
+    assert read_operation_id([line]) == "00000000-0000-4000-8000-000000000001"
+    ambiguous = (
+        [],
+        [line, line],
+        [_wrapper_line(operation_id=None)],
+        [_wrapper_line(operation_id="")],
+    )
+    for bad in ambiguous:
+        with pytest.raises(RolloutCheckError):
+            read_operation_id(bad)

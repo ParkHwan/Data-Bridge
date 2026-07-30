@@ -69,78 +69,24 @@ SERVICE_URL=$(gcloud run services describe databridge --project "$PROJECT" --reg
   --format='value(status.url)')
 set -o pipefail    # required: without it a failing wrapper is masked by tee
 
-FOLDER_ID_EXPECTED=98380      # the Confluence folder that holds $SPACE
+# The digest you intend to roll out. Take it from the build that produced it — the Cloud
+# Build result for the merge — not from what is currently deployed. Reading it back from
+# the service would make the check compare the deployment against itself.
+EXPECTED_IMAGE='us-central1-docker.pkg.dev/genaiacademy-ph/cloud-run-source-deploy/databridge@sha256:CHANGE_ME'
 
 run_generation() { scripts/run_generation_job.sh --project "$PROJECT" --region "$REGION" "$@"; }
+preflight() { uv run python scripts/rollout_preflight.py "$@" --project "$PROJECT" --region "$REGION"; }
 
-# --- Read the body of the command the wrapper just ran -----------------------------
-# The wrapper reports an outcome; inventory, report and list write their body to the
-# job's log. Correlate by the operation id the wrapper reported — never by "latest
-# execution", which would show another operator's run.
+# The wrapper reports an outcome, not the command's own output. inventory, report and list
+# write their body to the job's log; read it back for the execution that just ran.
 show_output() {
   local result_file="${1:?usage: show_output <wrapper-result-file>}" op exec_name
-
-  op=$(python3 - "$result_file" <<'PYEOF'
-import json, sys
-lines = [l for l in open(sys.argv[1]) if l.startswith("DATABRIDGE_WRAPPER_RESULT ")]
-if len(lines) != 1:
-    sys.exit("expected exactly one wrapper result line, got %d" % len(lines))
-op = json.loads(lines[0].split(" ", 1)[1]).get("operation_id")
-if not isinstance(op, str) or not op:
-    sys.exit("wrapper reported no operation id; there is nothing to correlate")
-print(op)
-PYEOF
-  ) || return 1
-
-  # Describe every candidate. A list entry is not guaranteed to carry per-execution env
-  # overrides, and an execution we cannot inspect is not the same as one that does not match.
-  # Do not rely on word splitting: bash splits an unquoted $var, default zsh does not.
-  # Read line by line and count with an integer instead.
-  local names n match hits=0
-  names=$(gcloud run jobs executions list --job databridge-generation \
-    --project "$PROJECT" --region "$REGION" --format='value(metadata.name)') || return 1
-  while IFS= read -r n; do
-    [ -n "$n" ] || continue
-    match=$(gcloud run jobs executions describe "$n" \
-        --project "$PROJECT" --region "$REGION" --format=json \
-      | OP="$op" NAME="$n" python3 -c '
-import json, os, sys
-op, name = os.environ["OP"], os.environ["NAME"]
-env = json.load(sys.stdin)["spec"]["template"]["spec"]["containers"][0].get("env", [])
-if any(e.get("name") == "DATABRIDGE_OPERATION_ID" and e.get("value") == op for e in env):
-    print(name)
-') || { echo "cannot inspect execution $n — refusing to guess which one is yours" >&2; return 1; }
-    if [ -n "$match" ]; then
-      hits=$((hits + 1))
-      exec_name="$match"
-    fi
-  done <<EOF
-$names
-EOF
-
-  [ "$hits" -eq 1 ] || { echo "expected exactly one execution for $op, found $hits" >&2; return 1; }
-
+  op=$(preflight operation-id --input "$result_file") || return 1
+  exec_name=$(preflight correlate --operation-id "$op") || return 1
   gcloud logging read \
     "logName:\"run.googleapis.com%2Fstdout\" labels.\"run.googleapis.com/execution_name\"=\"$exec_name\" labels.\"run.googleapis.com/task_index\"=\"0\" labels.\"run.googleapis.com/task_attempt\"=\"0\"" \
     --project "$PROJECT" --limit 1000 --order desc --format='value(textPayload)' \
     | python3 -c 'import sys; sys.stdout.writelines(reversed(sys.stdin.readlines()))'
-}
-
-# --- Read the generation id, refusing anything unclear -----------------------------
-read_generation_id() {
-  python3 - "${1:?usage: read_generation_id <wrapper-result-file>}" <<'PYEOF'
-import json, sys
-lines = [l for l in open(sys.argv[1]) if l.startswith("DATABRIDGE_WRAPPER_RESULT ")]
-if len(lines) != 1:
-    sys.exit("expected exactly one wrapper result line, got %d" % len(lines))
-p = json.loads(lines[0].split(" ", 1)[1])
-if p.get("wrapper_exit") != 0 or p.get("cli_exit") != 0:
-    sys.exit("wrapper_exit=%r cli_exit=%r — not a success" % (p.get("wrapper_exit"), p.get("cli_exit")))
-gid = p.get("cli_generation_id")
-if not isinstance(gid, int) or isinstance(gid, bool) or gid <= 0:
-    sys.exit("cli_generation_id is not a positive integer: %r" % (gid,))
-print(gid)
-PYEOF
 }
 ```
 
@@ -153,93 +99,22 @@ Most of this is checkable. Run the function; the checklist below it covers only 
 command cannot decide.
 
 ```bash
-preconditions_ok() {
-  case "${EXPECTED_IMAGE:?set EXPECTED_IMAGE first}" in
-    *@sha256:*CHANGE_ME*) echo "EXPECTED_IMAGE still holds the placeholder" >&2; return 1;;
-    *@sha256:*) ;;
-    *) echo "EXPECTED_IMAGE is not digest-pinned" >&2; return 1;;
-  esac
-  [ -n "${SERVICE_URL:-}" ] || { echo "SERVICE_URL is empty" >&2; return 1; }
-
-  # The generation job exists and is configured the way the wrapper's contract assumes.
-  gcloud run jobs describe databridge-generation --project "$PROJECT" --region "$REGION" \
-      --format=json \
-    | python3 -c '
-import json, sys
-job = json.load(sys.stdin)
-spec = job["spec"]["template"]["spec"]
-task = spec["template"]["spec"]
-problems = []
-
-# Measured on a real job: an explicit --max-retries 0 is present in the JSON as
-# maxRetries: 0, taskCount is present as an int, parallelism is omitted entirely, and
-# timeoutSeconds is a STRING. So an omitted maxRetries does not mean zero: the Cloud Run
-# default is 3, and treating the omission as 0 would approve a job that silently retries
-# activate or delete-legacy. Require the value to be there and to be exactly 0.
-if task.get("maxRetries") != 0 or type(task.get("maxRetries")) is not int:
-    problems.append("maxRetries=%r; require an explicit 0 (omitted means 3)" % task.get("maxRetries"))
-if spec.get("taskCount") != 1 or type(spec.get("taskCount")) is not int:
-    problems.append("taskCount=%r; require an explicit 1" % spec.get("taskCount"))
-# parallelism may be omitted; with taskCount 1 there can never be a second task.
-if spec.get("parallelism") not in (None, 1):
-    problems.append("parallelism=%r" % spec.get("parallelism"))
-try:
-    timeout = int(task.get("timeoutSeconds"))
-except (TypeError, ValueError):
-    timeout = -1
-if timeout < 3600:
-    problems.append("timeoutSeconds=%r; require at least 3600" % task.get("timeoutSeconds"))
-if problems:
-    sys.exit("generation job misconfigured: " + "; ".join(problems))
-print("generation job OK")
-' || return 1
-
-  # Prove the permissions the wrapper actually uses. Listing executions is a different
-  # permission from reading Tasks, so it does not stand in for run.tasks.list/get.
-  local probe_exec probe_task
-  probe_exec=$(gcloud run jobs executions list --job databridge-generation \
-    --project "$PROJECT" --region "$REGION" --limit 1 --format='value(metadata.name)') || return 1
-  if [ -n "$probe_exec" ]; then
-    probe_task=$(gcloud run jobs executions tasks list --execution "$probe_exec" \
-      --project "$PROJECT" --region "$REGION" --limit 1 --format='value(metadata.name)') \
-      || { echo "cannot list tasks — check run.tasks.list" >&2; return 1; }
-    if [ -n "$probe_task" ]; then
-      gcloud run jobs executions tasks describe "$probe_task" \
-        --project "$PROJECT" --region "$REGION" --format='value(metadata.name)' >/dev/null \
-        || { echo "cannot describe a task — check run.tasks.get" >&2; return 1; }
-      echo "task read access OK"
-    else
-      # The execution carries no task (start failure, still starting). run.tasks.get was
-      # never exercised, so fall through to the wrapper probe rather than declare success.
-      run_generation report --space "$SPACE" >/dev/null \
-        || { echo "wrapper cannot complete a read-only command — check run.tasks.get/list" >&2; return 1; }
-      echo "task read access OK (via a read-only wrapper run)"
-    fi
-  else
-    # No execution exists yet, so the read path cannot be probed directly. Run one
-    # read-only command through the wrapper; it exercises the whole permission path.
-    run_generation report --space "$SPACE" >/dev/null \
-      || { echo "wrapper cannot complete a read-only command — check run.tasks.get/list" >&2; return 1; }
-    echo "task read access OK (via a read-only wrapper run)"
-  fi
-
-  gcloud sql instances describe databridge-demo --project "$PROJECT" \
-      --format='value(settings.backupConfiguration.pointInTimeRecoveryEnabled)' \
-    | grep -qx True || { echo "point-in-time recovery is not enabled" >&2; return 1; }
-  # Enabled is not the same as usable: a window must actually exist and be readable.
-  gcloud sql instances get-latest-recovery-time databridge-demo --project "$PROJECT" \
-    | grep -q . || { echo "the recovery window is empty or unreadable" >&2; return 1; }
-
-  echo "preconditions OK"
-}
+preconditions_ok() { preflight preconditions; }
 
 preconditions_ok
 ```
 
 **Every later gate chains onto this**, so a failed precondition stops the rollout rather than
-scrolling past. It is cheap to re-run, but not free: when no execution exists yet it runs one
-read-only command through the wrapper, which creates a Cloud Run execution. The database work is
-read-only; the job's execution count and logs do change.
+scrolling past. It only reads, and is cheap to re-run.
+
+The checks themselves live in `src/databridge/rollout_checks.py` and are unit-tested against the
+shapes that have actually caused defects — an omitted `maxRetries` (which Cloud Run defaults to
+3, not 0), a boolean where an integer belongs, a job whose image was never read. They were inline
+shell here through nine review rounds, and every round found another one that no test could
+catch.
+
+When no execution exists yet, task read access cannot be proven and the check says so rather
+than passing: run one read-only command through the wrapper, then re-run it.
 
 What no command can decide, and you must judge yourself. The job configuration, the DSN secret
 reference, task read access and the recovery window are **asserted by the function above** — they
@@ -353,24 +228,7 @@ rather than printing it; step 2 chains onto it.
 job images drift silently. Check digests rather than assuming.
 
 ```bash
-images_aligned_ok() {
-  local want got job
-  # EXPECTED_IMAGE is the digest you intend to roll out, set independently of what is
-  # deployed. Taking the service's current image as the target would pass when the
-  # service and every job are still on the *old* digest.
-  want="${EXPECTED_IMAGE:?set EXPECTED_IMAGE to the digest-pinned image you intend to roll out}"
-  case "$want" in *@sha256:*) ;; *) echo "EXPECTED_IMAGE is not digest-pinned: $want" >&2; return 1;; esac
-  got=$(gcloud run services describe databridge --project "$PROJECT" --region "$REGION" \
-    --format='value(spec.template.spec.containers[0].image)') || return 1
-  [ "$got" = "$want" ] || { echo "service is on $got, expected $want" >&2; return 1; }
-  echo "service OK"
-  for job in databridge-migrate databridge-ingest databridge-confluence-ingest databridge-generation; do
-    got=$(gcloud run jobs describe "$job" --project "$PROJECT" --region "$REGION" \
-      --format='value(spec.template.spec.template.spec.containers[0].image)') || return 1
-    [ "$got" = "$want" ] || { echo "$job is on $got, expected $want" >&2; return 1; }
-    echo "$job OK"
-  done
-}
+images_aligned_ok() { preflight images --expected-image "${EXPECTED_IMAGE:?}"; }
 
 preconditions_ok && recovery_accepted_ok && scheduler_paused_ok && images_aligned_ok && \
 gcloud run services update-traffic databridge --project "$PROJECT" --region "$REGION" --to-latest
@@ -391,13 +249,14 @@ worse, because the old reader returns legacy and building rows together.
 ```bash
 run_generation create-building --space "$SPACE" | tee /tmp/create.out
 unset GENERATION
-GENERATION=$(read_generation_id /tmp/create.out)
+GENERATION=$(preflight generation-id --input /tmp/create.out)
 echo "GENERATION=${GENERATION:?STOP: no usable generation id — do not continue}"
 ```
 
-`read_generation_id` yields the id only when there is exactly one wrapper result line, the
-wrapper exited 0, the CLI exited 0, and `cli_generation_id` is a positive integer. Otherwise it
-prints why and leaves `GENERATION` unset.
+`preflight generation-id` yields the id only when there is exactly one wrapper result line,
+the wrapper exited 0, the CLI exited 0, and `cli_generation_id` is a positive integer that is not
+a boolean. Otherwise it prints why and leaves `GENERATION` unset. Those rules are unit-tested in
+`tests/test_rollout_checks.py`, not written out here.
 
 **The `:?` is the gate, not the prose.** An interactive shell does not stop just because a
 command failed, so every later step references `${GENERATION:?}`; with the variable unset those
@@ -419,23 +278,7 @@ name from its own value:
 
 ```bash
 verify_ingest_scope() {
-  gcloud run jobs describe databridge-confluence-ingest \
-      --project "$PROJECT" --region "$REGION" --format=json \
-    | SPACE="$SPACE" FOLDER_ID_EXPECTED="$FOLDER_ID_EXPECTED" python3 -c '
-import json, os, sys
-env = {e["name"]: e.get("value") for e in
-       json.load(sys.stdin)["spec"]["template"]["spec"]["template"]["spec"]["containers"][0].get("env", [])}
-problems = []
-if env.get("SPACE_KEY") != os.environ["SPACE"]:
-    problems.append("SPACE_KEY=%r, expected %r" % (env.get("SPACE_KEY"), os.environ["SPACE"]))
-if env.get("FOLDER_ID") != os.environ["FOLDER_ID_EXPECTED"]:
-    problems.append("FOLDER_ID=%r, expected %r" % (env.get("FOLDER_ID"), os.environ["FOLDER_ID_EXPECTED"]))
-if "DATABRIDGE_GENERATION_ID" in env:
-    problems.append("job carries a permanent DATABRIDGE_GENERATION_ID")
-if problems:
-    sys.exit("ingest scope is wrong: " + "; ".join(problems))
-print("ingest scope OK")
-'
+  preflight ingest-scope --space "$SPACE" --folder-id "${FOLDER_ID_EXPECTED:?}"
 }
 
 # The ingest runs only if the scope check passes. Do not split these two.
@@ -467,7 +310,7 @@ again before doing anything else:
 ```bash
 run_generation create-building --space "$SPACE" --discard-inflight | tee /tmp/create.out
 unset GENERATION
-GENERATION=$(read_generation_id /tmp/create.out)
+GENERATION=$(preflight generation-id --input /tmp/create.out)
 echo "GENERATION=${GENERATION:?STOP: no usable generation id — do not continue}"    # a new id
 
 verify_ingest_scope && \
@@ -674,32 +517,8 @@ hidden by a later success.
 
 ```bash
 strict_preflight_ok() {
-  gcloud run services describe databridge --project "$PROJECT" --region "$REGION" --format=json \
-    | python3 -c '
-import json, sys
-env = {e["name"]: e.get("value") for e in
-       json.load(sys.stdin)["spec"]["template"]["spec"]["containers"][0].get("env", [])}
-if env.get("DATABRIDGE_PROFILE_MODE") != "strict":
-    sys.exit("service DATABRIDGE_PROFILE_MODE=%r" % env.get("DATABRIDGE_PROFILE_MODE"))
-if "DATABRIDGE_GENERATION_ID" in env:
-    sys.exit("service carries a permanent generation override")
-print("service OK")
-' || return 1
-
-  for JOB in databridge-migrate databridge-ingest databridge-confluence-ingest databridge-generation; do
-    gcloud run jobs describe "$JOB" --project "$PROJECT" --region "$REGION" --format=json \
-      | JOB="$JOB" python3 -c '
-import json, os, sys
-env = {e["name"]: e.get("value") for e in
-       json.load(sys.stdin)["spec"]["template"]["spec"]["template"]["spec"]["containers"][0].get("env", [])}
-job = os.environ["JOB"]
-if env.get("DATABRIDGE_PROFILE_MODE") != "strict":
-    sys.exit("%s DATABRIDGE_PROFILE_MODE=%r" % (job, env.get("DATABRIDGE_PROFILE_MODE")))
-if "DATABRIDGE_GENERATION_ID" in env:
-    sys.exit("%s carries a permanent generation override" % job)
-print("%s OK" % job)
-' || return 1
-  done
+  # Service and all four jobs on strict, with no permanent generation override anywhere.
+  preflight strict || return 1
 
   # The service must actually answer under strict — a preflight failure shows at startup.
   curl -sf -X POST "$SERVICE_URL/ask" -H 'Content-Type: application/json' \
@@ -708,34 +527,7 @@ print("%s OK" % job)
   # The active generation must be the one this rollout activated, with no legacy left.
   run_generation report --space "$SPACE" >/tmp/report.out || return 1
   show_output /tmp/report.out > /tmp/report.body || return 1
-  GENERATION="${GENERATION:?}" python3 - /tmp/report.body <<'PYEOF' || return 1
-import json, os, sys
-want = int(os.environ["GENERATION"])
-rows = [json.loads(l) for l in open(sys.argv[1]) if l.lstrip().startswith("{")]
-if not rows:
-    sys.exit("report produced no parseable output; cannot confirm the active generation")
-report = rows[-1]
-# Field names verified against scripts/generation.py (_reference_report) and
-# PgVectorStore.generation_report.
-def as_int(value, label):
-    # Same rule as the wrapper: booleans are not integers here. False == 0 is true in
-    # Python, so a boolean would satisfy the comparisons below without meaning anything.
-    if type(value) is not int:
-        sys.exit("%s is %r, expected a JSON integer" % (label, value))
-    return value
-
-legacy = as_int(report.get("legacy_null_generation_chunks"), "legacy_null_generation_chunks")
-if legacy != 0:
-    sys.exit("legacy_null_generation_chunks=%d, expected 0" % legacy)
-active = [g for g in report.get("generations", []) if g.get("state") == "active"]
-if len(active) != 1:
-    sys.exit("expected exactly one active generation, found %d" % len(active))
-if as_int(active[0].get("generation_id"), "generation_id") != want:
-    sys.exit("active generation is %r, expected %r" % (active[0].get("generation_id"), want))
-if as_int(active[0].get("chunk_count"), "chunk_count") <= 0:
-    sys.exit("active generation holds no chunks")
-print("active generation OK")
-PYEOF
+  preflight report --input /tmp/report.body --expected-generation "${GENERATION:?}" || return 1
   echo "strict preflight OK"
 }
 ```
@@ -746,8 +538,7 @@ active id or leftover legacy rows block the resume rather than merely printing.
 The field names come from the code, not from guesswork: `report` prints
 `legacy_null_generation_chunks` at the top level and a `generations` list whose rows carry
 `generation_id`, `state` and `chunk_count` (`scripts/generation.py` → `_reference_report`,
-`PgVectorStore.generation_report`). One of the earlier invented names — the legacy count — made that check pass on any report at
-all, which is worse than no check because it reads like one.
+`PgVectorStore.generation_report`). 
 
 The permanent-override check is a cheap guard against operational drift — a stray `jobs update`,
 a leftover setting, a runbook that disagreed with what was actually run. The step-4 override is

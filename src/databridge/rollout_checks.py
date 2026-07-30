@@ -258,8 +258,8 @@ def correlate_execution(
     return matches[0]
 
 
-def read_generation_id(lines: Sequence[str]) -> int:
-    """Read a generation id from one successful wrapper result line."""
+def _one_wrapper_result(lines: Sequence[str]) -> Mapping[str, object]:
+    """Return the single wrapper result line, refusing anything ambiguous."""
     candidates = [line for line in lines if line.startswith(WRAPPER_PREFIX)]
     if len(candidates) != 1:
         raise RolloutCheckError(
@@ -271,6 +271,12 @@ def read_generation_id(lines: Sequence[str]) -> int:
         raise RolloutCheckError("wrapper result is not valid JSON") from exc
     if not isinstance(payload, Mapping):
         raise RolloutCheckError("wrapper result is not a JSON object")
+    return payload
+
+
+def read_generation_id(lines: Sequence[str]) -> int:
+    """Read a generation id from one successful wrapper result line."""
+    payload = _one_wrapper_result(lines)
     if not _json_int(payload.get("wrapper_exit")) or payload["wrapper_exit"] != 0:
         raise RolloutCheckError("wrapper result is not a wrapper success")
     if not _json_int(payload.get("cli_exit")) or payload["cli_exit"] != 0:
@@ -287,3 +293,68 @@ def check_env_absent(env: Sequence[Mapping[str, object]], name: str) -> list[str
     if count:
         return [f"environment variable {name} must be absent (found {count})"]
     return []
+
+def _env_map(env: Sequence[Mapping[str, object]]) -> dict[str, object]:
+    return {
+        str(item["name"]): item.get("value")
+        for item in env
+        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
+    }
+
+
+def check_ingest_scope(
+    env: Sequence[Mapping[str, object]], *, space_key: str, folder_id: str
+) -> list[str]:
+    """Check the Confluence ingest job targets the space being migrated.
+
+    setup_cicd.sh tells the provisioner to use a dedicated corpus key, so the configured
+    space is not necessarily the one being rolled out. A mismatch would ingest the wrong
+    corpus into a fresh generation.
+    """
+    problems: list[str] = []
+    values = _env_map(env)
+    if values.get("SPACE_KEY") != space_key:
+        problems.append(f"SPACE_KEY={values.get('SPACE_KEY')!r}, expected {space_key!r}")
+    if values.get("FOLDER_ID") != folder_id:
+        problems.append(f"FOLDER_ID={values.get('FOLDER_ID')!r}, expected {folder_id!r}")
+    if "DATABRIDGE_GENERATION_ID" in values:
+        problems.append("the job carries a permanent DATABRIDGE_GENERATION_ID")
+    return problems
+
+
+def check_strict_mode(
+    *,
+    service_env: Sequence[Mapping[str, object]],
+    job_envs: Mapping[str, Sequence[Mapping[str, object]]],
+) -> list[str]:
+    """Require strict profile mode everywhere, with no permanent generation override.
+
+    A job left on observe keeps writing under the condition strict exists to reject, so
+    the whole set has to move together.
+    """
+    problems: list[str] = []
+
+    def _one(label: str, env: Sequence[Mapping[str, object]]) -> None:
+        values = _env_map(env)
+        mode = values.get("DATABRIDGE_PROFILE_MODE")
+        if mode != "strict":
+            problems.append(f"{label} DATABRIDGE_PROFILE_MODE={mode!r}, expected 'strict'")
+        if "DATABRIDGE_GENERATION_ID" in values:
+            problems.append(f"{label} carries a permanent DATABRIDGE_GENERATION_ID")
+
+    _one("service", service_env)
+    missing = [name for name in ROLLOUT_JOBS if name not in job_envs]
+    if missing:
+        problems.append(f"no environment was read for {', '.join(missing)}")
+    for name, env in sorted(job_envs.items()):
+        _one(f"job {name}", env)
+    return problems
+
+
+def read_operation_id(lines: Sequence[str]) -> str:
+    """Return the operation id from exactly one valid wrapper result line."""
+    payload = _one_wrapper_result(lines)
+    operation_id = payload.get("operation_id")
+    if not isinstance(operation_id, str) or not operation_id:
+        raise RolloutCheckError("the wrapper reported no operation id to correlate")
+    return operation_id
