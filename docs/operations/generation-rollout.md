@@ -176,24 +176,52 @@ if spec.get("parallelism", 1) not in (1, None):
     problems.append("parallelism=%r" % spec.get("parallelism"))
 if task.get("maxRetries", 0) not in (0, None):
     problems.append("maxRetries=%r" % task.get("maxRetries"))
-# The DSN must be a secret reference, never a literal: a literal is readable by anyone
-# with viewer access and is copied into every execution spec.
-for e in task["containers"][0].get("env", []):
-    if e.get("name") == "DATABRIDGE_DSN" and e.get("value") is not None:
+# The DSN must be exactly one entry and a real secret reference. "Not a literal" is not
+# the same as "a valid reference": a missing entry, a bare {"name": ...}, a null value or
+# a malformed valueFrom would all pass that weaker test. A literal is readable by anyone
+# with viewer access and is copied into every execution spec, so this never prints values.
+dsn = [e for e in task["containers"][0].get("env", []) if e.get("name") == "DATABRIDGE_DSN"]
+if len(dsn) != 1:
+    problems.append("expected exactly one DATABRIDGE_DSN entry, found %d" % len(dsn))
+else:
+    entry = dsn[0]
+    if entry.get("value") is not None:
         problems.append("DATABRIDGE_DSN is a literal value, not a secret reference")
+    ref = (entry.get("valueFrom") or {}).get("secretKeyRef") or {}
+    if not ref.get("name") or not ref.get("key"):
+        problems.append("DATABRIDGE_DSN has no usable secretKeyRef (name and key required)")
 if problems:
     sys.exit("generation job misconfigured: " + "; ".join(problems))
 print("generation job OK")
 ' || return 1
 
-  # We can read Tasks — the wrapper runs as the operator and needs run.tasks.get/list.
-  gcloud run jobs executions list --job databridge-generation \
-    --project "$PROJECT" --region "$REGION" --limit 1 >/dev/null \
-    || { echo "cannot list executions — check run.tasks.get / run.tasks.list" >&2; return 1; }
+  # Prove the permissions the wrapper actually uses. Listing executions is a different
+  # permission from reading Tasks, so it does not stand in for run.tasks.list/get.
+  local probe_exec probe_task
+  probe_exec=$(gcloud run jobs executions list --job databridge-generation \
+    --project "$PROJECT" --region "$REGION" --limit 1 --format='value(metadata.name)') || return 1
+  if [ -n "$probe_exec" ]; then
+    probe_task=$(gcloud run jobs executions tasks list --execution "$probe_exec" \
+      --project "$PROJECT" --region "$REGION" --limit 1 --format='value(metadata.name)') \
+      || { echo "cannot list tasks — check run.tasks.list" >&2; return 1; }
+    [ -n "$probe_task" ] && { gcloud run jobs executions tasks describe "$probe_task" \
+      --project "$PROJECT" --region "$REGION" --format='value(metadata.name)' >/dev/null \
+      || { echo "cannot describe a task — check run.tasks.get" >&2; return 1; }; }
+    echo "task read access OK"
+  else
+    # No execution exists yet, so the read path cannot be probed directly. Run one
+    # read-only command through the wrapper; it exercises the whole permission path.
+    run_generation report --space "$SPACE" >/dev/null \
+      || { echo "wrapper cannot complete a read-only command — check run.tasks.get/list" >&2; return 1; }
+    echo "task read access OK (via a read-only wrapper run)"
+  fi
 
   gcloud sql instances describe databridge-demo --project "$PROJECT" \
       --format='value(settings.backupConfiguration.pointInTimeRecoveryEnabled)' \
     | grep -qx True || { echo "point-in-time recovery is not enabled" >&2; return 1; }
+  # Enabled is not the same as usable: a window must actually exist and be readable.
+  gcloud sql instances get-latest-recovery-time databridge-demo --project "$PROJECT" \
+    || { echo "cannot read the recovery window" >&2; return 1; }
 
   echo "preconditions OK"
 }
@@ -201,29 +229,26 @@ print("generation job OK")
 preconditions_ok
 ```
 
-What no command can decide, and you must judge yourself:
+**Step 1 chains onto this**, so a failed precondition stops the rollout rather than scrolling
+past. Re-running the function is cheap; it only reads.
 
+What no command can decide, and you must judge yourself. The job configuration, the DSN secret
+reference, task read access and the recovery window are **asserted by the function above** — they
+are not repeated here, because a checklist item that duplicates an assertion invites ticking the
+box instead of running the check.
 
-
-- [ ] `scripts/setup_cicd.sh` has been run, so `databridge-generation` exists with
-      `--max-retries 0 --tasks 1 --parallelism 1 --task-timeout 3600s`.
-- [ ] **Your own account** has `run.tasks.get` and `run.tasks.list`. The wrapper reads Task
-      resources as the operator. `setup_cicd.sh` grants job and build service-account roles —
-      those are separate, and it does **not** grant these to you.
 - [ ] You can author the validation query file. It does not exist in the repository yet; it is
       written from `inventory` output between steps 4 and 5 (see step 4a).
-- [ ] Point-in-time recovery covers the whole window. Check the retention setting, not just
-      that PITR is enabled:
+- [ ] The retention window is long enough for **your** rollout. The function proves a window
+      exists; only you know how long these steps will take and whether that fits inside it:
 
 ```bash
 gcloud sql instances describe databridge-demo --project "$PROJECT" \
-  --format='value(settings.backupConfiguration.pointInTimeRecoveryEnabled,settings.backupConfiguration.transactionLogRetentionDays)'
-gcloud sql instances get-latest-recovery-time databridge-demo --project "$PROJECT"
+  --format='value(settings.backupConfiguration.transactionLogRetentionDays)'
 ```
 
-Record the recovery window before you start; a recovery point that predates it is useless to
-you. **If this command fails, stop and find out why** — an unverified recovery window is not a
-recovery plan, and suppressing the error would turn this precondition into decoration.
+- [ ] The cost of recovery is acceptable to whoever owns this data, and the RTO below is one
+      you have agreed **before** starting.
 
 **PITR is not a rollback button.** Understand the whole cost before relying on it:
 
@@ -286,7 +311,7 @@ scheduler_paused_ok() {
   echo "scheduler PAUSED"
 }
 
-scheduler_paused_ok
+preconditions_ok && scheduler_paused_ok
 ```
 
 A batch starting mid-rollout writes into the wrong generation. The function asserts the state
@@ -434,7 +459,23 @@ run_generation inventory --space "$SPACE" --generation-id "${GENERATION:?}" | te
 
 Check the source set and per-source chunk counts against what you expect from Confluence. The
 manifest records **what the batch believed it wrote** — it catches storage-side divergence, not
-an incomplete fetch. If a page never arrived from Confluence, the manifest agrees with itself.
+an incomplete fetch. If a page never arrived from Confluence, the manifest agrees with itself,
+and no command can tell you otherwise: there is no independent list of what should be there.
+
+That makes this a human judgement, so it gets the same treatment as step 7 — a token bound to
+the generation, which `validate` is chained onto:
+
+```bash
+INVENTORY_VERIFIED="${GENERATION:?}"    # set this only after you have read the inventory
+
+inventory_verified_ok() {
+  [ "${INVENTORY_VERIFIED:-}" = "${GENERATION:?}" ] || {
+    echo "STOP: the inventory for generation ${GENERATION} was not reviewed" >&2; return 1; }
+}
+```
+
+A token left over from a discarded generation will not match the new id, so a retry cannot
+inherit the previous review.
 
 ## Step 4a — Author, upload and pin the validation query file
 
@@ -479,6 +520,7 @@ right file to the right place. **Upload as the operator**, not as a deployment s
 ## Step 5 — Validate, which seals on success
 
 ```bash
+inventory_verified_ok && \
 run_generation validate --space "$SPACE" --generation-id "${GENERATION:?}" \
   --queries "$QUERIES" --expected-queries-sha256 "$SHA"
 ```
