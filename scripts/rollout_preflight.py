@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from databridge.rollout_checks import (
+    ROLLOUT_JOBS,
     RolloutCheckError,
     check_generation_job,
     check_images,
@@ -21,13 +22,7 @@ from databridge.rollout_checks import (
 
 DEFAULT_JOB = "databridge-generation"
 DEFAULT_SERVICE = "databridge"
-ROLLOUT_JOBS = (
-    "databridge-migrate",
-    "databridge-ingest",
-    "databridge-confluence-ingest",
-    "databridge-generation",
-)
-
+DEFAULT_INSTANCE = "databridge-demo"
 
 def _run(command: Sequence[str]) -> str:
     completed = subprocess.run(command, check=False, capture_output=True, text=True)
@@ -74,19 +69,74 @@ def _report_problems(problems: Sequence[str]) -> int:
 
 
 def _preconditions(args: argparse.Namespace) -> int:
+    """Everything the runbook must establish before the first destructive step.
+
+    This is a drop-in replacement for the runbook's own preflight, so it has to cover
+    the whole set: a partial check that prints OK is the failure this module exists to
+    remove.
+    """
+    project, region = str(args.project), str(args.region)
+    problems: list[str] = []
+
     value = _gcloud_json(
-        [
-            "run",
-            "jobs",
-            "describe",
-            str(args.job),
-            "--project",
-            str(args.project),
-            "--region",
-            str(args.region),
-        ]
+        ["run", "jobs", "describe", str(args.job), "--project", project, "--region", region]
     )
-    return _report_problems(check_generation_job(_object(value, label="generation job")))
+    problems.extend(check_generation_job(_object(value, label="generation job")))
+
+    if not _gcloud_value(
+        ["run", "services", "describe", str(args.service),
+         "--project", project, "--region", region],
+        "status.url",
+    ):
+        problems.append("the service has no URL; it is not serving")
+
+    # Reading Tasks is a different permission from listing executions, and the wrapper
+    # needs it. Probe it for real when an execution exists.
+    execution = _gcloud_value(
+        [
+            "run", "jobs", "executions", "list", "--job", str(args.job),
+            "--project", project, "--region", region, "--limit", "1",
+        ],
+        "metadata.name",
+    )
+    if execution:
+        task = _gcloud_value(
+            [
+                "run", "jobs", "executions", "tasks", "list", "--execution", execution,
+                "--project", project, "--region", region, "--limit", "1",
+            ],
+            "metadata.name",
+        )
+        if task:
+            _gcloud_value(
+                ["run", "jobs", "executions", "tasks", "describe", task,
+                 "--project", project, "--region", region],
+                "metadata.name",
+            )
+        else:
+            problems.append(
+                f"execution {execution} exposes no task, so run.tasks.get was not exercised; "
+                "run one read-only command through the wrapper before continuing"
+            )
+    else:
+        problems.append(
+            "no execution exists yet, so task read access is unproven; "
+            "run one read-only command through the wrapper before continuing"
+        )
+
+    if _gcloud_value(
+        ["sql", "instances", "describe", str(args.instance), "--project", project],
+        "settings.backupConfiguration.pointInTimeRecoveryEnabled",
+    ) != "True":
+        problems.append("point-in-time recovery is not enabled")
+    # Enabled is not usable: the window has to exist and be readable.
+    if not _run(
+        ["gcloud", "sql", "instances", "get-latest-recovery-time", str(args.instance),
+         "--project", project]
+    ).strip():
+        problems.append("the recovery window is empty or unreadable")
+
+    return _report_problems(problems)
 
 
 def _images(args: argparse.Namespace) -> int:
@@ -95,7 +145,7 @@ def _images(args: argparse.Namespace) -> int:
         ["run", "services", "describe", str(args.service), *common],
         "spec.template.spec.containers[0].image",
     )
-    job_names = tuple(args.jobs) if args.jobs else ROLLOUT_JOBS
+    job_names = ROLLOUT_JOBS
     jobs = {
         name: _gcloud_value(
             ["run", "jobs", "describe", name, *common],
@@ -162,6 +212,8 @@ def _parser() -> argparse.ArgumentParser:
     preconditions.add_argument("--project", required=True)
     preconditions.add_argument("--region", required=True)
     preconditions.add_argument("--job", default=DEFAULT_JOB)
+    preconditions.add_argument("--service", default=DEFAULT_SERVICE)
+    preconditions.add_argument("--instance", default=DEFAULT_INSTANCE)
     preconditions.set_defaults(handler=_preconditions)
 
     images = commands.add_parser("images")
@@ -169,7 +221,6 @@ def _parser() -> argparse.ArgumentParser:
     images.add_argument("--region", required=True)
     images.add_argument("--expected-image", required=True)
     images.add_argument("--service", default=DEFAULT_SERVICE)
-    images.add_argument("--job", dest="jobs", action="append")
     images.set_defaults(handler=_images)
 
     report = commands.add_parser("report")

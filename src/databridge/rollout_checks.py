@@ -136,14 +136,28 @@ def check_generation_job(job: Mapping[str, object]) -> list[str]:
     return problems
 
 
+#: Every job that must be carrying the rollout image before traffic moves. A job left
+#: behind writes with the old schema assumptions, so the set is fixed here rather than
+#: supplied by the caller: checking a subset and reporting success is the failure mode.
+ROLLOUT_JOBS: tuple[str, ...] = (
+    "databridge-migrate",
+    "databridge-ingest",
+    "databridge-confluence-ingest",
+    "databridge-generation",
+)
+
+
 def check_images(*, expected: str, service: str, jobs: Mapping[str, str]) -> list[str]:
-    """Check that the service and every job use one independently chosen image digest."""
+    """Check that the service and every rollout job use one independently chosen digest."""
     problems: list[str] = []
     if _DIGEST_IMAGE.fullmatch(expected) is None:
         problems.append("expected image is not pinned to a canonical sha256 digest")
     if service != expected:
         problems.append("service image does not match the expected image")
-    for name, image in jobs.items():
+    missing = [name for name in ROLLOUT_JOBS if name not in jobs]
+    if missing:
+        problems.append(f"no image was read for {', '.join(missing)}")
+    for name, image in sorted(jobs.items()):
         if image != expected:
             problems.append(f"job {name} image does not match the expected image")
     return problems

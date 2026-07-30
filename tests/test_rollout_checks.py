@@ -8,6 +8,7 @@ from copy import deepcopy
 import pytest
 
 from databridge.rollout_checks import (
+    ROLLOUT_JOBS,
     WRAPPER_PREFIX,
     RolloutCheckError,
     check_dsn_secret_ref,
@@ -267,7 +268,19 @@ def test_read_generation_id_rejects_failed_and_ambiguous_results(line: str) -> N
 
 
 def test_images_accept_all_matching_digest_pinned_resources() -> None:
-    assert check_images(expected=IMAGE, service=IMAGE, jobs={"one": IMAGE, "two": IMAGE}) == []
+    assert check_images(
+        expected=IMAGE, service=IMAGE, jobs=dict.fromkeys(ROLLOUT_JOBS, IMAGE)
+    ) == []
+
+
+def test_images_reject_a_subset_of_the_required_jobs() -> None:
+    """A partial set that reports OK is the drift this check exists to catch."""
+    assert check_images(expected=IMAGE, service=IMAGE, jobs={}) != []
+    for name in ROLLOUT_JOBS:
+        partial = dict.fromkeys(ROLLOUT_JOBS, IMAGE)
+        del partial[name]
+        problems = check_images(expected=IMAGE, service=IMAGE, jobs=partial)
+        assert any(name in problem for problem in problems), name
 
 
 @pytest.mark.parametrize(
