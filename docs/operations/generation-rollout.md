@@ -170,26 +170,25 @@ job = json.load(sys.stdin)
 spec = job["spec"]["template"]["spec"]
 task = spec["template"]["spec"]
 problems = []
-if spec.get("taskCount", 1) != 1:
-    problems.append("taskCount=%r" % spec.get("taskCount"))
-if spec.get("parallelism", 1) not in (1, None):
+
+# Measured on a real job: an explicit --max-retries 0 is present in the JSON as
+# maxRetries: 0, taskCount is present as an int, parallelism is omitted entirely, and
+# timeoutSeconds is a STRING. So an omitted maxRetries does not mean zero: the Cloud Run
+# default is 3, and treating the omission as 0 would approve a job that silently retries
+# activate or delete-legacy. Require the value to be there and to be exactly 0.
+if task.get("maxRetries") != 0 or type(task.get("maxRetries")) is not int:
+    problems.append("maxRetries=%r; require an explicit 0 (omitted means 3)" % task.get("maxRetries"))
+if spec.get("taskCount") != 1 or type(spec.get("taskCount")) is not int:
+    problems.append("taskCount=%r; require an explicit 1" % spec.get("taskCount"))
+# parallelism may be omitted; with taskCount 1 there can never be a second task.
+if spec.get("parallelism") not in (None, 1):
     problems.append("parallelism=%r" % spec.get("parallelism"))
-if task.get("maxRetries", 0) not in (0, None):
-    problems.append("maxRetries=%r" % task.get("maxRetries"))
-# The DSN must be exactly one entry and a real secret reference. "Not a literal" is not
-# the same as "a valid reference": a missing entry, a bare {"name": ...}, a null value or
-# a malformed valueFrom would all pass that weaker test. A literal is readable by anyone
-# with viewer access and is copied into every execution spec, so this never prints values.
-dsn = [e for e in task["containers"][0].get("env", []) if e.get("name") == "DATABRIDGE_DSN"]
-if len(dsn) != 1:
-    problems.append("expected exactly one DATABRIDGE_DSN entry, found %d" % len(dsn))
-else:
-    entry = dsn[0]
-    if entry.get("value") is not None:
-        problems.append("DATABRIDGE_DSN is a literal value, not a secret reference")
-    ref = (entry.get("valueFrom") or {}).get("secretKeyRef") or {}
-    if not ref.get("name") or not ref.get("key"):
-        problems.append("DATABRIDGE_DSN has no usable secretKeyRef (name and key required)")
+try:
+    timeout = int(task.get("timeoutSeconds"))
+except (TypeError, ValueError):
+    timeout = -1
+if timeout < 3600:
+    problems.append("timeoutSeconds=%r; require at least 3600" % task.get("timeoutSeconds"))
 if problems:
     sys.exit("generation job misconfigured: " + "; ".join(problems))
 print("generation job OK")
@@ -204,10 +203,18 @@ print("generation job OK")
     probe_task=$(gcloud run jobs executions tasks list --execution "$probe_exec" \
       --project "$PROJECT" --region "$REGION" --limit 1 --format='value(metadata.name)') \
       || { echo "cannot list tasks — check run.tasks.list" >&2; return 1; }
-    [ -n "$probe_task" ] && { gcloud run jobs executions tasks describe "$probe_task" \
-      --project "$PROJECT" --region "$REGION" --format='value(metadata.name)' >/dev/null \
-      || { echo "cannot describe a task — check run.tasks.get" >&2; return 1; }; }
-    echo "task read access OK"
+    if [ -n "$probe_task" ]; then
+      gcloud run jobs executions tasks describe "$probe_task" \
+        --project "$PROJECT" --region "$REGION" --format='value(metadata.name)' >/dev/null \
+        || { echo "cannot describe a task — check run.tasks.get" >&2; return 1; }
+      echo "task read access OK"
+    else
+      # The execution carries no task (start failure, still starting). run.tasks.get was
+      # never exercised, so fall through to the wrapper probe rather than declare success.
+      run_generation report --space "$SPACE" >/dev/null \
+        || { echo "wrapper cannot complete a read-only command — check run.tasks.get/list" >&2; return 1; }
+      echo "task read access OK (via a read-only wrapper run)"
+    fi
   else
     # No execution exists yet, so the read path cannot be probed directly. Run one
     # read-only command through the wrapper; it exercises the whole permission path.
@@ -221,7 +228,7 @@ print("generation job OK")
     | grep -qx True || { echo "point-in-time recovery is not enabled" >&2; return 1; }
   # Enabled is not the same as usable: a window must actually exist and be readable.
   gcloud sql instances get-latest-recovery-time databridge-demo --project "$PROJECT" \
-    || { echo "cannot read the recovery window" >&2; return 1; }
+    | grep -q . || { echo "the recovery window is empty or unreadable" >&2; return 1; }
 
   echo "preconditions OK"
 }
@@ -229,8 +236,10 @@ print("generation job OK")
 preconditions_ok
 ```
 
-**Step 1 chains onto this**, so a failed precondition stops the rollout rather than scrolling
-past. Re-running the function is cheap; it only reads.
+**Every later gate chains onto this**, so a failed precondition stops the rollout rather than
+scrolling past. It is cheap to re-run, but not free: when no execution exists yet it runs one
+read-only command through the wrapper, which creates a Cloud Run execution. The database work is
+read-only; the job's execution count and logs do change.
 
 What no command can decide, and you must judge yourself. The job configuration, the DSN secret
 reference, task read access and the recovery window are **asserted by the function above** — they
@@ -249,6 +258,27 @@ gcloud sql instances describe databridge-demo --project "$PROJECT" \
 
 - [ ] The cost of recovery is acceptable to whoever owns this data, and the RTO below is one
       you have agreed **before** starting.
+
+These two are what authorise the irreversible deletion in step 8, so they get a token rather
+than a checkbox. Record the retention you saw and accepted:
+
+```bash
+RECOVERY_ACCEPTED_DAYS=7      # the retention you read above, and accepted
+
+recovery_accepted_ok() {
+  local have
+  have=$(gcloud sql instances describe databridge-demo --project "$PROJECT" \
+    --format='value(settings.backupConfiguration.transactionLogRetentionDays)') || return 1
+  [ -n "${RECOVERY_ACCEPTED_DAYS:-}" ] || {
+    echo "STOP: set RECOVERY_ACCEPTED_DAYS after judging the retention window" >&2; return 1; }
+  [ "$have" = "$RECOVERY_ACCEPTED_DAYS" ] || {
+    echo "retention is now $have days, not the $RECOVERY_ACCEPTED_DAYS you accepted" >&2; return 1; }
+  echo "recovery window accepted: $have days"
+}
+```
+
+Binding the value rather than a yes/no means a retention change between your judgement and the
+rollout invalidates the approval instead of silently keeping it.
 
 **PITR is not a rollback button.** Understand the whole cost before relying on it:
 
@@ -342,7 +372,7 @@ images_aligned_ok() {
   done
 }
 
-scheduler_paused_ok && images_aligned_ok && \
+preconditions_ok && recovery_accepted_ok && scheduler_paused_ok && images_aligned_ok && \
 gcloud run services update-traffic databridge --project "$PROJECT" --region "$REGION" --to-latest
 ```
 
@@ -594,7 +624,7 @@ serving_verified_ok() {
     echo "STOP: step 7 was not completed for generation ${GENERATION}" >&2; return 1; }
 }
 
-serving_verified_ok && \
+recovery_accepted_ok && serving_verified_ok && \
 run_generation delete-legacy --space "$SPACE" --generation-id "${GENERATION:?}" --yes
 ```
 
@@ -729,8 +759,9 @@ Resume **only as a consequence of the check**, in one chained command:
 strict_preflight_ok && \
 gcloud scheduler jobs resume databridge-confluence-ingest --project "$PROJECT" --location "$REGION"
 
-gcloud scheduler jobs describe databridge-confluence-ingest --project "$PROJECT" --location "$REGION" \
-  --format='value(state)'
+[ "$(gcloud scheduler jobs describe databridge-confluence-ingest \
+  --project "$PROJECT" --location "$REGION" --format='value(state)')" = "ENABLED" ] \
+  && echo "scheduler ENABLED" || echo "STOP: scheduler did not resume"
 ```
 
 Resuming earlier would let a batch change active chunks and the manifest while step 7's golden
@@ -750,11 +781,33 @@ long: the space serves no evidence in that window.
   space-only reader would return legacy and building rows together. The only exception is
   when you have confirmed the space holds **zero** non-null-generation chunks:
 
+  Establishing that requires quiescence, not a single report. Do all of it, in order:
+
   ```bash
-  run_generation report --space "$SPACE" | tee /tmp/report.out && show_output /tmp/report.out
+  # 1. Stop every writer first, or the answer is stale before you read it.
+  gcloud scheduler jobs pause databridge-confluence-ingest \
+    --project "$PROJECT" --location "$REGION"
+
+  # 2. Terminate the ingest execution that failed, if it is still running.
+  gcloud run jobs executions list --job databridge-confluence-ingest \
+    --project "$PROJECT" --region "$REGION" --limit 5 \
+    --format='table(metadata.name, status.runningCount, status.completionTime)'
+  # cancel any still-running execution before continuing:
+  #   gcloud run jobs executions cancel <NAME> --project "$PROJECT" --region "$REGION"
+
+  # 3. Only now read the state, and read both views.
+  run_generation inventory --space "$SPACE" --generation-id "${GENERATION:?}" \
+    | tee /tmp/inv.out && show_output /tmp/inv.out      # total_chunks must be 0
+  run_generation report --space "$SPACE" \
+    | tee /tmp/report.out && show_output /tmp/report.out # every generation's count
   ```
 
-  Leave the generation in place, or discard it on the next attempt with `--discard-inflight`.
+  Roll traffic back only if `total_chunks` is 0 **and** no generation holds chunks, and only
+  while writers stay stopped — the state you read is only true as long as nothing writes. If a
+  batch runs between the read and the rollback, the old reader will see building rows again.
+
+  Otherwise leave the generation in place, or discard it on the next attempt with
+  `--discard-inflight`.
 - **After step 6, before step 8** — the new generation serves and legacy rows remain as
   evidence. Nothing is lost. Resume at step 7.
 - **After step 8** — legacy rows are gone. Recovery is a new generation, or PITR.
