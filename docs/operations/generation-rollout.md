@@ -88,11 +88,13 @@ PYEOF
 
   # Describe every candidate. A list entry is not guaranteed to carry per-execution env
   # overrides, and an execution we cannot inspect is not the same as one that does not match.
-  local names n hits=""
+  # Do not rely on word splitting: bash splits an unquoted $var, default zsh does not.
+  # Read line by line and count with an integer instead.
+  local names n match hits=0
   names=$(gcloud run jobs executions list --job databridge-generation \
     --project "$PROJECT" --region "$REGION" --format='value(metadata.name)') || return 1
-  for n in $names; do
-    local match
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
     match=$(gcloud run jobs executions describe "$n" \
         --project "$PROJECT" --region "$REGION" --format=json \
       | OP="$op" NAME="$n" python3 -c '
@@ -102,12 +104,15 @@ env = json.load(sys.stdin)["spec"]["template"]["spec"]["containers"][0].get("env
 if any(e.get("name") == "DATABRIDGE_OPERATION_ID" and e.get("value") == op for e in env):
     print(name)
 ') || { echo "cannot inspect execution $n — refusing to guess which one is yours" >&2; return 1; }
-    [ -n "$match" ] && hits="$hits $match"
-  done
+    if [ -n "$match" ]; then
+      hits=$((hits + 1))
+      exec_name="$match"
+    fi
+  done <<EOF
+$names
+EOF
 
-  set -- $hits
-  [ "$#" -eq 1 ] || { echo "expected exactly one execution for $op, found $#" >&2; return 1; }
-  exec_name="$1"
+  [ "$hits" -eq 1 ] || { echo "expected exactly one execution for $op, found $hits" >&2; return 1; }
 
   gcloud logging read \
     "logName:\"run.googleapis.com%2Fstdout\" labels.\"run.googleapis.com/execution_name\"=\"$exec_name\" labels.\"run.googleapis.com/task_index\"=\"0\" labels.\"run.googleapis.com/task_attempt\"=\"0\"" \
@@ -235,10 +240,15 @@ job images drift silently. Check digests rather than assuming.
 ```bash
 images_aligned_ok() {
   local want got job
-  want=$(gcloud run services describe databridge --project "$PROJECT" --region "$REGION" \
+  # EXPECTED_IMAGE is the digest you intend to roll out, set independently of what is
+  # deployed. Taking the service's current image as the target would pass when the
+  # service and every job are still on the *old* digest.
+  want="${EXPECTED_IMAGE:?set EXPECTED_IMAGE to the digest-pinned image you intend to roll out}"
+  case "$want" in *@sha256:*) ;; *) echo "EXPECTED_IMAGE is not digest-pinned: $want" >&2; return 1;; esac
+  got=$(gcloud run services describe databridge --project "$PROJECT" --region "$REGION" \
     --format='value(spec.template.spec.containers[0].image)') || return 1
-  case "$want" in *@sha256:*) ;; *) echo "service image is not digest-pinned: $want" >&2; return 1;; esac
-  echo "target digest: $want"
+  [ "$got" = "$want" ] || { echo "service is on $got, expected $want" >&2; return 1; }
+  echo "service OK"
   for job in databridge-migrate databridge-ingest databridge-confluence-ingest databridge-generation; do
     got=$(gcloud run jobs describe "$job" --project "$PROJECT" --region "$REGION" \
       --format='value(spec.template.spec.template.spec.containers[0].image)') || return 1
@@ -566,15 +576,22 @@ if not rows:
 report = rows[-1]
 # Field names verified against scripts/generation.py (_reference_report) and
 # PgVectorStore.generation_report.
-legacy = report.get("legacy_null_generation_chunks")
+def as_int(value, label):
+    # Same rule as the wrapper: booleans are not integers here. False == 0 is true in
+    # Python, so a boolean would satisfy the comparisons below without meaning anything.
+    if type(value) is not int:
+        sys.exit("%s is %r, expected a JSON integer" % (label, value))
+    return value
+
+legacy = as_int(report.get("legacy_null_generation_chunks"), "legacy_null_generation_chunks")
 if legacy != 0:
-    sys.exit("legacy_null_generation_chunks=%r, expected 0" % (legacy,))
+    sys.exit("legacy_null_generation_chunks=%d, expected 0" % legacy)
 active = [g for g in report.get("generations", []) if g.get("state") == "active"]
 if len(active) != 1:
     sys.exit("expected exactly one active generation, found %d" % len(active))
-if active[0].get("generation_id") != want:
+if as_int(active[0].get("generation_id"), "generation_id") != want:
     sys.exit("active generation is %r, expected %r" % (active[0].get("generation_id"), want))
-if active[0].get("chunk_count", 0) <= 0:
+if as_int(active[0].get("chunk_count"), "chunk_count") <= 0:
     sys.exit("active generation holds no chunks")
 print("active generation OK")
 PYEOF
@@ -588,8 +605,8 @@ active id or leftover legacy rows block the resume rather than merely printing.
 The field names come from the code, not from guesswork: `report` prints
 `legacy_null_generation_chunks` at the top level and a `generations` list whose rows carry
 `generation_id`, `state` and `chunk_count` (`scripts/generation.py` → `_reference_report`,
-`PgVectorStore.generation_report`). A check written against invented names would pass vacuously,
-which is worse than no check.
+`PgVectorStore.generation_report`). One of the earlier invented names — the legacy count — made that check pass on any report at
+all, which is worse than no check because it reads like one.
 
 The permanent-override check is a cheap guard against operational drift — a stray `jobs update`,
 a leftover setting, a runbook that disagreed with what was actually run. The step-4 override is
