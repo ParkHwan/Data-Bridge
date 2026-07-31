@@ -294,12 +294,28 @@ def check_env_absent(env: Sequence[Mapping[str, object]], name: str) -> list[str
         return [f"environment variable {name} must be absent (found {count})"]
     return []
 
-def _env_map(env: Sequence[Mapping[str, object]]) -> dict[str, object]:
-    return {
-        str(item["name"]): item.get("value")
-        for item in env
-        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
-    }
+def _env_lookup(
+    env: Sequence[Mapping[str, object]], names: Sequence[str], problems: list[str]
+) -> dict[str, object]:
+    """Resolve the named variables, refusing any that appears more than once.
+
+    A dict comprehension would let the last entry win, so an env carrying both
+    SPACE_KEY=WRONG and SPACE_KEY=MFS — or observe followed by strict — would be read
+    as correct. Order must not decide whether a rollout is safe.
+    """
+    values: dict[str, object] = {}
+    for name in names:
+        matches = [
+            item
+            for item in env
+            if isinstance(item, Mapping) and item.get("name") == name
+        ]
+        if len(matches) > 1:
+            problems.append(f"{name} appears {len(matches)} times; expected at most once")
+            continue
+        if matches:
+            values[name] = matches[0].get("value")
+    return values
 
 
 def check_ingest_scope(
@@ -312,7 +328,9 @@ def check_ingest_scope(
     corpus into a fresh generation.
     """
     problems: list[str] = []
-    values = _env_map(env)
+    values = _env_lookup(
+        env, ("SPACE_KEY", "FOLDER_ID", "DATABRIDGE_GENERATION_ID"), problems
+    )
     if values.get("SPACE_KEY") != space_key:
         problems.append(f"SPACE_KEY={values.get('SPACE_KEY')!r}, expected {space_key!r}")
     if values.get("FOLDER_ID") != folder_id:
@@ -335,7 +353,11 @@ def check_strict_mode(
     problems: list[str] = []
 
     def _one(label: str, env: Sequence[Mapping[str, object]]) -> None:
-        values = _env_map(env)
+        local: list[str] = []
+        values = _env_lookup(
+            env, ("DATABRIDGE_PROFILE_MODE", "DATABRIDGE_GENERATION_ID"), local
+        )
+        problems.extend(f"{label} {problem}" for problem in local)
         mode = values.get("DATABRIDGE_PROFILE_MODE")
         if mode != "strict":
             problems.append(f"{label} DATABRIDGE_PROFILE_MODE={mode!r}, expected 'strict'")
@@ -358,3 +380,32 @@ def read_operation_id(lines: Sequence[str]) -> str:
     if not isinstance(operation_id, str) or not operation_id:
         raise RolloutCheckError("the wrapper reported no operation id to correlate")
     return operation_id
+
+
+CLI_PREFIX = "DATABRIDGE_RESULT "
+
+
+def extract_report_body(lines: Sequence[str]) -> Mapping[str, object]:
+    """Return the one report object from a command's captured stdout.
+
+    The log carries the report and the CLI result marker, so the whole capture is not a
+    JSON document. Picking the first or last line instead would depend on log ordering.
+    Take the lines that parse as JSON objects and are not the marker, and require exactly
+    one — two would mean we cannot tell which run we are looking at.
+    """
+    candidates: list[Mapping[str, object]] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("{") or stripped.startswith(CLI_PREFIX):
+            continue
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, Mapping):
+            candidates.append(parsed)
+    if len(candidates) != 1:
+        raise RolloutCheckError(
+            f"expected exactly one report object in the output, found {len(candidates)}"
+        )
+    return candidates[0]

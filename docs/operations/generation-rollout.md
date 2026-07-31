@@ -59,6 +59,7 @@ Set these once:
 PROJECT=genaiacademy-ph
 REGION=us-central1
 SPACE=MFS
+FOLDER_ID_EXPECTED=98380      # the Confluence folder that holds $SPACE
 
 # The digest you intend to roll out. Take it from the build that produced it — the Cloud
 # Build result for the merge — not from what is currently deployed. Reading it back from
@@ -72,7 +73,6 @@ set -o pipefail    # required: without it a failing wrapper is masked by tee
 # The digest you intend to roll out. Take it from the build that produced it — the Cloud
 # Build result for the merge — not from what is currently deployed. Reading it back from
 # the service would make the check compare the deployment against itself.
-EXPECTED_IMAGE='us-central1-docker.pkg.dev/genaiacademy-ph/cloud-run-source-deploy/databridge@sha256:CHANGE_ME'
 
 run_generation() { scripts/run_generation_job.sh --project "$PROJECT" --region "$REGION" "$@"; }
 preflight() { uv run python scripts/rollout_preflight.py "$@" --project "$PROJECT" --region "$REGION"; }

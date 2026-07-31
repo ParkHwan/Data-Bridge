@@ -19,6 +19,7 @@ from databridge.rollout_checks import (
     check_report,
     check_strict_mode,
     correlate_execution,
+    extract_report_body,
     read_generation_id,
     read_operation_id,
 )
@@ -162,6 +163,21 @@ def _images(args: argparse.Namespace) -> int:
     )
 
 
+def _env_entries(value: object, *, label: str) -> list[Mapping[str, object]]:
+    """Return every env entry, refusing to drop one we cannot read.
+
+    Silently skipping a malformed entry would let a check succeed beside something it
+    could not inspect — the same distinction between absence and inability to observe
+    that the wrapper draws.
+    """
+    if not isinstance(value, list):
+        raise RolloutCheckError(f"{label} env is not a list")
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping):
+            raise RolloutCheckError(f"{label} env[{index}] is not an object")
+    return [item for item in value if isinstance(item, Mapping)]
+
+
 def _job_env(name: str, project: str, region: str) -> list[Mapping[str, object]]:
     value = _gcloud_json(
         ["run", "jobs", "describe", name, "--project", project, "--region", region]
@@ -176,10 +192,7 @@ def _job_env(name: str, project: str, region: str) -> list[Mapping[str, object]]
     if not isinstance(containers, list) or not containers:
         raise RolloutCheckError(f"job {name} has no container")
     container = _object(containers[0], label=f"job {name} container")
-    env = container.get("env", [])
-    if not isinstance(env, list):
-        raise RolloutCheckError(f"job {name} env is not a list")
-    return [item for item in env if isinstance(item, Mapping)]
+    return _env_entries(container.get("env", []), label=f"job {name}")
 
 
 def _service_env(name: str, project: str, region: str) -> list[Mapping[str, object]]:
@@ -194,10 +207,7 @@ def _service_env(name: str, project: str, region: str) -> list[Mapping[str, obje
     if not isinstance(containers, list) or not containers:
         raise RolloutCheckError("service has no container")
     container = _object(containers[0], label="service container")
-    env = container.get("env", [])
-    if not isinstance(env, list):
-        raise RolloutCheckError("service env is not a list")
-    return [item for item in env if isinstance(item, Mapping)]
+    return _env_entries(container.get("env", []), label="service")
 
 
 def _ingest_scope(args: argparse.Namespace) -> int:
@@ -224,10 +234,10 @@ def _operation_id(args: argparse.Namespace) -> int:
 
 
 def _report(args: argparse.Namespace) -> int:
-    value = json.loads(_read_text(str(args.input)))
+    report = extract_report_body(_read_text(str(args.input)).splitlines())
     return _report_problems(
         check_report(
-            _object(value, label="generation report"),
+            report,
             expected_generation=int(args.expected_generation),
         )
     )

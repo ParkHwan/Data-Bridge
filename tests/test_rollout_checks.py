@@ -19,6 +19,7 @@ from databridge.rollout_checks import (
     check_report,
     check_strict_mode,
     correlate_execution,
+    extract_report_body,
     read_generation_id,
     read_operation_id,
 )
@@ -384,3 +385,45 @@ def test_operation_id_refuses_anything_ambiguous() -> None:
     for bad in ambiguous:
         with pytest.raises(RolloutCheckError):
             read_operation_id(bad)
+
+
+def test_duplicate_env_names_fail_regardless_of_order() -> None:
+    """The last entry must not decide whether a rollout is safe.
+
+    A dict comprehension let SPACE_KEY=WRONG followed by SPACE_KEY=MFS read as correct,
+    and observe followed by strict read as strict.
+    """
+    both_orders = (
+        (("SPACE_KEY", "WRONG"), ("SPACE_KEY", "MFS")),
+        (("SPACE_KEY", "MFS"), ("SPACE_KEY", "WRONG")),
+    )
+    for pairs in both_orders:
+        env = [{"name": name, "value": value} for name, value in pairs]
+        env.append({"name": "FOLDER_ID", "value": "98380"})
+        problems = check_ingest_scope(env, space_key="MFS", folder_id="98380")
+        assert any("appears 2 times" in problem for problem in problems), pairs
+
+    for modes in (("observe", "strict"), ("strict", "observe")):
+        env = [{"name": "DATABRIDGE_PROFILE_MODE", "value": mode} for mode in modes]
+        problems = check_strict_mode(
+            service_env=env, job_envs=dict.fromkeys(ROLLOUT_JOBS, env)
+        )
+        assert any("appears 2 times" in problem for problem in problems), modes
+
+
+def test_report_body_is_taken_from_a_real_command_capture() -> None:
+    """The capture holds the report and the CLI marker, so it is not one JSON document."""
+    report = {
+        "space_key": "MFS",
+        "legacy_null_generation_chunks": 0,
+        "generations": [{"generation_id": 7, "state": "active", "chunk_count": 5}],
+    }
+    marker = 'DATABRIDGE_RESULT {"command":"report","exit_code":0,"reason":"ok"}'
+    lines = [json.dumps(report), marker]
+    assert extract_report_body(lines) == report
+    assert extract_report_body(["", *lines, ""]) == report
+    # Two reports in one capture means we cannot tell which run this is.
+    with pytest.raises(RolloutCheckError):
+        extract_report_body([json.dumps(report), json.dumps(report), marker])
+    with pytest.raises(RolloutCheckError):
+        extract_report_body([marker])
