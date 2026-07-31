@@ -469,19 +469,34 @@ def test_serving_revision_refuses_a_split_or_tagged_allocation() -> None:
 
 def test_writers_must_be_quiesced_before_state_is_read() -> None:
     """Pausing the schedule does not stop a batch already in flight."""
-    done = [{"metadata": {"name": "e1"}, "status": {"runningCount": 0}}]
-    assert check_writers_quiesced(done) == []
+    def _execution(name: str, **status: object) -> dict[str, object]:
+        base: dict[str, object] = {
+            "completionTime": "2026-07-28T21:02:45Z",
+            "conditions": [{"type": "Completed", "status": "True"}],
+        }
+        base.update(status)
+        return {"metadata": {"name": name}, "status": base}
+
+    assert check_writers_quiesced([_execution("e1"), _execution("e2")]) == []
     # Cloud Run omits runningCount once nothing is running.
-    assert check_writers_quiesced([{"metadata": {"name": "e1"}, "status": {}}]) == []
-    running = [
-        {"metadata": {"name": "e1"}, "status": {"runningCount": 0}},
-        {"metadata": {"name": "e2"}, "status": {"runningCount": 1}},
-    ]
+    assert check_writers_quiesced([_execution("e1", runningCount=0)]) == []
+
+    running = [_execution("e1"), _execution("e2", runningCount=1)]
     assert any("e2" in problem for problem in check_writers_quiesced(running))
-    # A count we cannot read is not a count of zero.
+
+    # A pending execution carries the same empty status as a finished one. Treating the
+    # absence of runningCount as zero would approve a rollback that a later write undoes.
+    pending = [{"metadata": {"name": "pending"}, "status": {}}]
+    problems = check_writers_quiesced(pending)
+    assert any("completionTime" in problem for problem in problems), problems
+
     for bad in (True, False, "0", None):
-        assert check_writers_quiesced(
-            [{"metadata": {"name": "e1"}, "status": {"runningCount": bad}}]
-        ) != []
+        assert check_writers_quiesced([_execution("e1", runningCount=bad)]) != []
+    # Terminal evidence must be readable, not merely present.
+    assert check_writers_quiesced([_execution("e1", conditions=[])]) != []
+    assert check_writers_quiesced(
+        [_execution("e1", conditions=[{"type": "Completed", "status": True}])]
+    ) != []
+    assert check_writers_quiesced([_execution("e1", completionTime="")]) != []
     assert check_writers_quiesced([{"metadata": {"name": "e1"}}]) != []
     assert check_writers_quiesced(["oops"]) != []

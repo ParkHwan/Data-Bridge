@@ -474,28 +474,47 @@ def read_serving_revision(traffic: Sequence[Mapping[str, object]]) -> str:
 
 
 def check_writers_quiesced(executions: Sequence[Mapping[str, object]]) -> list[str]:
-    """Check that no ingest execution is still running before state is read.
+    """Require positive evidence that every ingest execution has finished.
 
-    Whatever inventory and report say is only true while nothing writes. Reading them
-    beside a running batch produces numbers that were correct a moment ago, and a
-    rollback decided on those numbers can still be wrong by the time it lands.
+    Whatever inventory and report say is only true while nothing writes, so this has to
+    establish that nothing *will* write either. An absent runningCount does not do that:
+    a pending execution — created, tasks not yet started — carries the same empty status
+    as a finished one, and would go on to write chunks after the rollback was approved.
+
+    Measured on a finished execution: status carries completionTime and a Completed
+    condition whose status is the string "True". Both are required here.
     """
     problems: list[str] = []
     for index, item in enumerate(executions):
         if not isinstance(item, Mapping):
             problems.append(f"execution[{index}] is not an object")
             continue
-        name = item.get("metadata")
+        metadata = item.get("metadata")
         label = (
-            name.get("name") if isinstance(name, Mapping) else None
+            metadata.get("name") if isinstance(metadata, Mapping) else None
         ) or f"execution[{index}]"
+
         status = item.get("status")
         if not isinstance(status, Mapping):
             problems.append(f"{label} has no readable status")
             continue
+
         running = status.get("runningCount", 0)
         if not _json_int(running):
             problems.append(f"{label} runningCount is not a JSON integer")
         elif running != 0:
             problems.append(f"{label} is still running ({running} task(s))")
+
+        if not status.get("completionTime"):
+            problems.append(
+                f"{label} has no completionTime; it has not finished and may still write"
+            )
+        conditions = _sequence(status.get("conditions")) or ()
+        completed = [
+            item
+            for item in conditions
+            if isinstance(item, Mapping) and item.get("type") == "Completed"
+        ]
+        if len(completed) != 1 or completed[0].get("status") not in {"True", "False"}:
+            problems.append(f"{label} has no single readable Completed condition")
     return problems
