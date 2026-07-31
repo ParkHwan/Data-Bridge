@@ -70,10 +70,6 @@ SERVICE_URL=$(gcloud run services describe databridge --project "$PROJECT" --reg
   --format='value(status.url)')
 set -o pipefail    # required: without it a failing wrapper is masked by tee
 
-# The digest you intend to roll out. Take it from the build that produced it — the Cloud
-# Build result for the merge — not from what is currently deployed. Reading it back from
-# the service would make the check compare the deployment against itself.
-
 run_generation() { scripts/run_generation_job.sh --project "$PROJECT" --region "$REGION" "$@"; }
 preflight() { uv run python scripts/rollout_preflight.py "$@" --project "$PROJECT" --region "$REGION"; }
 
@@ -550,9 +546,10 @@ Resume **only as a consequence of the check**, in one chained command:
 strict_preflight_ok && \
 gcloud scheduler jobs resume databridge-confluence-ingest --project "$PROJECT" --location "$REGION"
 
-[ "$(gcloud scheduler jobs describe databridge-confluence-ingest \
-  --project "$PROJECT" --location "$REGION" --format='value(state)')" = "ENABLED" ] \
-  && echo "scheduler ENABLED" || echo "STOP: scheduler did not resume"
+state=$(gcloud scheduler jobs describe databridge-confluence-ingest \
+  --project "$PROJECT" --location "$REGION" --format='value(state)') || state=""
+[ "$state" = "ENABLED" ] && echo "scheduler ENABLED" \
+  || { echo "STOP: scheduler state is '${state:-unreadable}', not ENABLED" >&2; false; }
 ```
 
 Resuming earlier would let a batch change active chunks and the manifest while step 7's golden
@@ -588,14 +585,25 @@ long: the space serves no evidence in that window.
 
   # 3. Only now read the state, and read both views.
   run_generation inventory --space "$SPACE" --generation-id "${GENERATION:?}" \
-    | tee /tmp/inv.out && show_output /tmp/inv.out      # total_chunks must be 0
+    | tee /tmp/inv.out && show_output /tmp/inv.out > /tmp/inv.body
   run_generation report --space "$SPACE" \
-    | tee /tmp/report.out && show_output /tmp/report.out # every generation's count
+    | tee /tmp/report.out && show_output /tmp/report.out > /tmp/report.body
   ```
 
-  Roll traffic back only if `total_chunks` is 0 **and** no generation holds chunks, and only
-  while writers stay stopped — the state you read is only true as long as nothing writes. If a
-  batch runs between the read and the rollback, the old reader will see building rows again.
+  Then let the check decide, and chain the rollback onto it:
+
+  ```bash
+  preflight rollback-safe --inventory /tmp/inv.body --report /tmp/report.body && \
+  gcloud run services update-traffic databridge --project "$PROJECT" --region "$REGION" \
+    --to-revisions "<the revision that was serving before step 2>=100"
+  ```
+
+  It requires `total_chunks` to be 0 and **every** generation to hold zero chunks. Reading
+  those two numbers by eye is how this gets decided wrongly, and a wrong reading makes the old
+  space-only reader return legacy and building rows together.
+
+  The check is only true while writers stay stopped. If a batch runs between the read and the
+  rollback, the old reader will see building rows again.
 
   Otherwise leave the generation in place, or discard it on the next attempt with
   `--discard-inflight`.

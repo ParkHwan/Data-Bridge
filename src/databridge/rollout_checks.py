@@ -409,3 +409,40 @@ def extract_report_body(lines: Sequence[str]) -> Mapping[str, object]:
             f"expected exactly one report object in the output, found {len(candidates)}"
         )
     return candidates[0]
+
+
+def check_rollback_is_safe(
+    *, inventory: Mapping[str, object], report: Mapping[str, object]
+) -> list[str]:
+    """Check that no generation holds chunks, so the old reader cannot mix rows.
+
+    Rolling traffic back after the clean ingest started is only safe while the space
+    holds no non-null-generation chunk. Reading the two outputs by eye is how that gets
+    decided wrongly, and a wrong reading here makes the old space-only reader return
+    legacy and building rows together.
+    """
+    problems: list[str] = []
+
+    total = inventory.get("total_chunks")
+    if not _json_int(total):
+        problems.append("inventory total_chunks is not a JSON integer")
+    elif total != 0:
+        problems.append(f"inventory total_chunks={total}, expected 0")
+
+    raw_generations = _sequence(report.get("generations"))
+    if raw_generations is None:
+        problems.append("report generations is missing or is not a list")
+        return problems
+    for index, item in enumerate(raw_generations):
+        if not isinstance(item, Mapping):
+            problems.append(f"report generations[{index}] is not an object")
+            continue
+        count = item.get("chunk_count")
+        if not _json_int(count):
+            problems.append(f"generations[{index}] chunk_count is not a JSON integer")
+        elif count != 0:
+            problems.append(
+                f"generation {item.get('generation_id')!r} holds {count} chunks; "
+                "rolling back would mix generations"
+            )
+    return problems

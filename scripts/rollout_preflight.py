@@ -17,6 +17,7 @@ from databridge.rollout_checks import (
     check_images,
     check_ingest_scope,
     check_report,
+    check_rollback_is_safe,
     check_strict_mode,
     correlate_execution,
     extract_report_body,
@@ -233,6 +234,15 @@ def _operation_id(args: argparse.Namespace) -> int:
     return 0
 
 
+def _rollback_safe(args: argparse.Namespace) -> int:
+    return _report_problems(
+        check_rollback_is_safe(
+            inventory=extract_report_body(_read_text(str(args.inventory)).splitlines()),
+            report=extract_report_body(_read_text(str(args.report)).splitlines()),
+        )
+    )
+
+
 def _report(args: argparse.Namespace) -> int:
     report = extract_report_body(_read_text(str(args.input)).splitlines())
     return _report_problems(
@@ -331,6 +341,11 @@ def _parser() -> argparse.ArgumentParser:
     strict = _add(commands, "strict")
     strict.add_argument("--service", default=DEFAULT_SERVICE)
     strict.set_defaults(handler=_strict)
+
+    rollback = _add(commands, "rollback-safe")
+    rollback.add_argument("--inventory", required=True)
+    rollback.add_argument("--report", required=True)
+    rollback.set_defaults(handler=_rollback_safe)
 
     operation = _add(commands, "operation-id")
     operation.add_argument("--input", default="-")

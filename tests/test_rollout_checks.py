@@ -17,6 +17,7 @@ from databridge.rollout_checks import (
     check_images,
     check_ingest_scope,
     check_report,
+    check_rollback_is_safe,
     check_strict_mode,
     correlate_execution,
     extract_report_body,
@@ -427,3 +428,22 @@ def test_report_body_is_taken_from_a_real_command_capture() -> None:
         extract_report_body([json.dumps(report), json.dumps(report), marker])
     with pytest.raises(RolloutCheckError):
         extract_report_body([marker])
+
+
+def test_rollback_is_refused_while_any_generation_holds_chunks() -> None:
+    """The old reader is space-only, so one building row makes a rollback mix generations."""
+    empty = {"generations": [{"generation_id": 1, "chunk_count": 0}]}
+    assert check_rollback_is_safe(inventory={"total_chunks": 0}, report=empty) == []
+    assert check_rollback_is_safe(inventory={"total_chunks": 3}, report=empty) != []
+    assert check_rollback_is_safe(
+        inventory={"total_chunks": 0},
+        report={"generations": [{"generation_id": 1, "chunk_count": 12}]},
+    ) != []
+    # Booleans satisfy != 0 and <= 0 comparisons, so they must fail on type.
+    for bad in (True, False, "0", None):
+        assert check_rollback_is_safe(inventory={"total_chunks": bad}, report=empty) != []
+        assert check_rollback_is_safe(
+            inventory={"total_chunks": 0},
+            report={"generations": [{"generation_id": 1, "chunk_count": bad}]},
+        ) != []
+    assert check_rollback_is_safe(inventory={"total_chunks": 0}, report={}) != []
