@@ -38,8 +38,7 @@ def resolve_profile_mode(environ: Mapping[str, str] | None = None) -> ProfileMod
         return ProfileMode(raw.strip().lower())
     except ValueError as exc:
         raise ProfileModeConfigurationError(
-            f"Unsupported DATABRIDGE_PROFILE_MODE={raw!r}; "
-            "allowed values: observe, strict"
+            f"Unsupported DATABRIDGE_PROFILE_MODE={raw!r}; allowed values: observe, strict"
         ) from exc
 
 
@@ -56,6 +55,30 @@ class GenerationChunkCount:
     generation_id: int
     state: GenerationState
     chunk_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationSourceInventory:
+    chunk_count: int
+    headings: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationInventory:
+    space_key: str
+    generation_id: int
+    generation_state: GenerationState
+    profile_fingerprint: str
+    total_chunks: int
+    sources: dict[str, GenerationSourceInventory]
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyCleanupResult:
+    space_key: str
+    generation_id: int
+    legacy_count_before: int
+    deleted_count: int
 
 
 @dataclass(frozen=True, slots=True)

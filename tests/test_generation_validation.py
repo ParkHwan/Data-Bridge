@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import inspect
+import json
 import os
+import threading
 import uuid
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import ModuleType
 from urllib.parse import quote
@@ -20,11 +24,16 @@ from databridge.embed import EmbeddingProfile, HashedEmbedder
 from databridge.ingest.chunker import Chunk, chunk_document
 from databridge.ingest.markdown import SourceDocument
 from databridge.store import (
+    ActivationIntegrityError,
+    EmbeddingProfileMismatchError,
     Generation,
     GenerationConcurrencyError,
     GenerationState,
     GenerationTargetError,
+    GenerationTargetNotFoundError,
+    GenerationTargetStateMismatchError,
     GenerationValidationError,
+    LegacyCleanupWindowClosedError,
     PgVectorStore,
     ProfileMode,
     ValidationQueryConfigurationError,
@@ -177,9 +186,11 @@ queries:
     return path
 
 
-def _prepare_building(
-    store: PgVectorStore, *, space_key: str, source_id: str = "source"
-) -> int:
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _prepare_building(store: PgVectorStore, *, space_key: str, source_id: str = "source") -> int:
     embedder = HashedEmbedder()
     building = store.create_building_generation(space_key=space_key)
     document = SourceDocument(
@@ -213,6 +224,43 @@ def _complete_manifest(
         suppressed_pages=0,
     )
     return revision
+
+
+def _prepare_legacy_cleanup(store: PgVectorStore, *, space_key: str, tmp_path: Path) -> int:
+    embedder = HashedEmbedder()
+    legacy_document = SourceDocument(
+        source_id="legacy",
+        title="Legacy",
+        space_key=space_key,
+        body="## Legacy\nold content",
+    )
+    legacy_chunks = chunk_document(legacy_document)
+    store.replace_source(
+        space_key=space_key,
+        source_id="legacy",
+        chunks=legacy_chunks,
+        embeddings=embedder.embed([chunk.embedding_text for chunk in legacy_chunks]),
+    )
+    with psycopg.connect(DSN) as conn:
+        conn.execute(
+            "UPDATE chunks SET generation_id=NULL WHERE space_key=%s AND source_id='legacy'",
+            (space_key,),
+        )
+    generation_id = _prepare_building(store, space_key=space_key)
+    _complete_manifest(store, space_key=space_key, generation_id=generation_id)
+    queries = _write_queries(
+        tmp_path / f"{space_key}.yaml", space_key=space_key, source_id="source"
+    )
+    validate_generation(
+        store,
+        embedder,
+        space_key=space_key,
+        generation_id=generation_id,
+        queries_path=queries,
+        expected_queries_sha256=_sha256(queries),
+    )
+    store.activate_generation(space_key=space_key, generation_id=generation_id)
+    return generation_id
 
 
 class _TwoPageBatchClient:
@@ -252,9 +300,7 @@ class _TwoPageBatchClient:
         for page in self.pages.values():
             yield page
 
-    async def get_page(
-        self, page_id: str, *, body_format: str = "atlas_doc_format"
-    ) -> Page:
+    async def get_page(self, page_id: str, *, body_format: str = "atlas_doc_format") -> Page:
         del body_format
         return self.pages[page_id]
 
@@ -297,13 +343,11 @@ class _RetireAfterFirstWriteStore(PgVectorStore):
 
 
 def test_query_file_is_strict_and_requires_boolean_and_heading(tmp_path: Path) -> None:
-    path = _write_queries(
-        tmp_path / "queries.yaml", space_key="MFS", source_id="source"
-    )
+    path = _write_queries(tmp_path / "queries.yaml", space_key="MFS", source_id="source")
     text = path.read_text("utf-8")
     invalid_boolean = text.replace(
         "category: heading_intent\n",
-        "category: heading_intent\n    critical: \"true\"\n",
+        'category: heading_intent\n    critical: "true"\n',
     )
     path.write_text(invalid_boolean, "utf-8")
     with pytest.raises(ValidationQueryConfigurationError, match="boolean"):
@@ -317,9 +361,7 @@ def test_query_file_is_strict_and_requires_boolean_and_heading(tmp_path: Path) -
 def test_query_file_rejects_unknown_fields_duplicate_ids_and_space_mismatch(
     tmp_path: Path,
 ) -> None:
-    path = _write_queries(
-        tmp_path / "queries.yaml", space_key="MFS", source_id="source"
-    )
+    path = _write_queries(tmp_path / "queries.yaml", space_key="MFS", source_id="source")
     text = path.read_text("utf-8")
     unknown_field = text.replace(
         "    category: source_coverage",
@@ -339,6 +381,66 @@ def test_query_file_rejects_unknown_fields_duplicate_ids_and_space_mismatch(
         load_validation_queries(path, space_key="OTHER")
 
 
+def test_query_sha256_is_checked_before_yaml_parsing(tmp_path: Path) -> None:
+    malformed = tmp_path / "malformed.yaml"
+    malformed.write_text("queries: [", encoding="utf-8")
+
+    with pytest.raises(ValidationQueryConfigurationError, match="64 hexadecimal"):
+        load_validation_queries(malformed, space_key="MFS", expected_sha256="not-a-sha")
+    with pytest.raises(ValidationQueryConfigurationError, match="SHA-256") as mismatch:
+        load_validation_queries(malformed, space_key="MFS", expected_sha256="0" * 64)
+    assert "Invalid validation query file" not in str(mismatch.value)
+
+    with pytest.raises(ValidationQueryConfigurationError, match="Invalid validation"):
+        load_validation_queries(
+            malformed,
+            space_key="MFS",
+            expected_sha256=_sha256(malformed),
+        )
+
+
+def test_query_sha256_accepts_matching_bytes(tmp_path: Path) -> None:
+    path = _write_queries(tmp_path / "queries.yaml", space_key="MFS", source_id="source")
+    query_file, observed = load_validation_queries(
+        path,
+        space_key="MFS",
+        expected_sha256=_sha256(path).upper(),
+    )
+    assert query_file.space_key == "MFS"
+    assert observed == _sha256(path)
+
+
+def test_cli_query_sha256_errors_are_exit_two_and_precede_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    malformed = tmp_path / "malformed.yaml"
+    malformed.write_text("queries: [", encoding="utf-8")
+    cli = _load_cli()
+    monkeypatch.setenv("DATABRIDGE_DSN", DSN)
+    monkeypatch.setenv("DATABRIDGE_EMBEDDER", "hashed")
+    monkeypatch.setenv("DATABRIDGE_PROFILE_MODE", "observe")
+
+    base = [
+        "validate",
+        "--space",
+        "MFS",
+        "--generation-id",
+        "1",
+        "--queries",
+        str(malformed),
+        "--expected-queries-sha256",
+    ]
+    assert cli.main([*base, "bad"]) == 2
+    assert "64 hexadecimal" in capsys.readouterr().err
+
+    assert cli.main([*base, "0" * 64]) == 2
+    error = capsys.readouterr().err
+    assert "SHA-256" in error
+    assert "Invalid validation query file" not in error
+
+
 def test_validation_defaults_match_production_and_agents_do_not_import_module() -> None:
     production = inspect.signature(PgVectorStore.search_hybrid).parameters
     validation = inspect.signature(search_hybrid_in_generation).parameters
@@ -347,8 +449,7 @@ def test_validation_defaults_match_production_and_agents_do_not_import_module() 
 
     agents = Path(__file__).parents[1] / "src" / "databridge" / "agents"
     assert all(
-        "databridge.store.validation" not in path.read_text("utf-8")
-        for path in agents.glob("*.py")
+        "databridge.store.validation" not in path.read_text("utf-8") for path in agents.glob("*.py")
     )
 
 
@@ -374,20 +475,136 @@ def test_cli_exit_code_mapping(
     assert cli.main(["list", "--space", "MFS"]) == expected
 
 
-def test_cli_requires_yes_and_explicit_validate_arguments() -> None:
+@pytest.mark.parametrize(
+    ("error", "expected_exit", "expected_reason"),
+    [
+        (None, 0, "ok"),
+        (RuntimeError("unexpected"), 1, "unexpected_error"),
+        (ValidationQueryConfigurationError("config"), 2, "queries_contract_violation"),
+        (GenerationValidationError("quality"), 3, "structural_validation_failed"),
+        (GenerationTargetError("target"), 4, "target_state_mismatch"),
+        (GenerationConcurrencyError("race"), 5, "concurrent_change"),
+    ],
+)
+def test_cli_emits_one_matching_marker_for_every_exit_code(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error: Exception | None,
+    expected_exit: int,
+    expected_reason: str,
+) -> None:
     cli = _load_cli()
-    with pytest.raises(SystemExit) as activate:
-        cli.main(["activate", "--space", "MFS", "--generation-id", "1"])
-    assert activate.value.code == 2
-    with pytest.raises(SystemExit) as validate:
-        cli.main(["validate", "--space", "MFS", "--generation-id", "1"])
-    assert validate.value.code == 2
+
+    def run(_args: object) -> None:
+        if error is not None:
+            raise error
+
+    monkeypatch.setattr(cli, "_run", run)
+    assert cli.main(["list", "--space", "MFS"]) == expected_exit
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 1
+    prefix = "DATABRIDGE_RESULT "
+    assert lines[0].startswith(prefix)
+    payload = json.loads(lines[0][len(prefix) :])
+    assert payload["exit_code"] == expected_exit
+    assert payload["reason"] == expected_reason
+
+
+def test_delete_legacy_confirmation_precedes_database_access(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cli = _load_cli()
+    called = False
+
+    def fail_if_called(_args: object) -> None:
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(cli, "_run", fail_if_called)
+    assert cli.main(["delete-legacy", "--space", "MFS", "--generation-id", "1"]) == 2
+    assert called is False
+    assert '"reason":"confirmation_missing"' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    ("error", "exit_code", "reason"),
+    [
+        (GenerationTargetNotFoundError("missing"), 4, "target_not_found"),
+        (GenerationTargetStateMismatchError("state"), 4, "target_state_mismatch"),
+        (ActivationIntegrityError("integrity"), 4, "activation_integrity_failed"),
+        (
+            LegacyCleanupWindowClosedError("stale"),
+            4,
+            "legacy_cleanup_window_closed",
+        ),
+        (GenerationConcurrencyError("race"), 5, "concurrent_change"),
+    ],
+)
+def test_delete_legacy_marker_reason_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    error: Exception,
+    exit_code: int,
+    reason: str,
+) -> None:
+    cli = _load_cli()
+
+    def fail(_args: object) -> None:
+        raise error
+
+    monkeypatch.setattr(cli, "_run", fail)
+    assert (
+        cli.main(
+            [
+                "delete-legacy",
+                "--space",
+                "MFS",
+                "--generation-id",
+                "1",
+                "--yes",
+            ]
+        )
+        == exit_code
+    )
+    payload = json.loads(capsys.readouterr().out.split(" ", 1)[1])
+    assert payload["reason"] == reason
+    assert payload["exit_code"] == exit_code
+
+
+def test_cli_requires_yes_and_explicit_validate_arguments(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = _load_cli()
+    assert cli.main(["activate", "--space", "MFS", "--generation-id", "1"]) == 2
+    marker = capsys.readouterr().out
+    assert '"reason":"confirmation_missing"' in marker
+    assert cli.main(["validate", "--space", "MFS", "--generation-id", "1"]) == 2
+    assert '"reason":"cli_usage_error"' in capsys.readouterr().out
+    assert (
+        cli.main(
+            [
+                "validate",
+                "--space",
+                "MFS",
+                "--generation-id",
+                "1",
+                "--queries",
+                "queries.yaml",
+            ]
+        )
+        == 2
+    )
+    assert '"reason":"cli_usage_error"' in capsys.readouterr().out
+    # An unknown option is a usage error like any other, and it must still emit a
+    # marker — a silent argparse exit would leave the wrapper with nothing to read.
+    assert cli.main(["list", "--space", "MFS", "--no-such-option"]) == 2
+    unknown = capsys.readouterr().out
+    assert '"reason":"cli_usage_error"' in unknown
+    assert '"generation_id":null' in unknown
 
 
 def test_heading_coverage_does_not_overreach_zero_or_one_heading(tmp_path: Path) -> None:
-    path = _write_queries(
-        tmp_path / "queries.yaml", space_key="MFS", source_id="source"
-    )
+    path = _write_queries(tmp_path / "queries.yaml", space_key="MFS", source_id="source")
     text = path.read_text("utf-8")
     text = text.replace(
         "  - id: heading\n"
@@ -408,9 +625,7 @@ def test_heading_coverage_does_not_overreach_zero_or_one_heading(tmp_path: Path)
 
 
 def test_multi_heading_source_requires_two_distinct_heading_queries(tmp_path: Path) -> None:
-    path = _write_queries(
-        tmp_path / "queries.yaml", space_key="MFS", source_id="source"
-    )
+    path = _write_queries(tmp_path / "queries.yaml", space_key="MFS", source_id="source")
     query_file, _ = load_validation_queries(path, space_key="MFS")
     two_headings = [
         ("source#0", "source", "title", "Release", None, "body"),
@@ -421,9 +636,7 @@ def test_multi_heading_source_requires_two_distinct_heading_queries(tmp_path: Pa
 
 
 def test_multi_heading_source_rejects_duplicate_expected_headings(tmp_path: Path) -> None:
-    path = _write_queries(
-        tmp_path / "queries.yaml", space_key="MFS", source_id="source"
-    )
+    path = _write_queries(tmp_path / "queries.yaml", space_key="MFS", source_id="source")
     text = path.read_text("utf-8")
     text += (
         "  - id: duplicate-heading\n"
@@ -443,9 +656,7 @@ def test_multi_heading_source_rejects_duplicate_expected_headings(tmp_path: Path
 
 
 def test_source_coverage_rejects_unrepresented_source(tmp_path: Path) -> None:
-    path = _write_queries(
-        tmp_path / "queries.yaml", space_key="MFS", source_id="source"
-    )
+    path = _write_queries(tmp_path / "queries.yaml", space_key="MFS", source_id="source")
     query_file, _ = load_validation_queries(path, space_key="MFS")
     rows = [
         ("source#0", "source", "title", None, None, "body"),
@@ -532,8 +743,7 @@ def test_critical_query_uses_top_three_not_top_five() -> None:
         }
     )
     hits = [
-        ValidationHit(1, f"other-{index}#0", f"other-{index}", None, index)
-        for index in range(1, 4)
+        ValidationHit(1, f"other-{index}#0", f"other-{index}", None, index) for index in range(1, 4)
     ] + [ValidationHit(1, "expected#0", "expected", None, 4)]
     assert _query_failure(query, hits, generation_id=1) == (
         "expected source/heading absent from top-3"
@@ -550,9 +760,7 @@ def test_validation_hit_rejects_another_generation() -> None:
         }
     )
     hits = [ValidationHit(2, "expected#0", "expected", None, 1)]
-    assert _query_failure(query, hits, generation_id=1) == (
-        "result contains another generation"
-    )
+    assert _query_failure(query, hits, generation_id=1) == ("result contains another generation")
 
 
 @pytest.mark.integration
@@ -561,26 +769,20 @@ def test_normal_revision_two_validate_receipt_and_atomic_activation(tmp_path: Pa
     store = _store()
     store.ensure_schema()
     space_key = _space("VALIDATE_OK")
-    active_document = SourceDocument(
-        "old", "old", space_key, "## Old\nold active content"
-    )
+    active_document = SourceDocument("old", "old", space_key, "## Old\nold active content")
     active_chunks = chunk_document(active_document)
     store.replace_source(
         space_key=space_key,
         source_id="old",
         chunks=active_chunks,
-        embeddings=HashedEmbedder().embed(
-            [chunk.embedding_text for chunk in active_chunks]
-        ),
+        embeddings=HashedEmbedder().embed([chunk.embedding_text for chunk in active_chunks]),
     )
     old_active = store.profile_report(space_key=space_key).active_generation_id
     assert old_active is not None
     generation_id = _prepare_building(store, space_key=space_key)
     assert _complete_manifest(store, space_key=space_key, generation_id=generation_id) == 1
     assert _complete_manifest(store, space_key=space_key, generation_id=generation_id) == 2
-    queries = _write_queries(
-        tmp_path / "queries.yaml", space_key=space_key, source_id="source"
-    )
+    queries = _write_queries(tmp_path / "queries.yaml", space_key=space_key, source_id="source")
 
     result = validate_generation(
         store,
@@ -588,6 +790,7 @@ def test_normal_revision_two_validate_receipt_and_atomic_activation(tmp_path: Pa
         space_key=space_key,
         generation_id=generation_id,
         queries_path=queries,
+        expected_queries_sha256=_sha256(queries),
     )
     assert result.manifest_revision == 2
     report = store.profile_report(space_key=space_key)
@@ -603,24 +806,18 @@ def test_normal_revision_two_validate_receipt_and_atomic_activation(tmp_path: Pa
         ).fetchone()
     assert receipt == (2, result.checksum)
 
-    activated = store.activate_generation(
-        space_key=space_key, generation_id=generation_id
-    )
+    activated = store.activate_generation(space_key=space_key, generation_id=generation_id)
     assert activated.state is GenerationState.ACTIVE
     with pytest.raises(GenerationTargetError, match="retired"):
         store.list_source_ids(space_key=space_key, generation_id=old_active)
     with pytest.raises(GenerationTargetError, match="retired"):
-        store.delete_source(
-            space_key=space_key, source_id="old", generation_id=old_active
-        )
+        store.delete_source(space_key=space_key, source_id="old", generation_id=old_active)
     with pytest.raises(GenerationTargetError, match="retired"):
         store.replace_source(
             space_key=space_key,
             source_id="old",
             chunks=active_chunks,
-            embeddings=HashedEmbedder().embed(
-                [chunk.embedding_text for chunk in active_chunks]
-            ),
+            embeddings=HashedEmbedder().embed([chunk.embedding_text for chunk in active_chunks]),
             generation_id=old_active,
         )
 
@@ -631,26 +828,19 @@ def test_create_building_is_idempotent_and_discard_removes_all_scoped_rows() -> 
     store = _store()
     store.ensure_schema()
     space_key = _space("CREATE")
-    first, first_status = store.create_building_generation_with_status(
-        space_key=space_key
-    )
-    reused, reused_status = store.create_building_generation_with_status(
-        space_key=space_key
-    )
+    first, first_status = store.create_building_generation_with_status(space_key=space_key)
+    reused, reused_status = store.create_building_generation_with_status(space_key=space_key)
     assert (reused.generation_id, first_status, reused_status) == (
         first.generation_id,
         "created",
         "reused",
     )
-    generation_id = _prepare_building(
-        store, space_key=space_key, source_id="source"
-    )
+    generation_id = _prepare_building(store, space_key=space_key, source_id="source")
     assert generation_id == first.generation_id
     _complete_manifest(store, space_key=space_key, generation_id=generation_id)
     with psycopg.connect(DSN) as conn:
         conn.execute(
-            "UPDATE space_generation SET state='sealed' "
-            "WHERE space_key=%s AND generation_id=%s",
+            "UPDATE space_generation SET state='sealed' WHERE space_key=%s AND generation_id=%s",
             (space_key, generation_id),
         )
     replacement, status = store.create_building_generation_with_status(
@@ -703,9 +893,7 @@ def test_active_batch_target_passes_every_manifest_and_data_operation() -> None:
 
     target = store.resolve_batch_target(space_key=space_key, generation_id=None)
     assert target.state is GenerationState.ACTIVE
-    revision = store.begin_manifest(
-        space_key=space_key, generation_id=target.generation_id
-    )
+    revision = store.begin_manifest(space_key=space_key, generation_id=target.generation_id)
     replacement = SourceDocument("replacement", "replacement", space_key, "## H\nnew")
     replacement_chunks = chunk_document(replacement)
     assert (
@@ -713,16 +901,15 @@ def test_active_batch_target_passes_every_manifest_and_data_operation() -> None:
             space_key=space_key,
             source_id="replacement",
             chunks=replacement_chunks,
-            embeddings=embedder.embed(
-                [chunk.embedding_text for chunk in replacement_chunks]
-            ),
+            embeddings=embedder.embed([chunk.embedding_text for chunk in replacement_chunks]),
             generation_id=target.generation_id,
         )
         == 1
     )
-    assert store.list_source_ids(
-        space_key=space_key, generation_id=target.generation_id
-    ) == {"replacement", "stale"}
+    assert store.list_source_ids(space_key=space_key, generation_id=target.generation_id) == {
+        "replacement",
+        "stale",
+    }
     assert (
         store.delete_source(
             space_key=space_key,
@@ -772,9 +959,7 @@ async def test_batch_target_retirement_stops_next_write_and_validate_exits_four(
     generation_id = store.profile_report(space_key=space_key).active_generation_id
     assert generation_id is not None
 
-    retiring_store = _RetireAfterFirstWriteStore(
-        target_generation_id=generation_id
-    )
+    retiring_store = _RetireAfterFirstWriteStore(target_generation_id=generation_id)
     with pytest.raises(GenerationTargetError, match="retired"):
         await run_confluence_batch(
             client=_TwoPageBatchClient(),
@@ -803,9 +988,7 @@ async def test_batch_target_retirement_stops_next_write_and_validate_exits_four(
         ).fetchone()
     assert outcome == ("retired", "in_progress", ["initial", "page-1"])
 
-    queries = _write_queries(
-        tmp_path / "queries.yaml", space_key=space_key, source_id="page-1"
-    )
+    queries = _write_queries(tmp_path / "queries.yaml", space_key=space_key, source_id="page-1")
     cli = _load_cli()
     monkeypatch.setenv("DATABRIDGE_DSN", DSN)
     monkeypatch.setenv("DATABRIDGE_EMBEDDER", "hashed")
@@ -820,6 +1003,8 @@ async def test_batch_target_retirement_stops_next_write_and_validate_exits_four(
                 str(generation_id),
                 "--queries",
                 str(queries),
+                "--expected-queries-sha256",
+                _sha256(queries),
             ]
         )
         == 4
@@ -869,9 +1054,7 @@ def test_manifest_begin_rechecks_resolved_target_and_preserves_complete_row(
     space_key = _space(f"BEGIN_{state}")
     generation_id = _prepare_building(store, space_key=space_key)
     _complete_manifest(store, space_key=space_key, generation_id=generation_id)
-    target = store.resolve_batch_target(
-        space_key=space_key, generation_id=generation_id
-    )
+    target = store.resolve_batch_target(space_key=space_key, generation_id=generation_id)
     with psycopg.connect(DSN) as conn:
         before = conn.execute(
             "SELECT state, revision, source_counts, total_chunks, completed_at "
@@ -924,8 +1107,7 @@ def test_manifest_finalize_rechecks_state_and_leaves_in_progress(state: str) -> 
         )
     with psycopg.connect(DSN) as conn:
         manifest_state = conn.execute(
-            "SELECT state FROM generation_manifest "
-            "WHERE space_key=%s AND generation_id=%s",
+            "SELECT state FROM generation_manifest WHERE space_key=%s AND generation_id=%s",
             (space_key, generation_id),
         ).fetchone()
     assert manifest_state == ("in_progress",)
@@ -954,15 +1136,12 @@ def test_manifest_finalize_rejects_active_target_retired_after_last_mutation() -
         space_key=space_key,
         source_id="replacement",
         chunks=replacement_chunks,
-        embeddings=embedder.embed(
-            [chunk.embedding_text for chunk in replacement_chunks]
-        ),
+        embeddings=embedder.embed([chunk.embedding_text for chunk in replacement_chunks]),
         generation_id=target.generation_id,
     )
     with psycopg.connect(DSN) as conn:
         conn.execute(
-            "UPDATE space_generation SET state='retired' "
-            "WHERE space_key=%s AND generation_id=%s",
+            "UPDATE space_generation SET state='retired' WHERE space_key=%s AND generation_id=%s",
             (space_key, target.generation_id),
         )
     with pytest.raises(GenerationTargetError, match="retired"):
@@ -977,8 +1156,7 @@ def test_manifest_finalize_rejects_active_target_retired_after_last_mutation() -
         )
     with psycopg.connect(DSN) as conn:
         manifest_state = conn.execute(
-            "SELECT state FROM generation_manifest "
-            "WHERE space_key=%s AND generation_id=%s",
+            "SELECT state FROM generation_manifest WHERE space_key=%s AND generation_id=%s",
             (space_key, target.generation_id),
         ).fetchone()
     assert manifest_state == ("in_progress",)
@@ -1036,9 +1214,7 @@ def test_manifest_lock_timeout_rolls_back_without_changing_row(
     monkeypatch.setattr(PgVectorStore, "_set_lock_timeout", staticmethod(short_timeout))
     lock_key = f"databridge:embedding-profile:{space_key}"
     with psycopg.connect(DSN) as holder:
-        holder.execute(
-            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock_key,)
-        )
+        holder.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock_key,))
         with pytest.raises(psycopg.errors.LockNotAvailable):
             if operation == "begin":
                 store.begin_manifest(space_key=space_key, generation_id=generation_id)
@@ -1084,6 +1260,7 @@ def test_stable_search_failure_is_exit_three_class_and_does_not_seal(
             space_key=space_key,
             generation_id=generation_id,
             queries_path=queries,
+            expected_queries_sha256=_sha256(queries),
         )
     with psycopg.connect(DSN) as conn:
         state = conn.execute(
@@ -1108,9 +1285,7 @@ def test_cli_validate_rejects_in_progress_manifest_with_exit_three(
     space_key = _space("MANIFEST_IN_PROGRESS")
     generation_id = _prepare_building(store, space_key=space_key)
     store.begin_manifest(space_key=space_key, generation_id=generation_id)
-    queries = _write_queries(
-        tmp_path / "queries.yaml", space_key=space_key, source_id="source"
-    )
+    queries = _write_queries(tmp_path / "queries.yaml", space_key=space_key, source_id="source")
     cli = _load_cli()
     monkeypatch.setenv("DATABRIDGE_DSN", DSN)
     monkeypatch.setenv("DATABRIDGE_EMBEDDER", "hashed")
@@ -1125,6 +1300,8 @@ def test_cli_validate_rejects_in_progress_manifest_with_exit_three(
                 str(generation_id),
                 "--queries",
                 str(queries),
+                "--expected-queries-sha256",
+                _sha256(queries),
             ]
         )
         == 3
@@ -1172,6 +1349,8 @@ def test_cli_validate_uses_initial_four_but_concurrent_change_five(
                 "9223372036854775000",
                 "--queries",
                 str(missing_queries),
+                "--expected-queries-sha256",
+                _sha256(missing_queries),
             ]
         )
         == 4
@@ -1182,9 +1361,7 @@ def test_cli_validate_uses_initial_four_but_concurrent_change_five(
     space_key = _space("CLI_CONCURRENT")
     generation_id = _prepare_building(store, space_key=space_key)
     _complete_manifest(store, space_key=space_key, generation_id=generation_id)
-    queries = _write_queries(
-        tmp_path / "concurrent.yaml", space_key=space_key, source_id="source"
-    )
+    queries = _write_queries(tmp_path / "concurrent.yaml", space_key=space_key, source_id="source")
     changed = False
 
     def failing_search_then_change(*args: object, **kwargs: object) -> list[ValidationHit]:
@@ -1213,6 +1390,8 @@ def test_cli_validate_uses_initial_four_but_concurrent_change_five(
                 str(generation_id),
                 "--queries",
                 str(queries),
+                "--expected-queries-sha256",
+                _sha256(queries),
             ]
         )
         == 5
@@ -1237,9 +1416,7 @@ def test_t2_detects_every_generation_or_manifest_change(
     space_key = _space(f"TOCTOU_{change}")
     generation_id = _prepare_building(store, space_key=space_key)
     _complete_manifest(store, space_key=space_key, generation_id=generation_id)
-    queries = _write_queries(
-        tmp_path / "queries.yaml", space_key=space_key, source_id="source"
-    )
+    queries = _write_queries(tmp_path / "queries.yaml", space_key=space_key, source_id="source")
     original = validation_module.search_hybrid_in_generation
     changed = False
 
@@ -1269,8 +1446,7 @@ def test_t2_detects_every_generation_or_manifest_change(
                     )
                 else:
                     conn.execute(
-                        "DELETE FROM generation_manifest "
-                        "WHERE space_key=%s AND generation_id=%s",
+                        "DELETE FROM generation_manifest WHERE space_key=%s AND generation_id=%s",
                         (space_key, generation_id),
                     )
         return hits
@@ -1283,6 +1459,7 @@ def test_t2_detects_every_generation_or_manifest_change(
             space_key=space_key,
             generation_id=generation_id,
             queries_path=queries,
+            expected_queries_sha256=_sha256(queries),
         )
     with psycopg.connect(DSN) as conn:
         receipt_count = conn.execute(
@@ -1316,9 +1493,7 @@ def test_t2_lock_timeout_does_not_seal_or_write_receipt(
     space_key = _space("T2_LOCK")
     generation_id = _prepare_building(store, space_key=space_key)
     _complete_manifest(store, space_key=space_key, generation_id=generation_id)
-    queries = _write_queries(
-        tmp_path / "queries.yaml", space_key=space_key, source_id="source"
-    )
+    queries = _write_queries(tmp_path / "queries.yaml", space_key=space_key, source_id="source")
     original = validation_module.search_hybrid_in_generation
     holder = psycopg.connect(DSN)
     lock_acquired = False
@@ -1354,6 +1529,8 @@ def test_t2_lock_timeout_does_not_seal_or_write_receipt(
                     str(generation_id),
                     "--queries",
                     str(queries),
+                    "--expected-queries-sha256",
+                    _sha256(queries),
                 ]
             )
             == 5
@@ -1387,9 +1564,7 @@ def test_activate_rechecks_receipt_and_preserves_existing_active(
     store.ensure_schema()
     embedder = HashedEmbedder()
     space_key = _space(f"ACTIVATE_{change}")
-    active_document = SourceDocument(
-        "active", "active", space_key, "## Active\nold active content"
-    )
+    active_document = SourceDocument("active", "active", space_key, "## Active\nold active content")
     active_chunks = chunk_document(active_document)
     store.replace_source(
         space_key=space_key,
@@ -1400,15 +1575,14 @@ def test_activate_rechecks_receipt_and_preserves_existing_active(
     active_id = store.profile_report(space_key=space_key).active_generation_id
     generation_id = _prepare_building(store, space_key=space_key)
     _complete_manifest(store, space_key=space_key, generation_id=generation_id)
-    queries = _write_queries(
-        tmp_path / "queries.yaml", space_key=space_key, source_id="source"
-    )
+    queries = _write_queries(tmp_path / "queries.yaml", space_key=space_key, source_id="source")
     validate_generation(
         store,
         embedder,
         space_key=space_key,
         generation_id=generation_id,
         queries_path=queries,
+        expected_queries_sha256=_sha256(queries),
     )
     with psycopg.connect(DSN) as conn:
         if change == "checksum":
@@ -1449,16 +1623,12 @@ def test_cli_activate_rejects_every_nonsealed_state_with_exit_four(
             space_key=space_key,
             source_id="active",
             chunks=chunks,
-            embeddings=HashedEmbedder().embed(
-                [chunk.embedding_text for chunk in chunks]
-            ),
+            embeddings=HashedEmbedder().embed([chunk.embedding_text for chunk in chunks]),
         )
         generation_id = store.profile_report(space_key=space_key).active_generation_id
         assert generation_id is not None
     else:
-        generation_id = store.create_building_generation(
-            space_key=space_key
-        ).generation_id
+        generation_id = store.create_building_generation(space_key=space_key).generation_id
         if state == "retired":
             with psycopg.connect(DSN) as conn:
                 conn.execute(
@@ -1500,23 +1670,20 @@ def test_activation_rolls_back_if_target_update_fails_after_retiring_active(
         space_key=space_key,
         source_id="old",
         chunks=active_chunks,
-        embeddings=HashedEmbedder().embed(
-            [chunk.embedding_text for chunk in active_chunks]
-        ),
+        embeddings=HashedEmbedder().embed([chunk.embedding_text for chunk in active_chunks]),
     )
     old_active = store.profile_report(space_key=space_key).active_generation_id
     assert old_active is not None
     generation_id = _prepare_building(store, space_key=space_key)
     _complete_manifest(store, space_key=space_key, generation_id=generation_id)
-    queries = _write_queries(
-        tmp_path / "queries.yaml", space_key=space_key, source_id="source"
-    )
+    queries = _write_queries(tmp_path / "queries.yaml", space_key=space_key, source_id="source")
     validate_generation(
         store,
         HashedEmbedder(),
         space_key=space_key,
         generation_id=generation_id,
         queries_path=queries,
+        expected_queries_sha256=_sha256(queries),
     )
 
     suffix = uuid.uuid4().hex
@@ -1577,9 +1744,9 @@ def test_explicit_active_building_and_sealed_target_policies() -> None:
     active_id = store.profile_report(space_key=space_key).active_generation_id
     assert active_id is not None
     assert store.list_source_ids(space_key=space_key, generation_id=active_id) == {"active"}
-    assert store.delete_source(
-        space_key=space_key, source_id="absent", generation_id=active_id
-    ) == 0
+    assert (
+        store.delete_source(space_key=space_key, source_id="absent", generation_id=active_id) == 0
+    )
 
     building_id = _prepare_building(store, space_key=space_key, source_id="building")
     assert store.list_source_ids(space_key=space_key, generation_id=building_id) == {"building"}
@@ -1591,21 +1758,15 @@ def test_explicit_active_building_and_sealed_target_policies() -> None:
     with pytest.raises(GenerationTargetError, match="sealed"):
         store.list_source_ids(space_key=space_key, generation_id=building_id)
     with pytest.raises(GenerationTargetError, match="sealed"):
-        store.delete_source(
-            space_key=space_key, source_id="building", generation_id=building_id
-        )
-    sealed_document = SourceDocument(
-        "sealed", "sealed", space_key, "## H\nsealed content"
-    )
+        store.delete_source(space_key=space_key, source_id="building", generation_id=building_id)
+    sealed_document = SourceDocument("sealed", "sealed", space_key, "## H\nsealed content")
     sealed_chunks = chunk_document(sealed_document)
     with pytest.raises(GenerationTargetError, match="sealed"):
         store.replace_source(
             space_key=space_key,
             source_id="sealed",
             chunks=sealed_chunks,
-            embeddings=embedder.embed(
-                [item.embedding_text for item in sealed_chunks]
-            ),
+            embeddings=embedder.embed([item.embedding_text for item in sealed_chunks]),
             generation_id=building_id,
         )
 
@@ -1613,9 +1774,7 @@ def test_explicit_active_building_and_sealed_target_policies() -> None:
 @pytest.mark.integration
 @pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
 @pytest.mark.parametrize("kind", ["zero", "degenerate"])
-def test_vector_validator_rejects_zero_and_degenerate_vectors(
-    tmp_path: Path, kind: str
-) -> None:
+def test_vector_validator_rejects_zero_and_degenerate_vectors(tmp_path: Path, kind: str) -> None:
     store = _store()
     store.ensure_schema()
     space_key = _space(f"VECTOR_{kind}")
@@ -1632,12 +1791,8 @@ def test_vector_validator_rejects_zero_and_degenerate_vectors(
             """,
             (space_key, generation.generation_id, vector),
         )
-    _complete_manifest(
-        store, space_key=space_key, generation_id=generation.generation_id
-    )
-    queries = _write_queries(
-        tmp_path / "queries.yaml", space_key=space_key, source_id="source"
-    )
+    _complete_manifest(store, space_key=space_key, generation_id=generation.generation_id)
+    queries = _write_queries(tmp_path / "queries.yaml", space_key=space_key, source_id="source")
     with pytest.raises(GenerationValidationError, match="zero, or degenerate"):
         validate_generation(
             store,
@@ -1645,6 +1800,7 @@ def test_vector_validator_rejects_zero_and_degenerate_vectors(
             space_key=space_key,
             generation_id=generation.generation_id,
             queries_path=queries,
+            expected_queries_sha256=_sha256(queries),
         )
 
 
@@ -1741,6 +1897,206 @@ def test_cli_well_formed_unreachable_dsn_is_an_operational_exit_one(
 
 @pytest.mark.integration
 @pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+def test_inventory_empty_generation_and_missing_target_contract(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space("INVENTORY_EMPTY")
+    generation_id = store.create_building_generation(space_key=space_key).generation_id
+    cli = _load_cli()
+    monkeypatch.setenv("DATABRIDGE_DSN", DSN)
+    monkeypatch.setenv("DATABRIDGE_EMBEDDER", "hashed")
+    monkeypatch.setenv("DATABRIDGE_PROFILE_MODE", "observe")
+
+    assert (
+        cli.main(
+            [
+                "inventory",
+                "--space",
+                space_key,
+                "--generation-id",
+                str(generation_id),
+            ]
+        )
+        == 0
+    )
+    output_lines = capsys.readouterr().out.splitlines()
+    assert len(output_lines) == 2
+    payload = json.loads(output_lines[0])
+    assert '"exit_code":0' in output_lines[1]
+    assert payload["generation_state"] == "building"
+    assert payload["sources"] == {}
+    assert payload["total_chunks"] == 0
+    assert isinstance(payload["total_chunks"], int)
+
+    assert (
+        cli.main(
+            [
+                "inventory",
+                "--space",
+                space_key,
+                "--generation-id",
+                str(generation_id + 9_000_000_000),
+            ]
+        )
+        == 4
+    )
+    assert "not found" in capsys.readouterr().err
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+def test_inventory_sorts_headings_and_reads_retired_profile_mismatch(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    alternate_profile = EmbeddingProfile(
+        provider="hashed",
+        model="inventory-alternate",
+        dimension=768,
+        config_fingerprint=uuid.uuid4().hex * 2,
+    )
+    store = PgVectorStore(DSN, profile=alternate_profile, mode=ProfileMode.OBSERVE)
+    store.ensure_schema()
+    space_key = _space("INVENTORY_RETIRED")
+    generation_id = store.create_building_generation(space_key=space_key).generation_id
+    embedder = HashedEmbedder()
+    documents = (
+        SourceDocument(
+            source_id="multi",
+            title="Multi",
+            space_key=space_key,
+            body="## Zebra\nz body\n## Alpha\na body\n## Alpha\na second body",
+        ),
+        SourceDocument(
+            source_id="plain",
+            title="Plain",
+            space_key=space_key,
+            body="plain body",
+        ),
+    )
+    expected_total = 0
+    for document in documents:
+        chunks = chunk_document(document)
+        expected_total += len(chunks)
+        store.replace_source(
+            space_key=space_key,
+            source_id=document.source_id,
+            chunks=chunks,
+            embeddings=embedder.embed([chunk.embedding_text for chunk in chunks]),
+            generation_id=generation_id,
+        )
+    with psycopg.connect(DSN) as conn:
+        conn.execute(
+            "UPDATE space_generation SET state='retired', activated_at=now() "
+            "WHERE space_key=%s AND generation_id=%s",
+            (space_key, generation_id),
+        )
+
+    cli = _load_cli()
+    monkeypatch.setenv("DATABRIDGE_DSN", DSN)
+    monkeypatch.setenv("DATABRIDGE_EMBEDDER", "hashed")
+    monkeypatch.setenv("DATABRIDGE_PROFILE_MODE", "observe")
+    assert (
+        cli.main(
+            [
+                "inventory",
+                "--space",
+                space_key,
+                "--generation-id",
+                str(generation_id),
+            ]
+        )
+        == 0
+    )
+    output_lines = capsys.readouterr().out.splitlines()
+    assert len(output_lines) == 2
+    payload = json.loads(output_lines[0])
+    assert '"exit_code":0' in output_lines[1]
+    assert payload["generation_state"] == "retired"
+    assert payload["profile_fingerprint"] == alternate_profile.config_fingerprint
+    assert payload["sources"]["multi"]["headings"] == ["Alpha", "Zebra"]
+    assert payload["sources"]["multi"]["chunk_count"] == 3
+    assert payload["sources"]["plain"] == {"chunk_count": 1, "headings": []}
+    assert payload["total_chunks"] == expected_total
+    assert isinstance(payload["total_chunks"], int)
+    assert all(isinstance(source["chunk_count"], int) for source in payload["sources"].values())
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+def test_inventory_counts_and_headings_share_one_snapshot() -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space("INVENTORY_SNAPSHOT")
+    generation_id = store.create_building_generation(space_key=space_key).generation_id
+    embedder = HashedEmbedder()
+
+    def write_version(body: str) -> None:
+        document = SourceDocument(
+            source_id="source",
+            title="Snapshot",
+            space_key=space_key,
+            body=body,
+        )
+        chunks = chunk_document(document)
+        store.replace_source(
+            space_key=space_key,
+            source_id="source",
+            chunks=chunks,
+            embeddings=embedder.embed([chunk.embedding_text for chunk in chunks]),
+            generation_id=generation_id,
+        )
+
+    versions = (
+        (1, ("Alpha",)),
+        (2, ("Beta", "Gamma")),
+    )
+    write_version("## Alpha\none")
+    start = threading.Barrier(2)
+    first_write_committed = threading.Event()
+    continue_writes = threading.Event()
+
+    def mutate() -> None:
+        start.wait()
+        write_version("## Beta\ntwo\n## Gamma\nthree")
+        first_write_committed.set()
+        if not continue_writes.wait(timeout=10):
+            raise TimeoutError("inventory reader did not release concurrent writer")
+        write_version("## Alpha\none")
+        for _ in range(9):
+            write_version("## Beta\ntwo\n## Gamma\nthree")
+            write_version("## Alpha\none")
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(mutate)
+        start.wait()
+
+        inventory_reads = 0
+
+        def assert_consistent_inventory() -> None:
+            nonlocal inventory_reads
+            inventory = _store().generation_inventory(
+                space_key=space_key, generation_id=generation_id
+            )
+            inventory_reads += 1
+            source = inventory.sources["source"]
+            assert (source.chunk_count, source.headings) in versions
+            assert inventory.total_chunks == source.chunk_count
+
+        assert first_write_committed.wait(timeout=10)
+        try:
+            assert_consistent_inventory()
+        finally:
+            continue_writes.set()
+        while not future.done():
+            assert_consistent_inventory()
+        future.result()
+        assert inventory_reads > 0
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
 def test_every_cli_command_has_an_actual_success_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1757,10 +2113,20 @@ def test_every_cli_command_has_an_actual_success_path(
 
     store = _store()
     generation_id = _prepare_building(store, space_key=space_key)
-    _complete_manifest(store, space_key=space_key, generation_id=generation_id)
-    queries = _write_queries(
-        tmp_path / "queries.yaml", space_key=space_key, source_id="source"
+    assert (
+        cli.main(
+            [
+                "inventory",
+                "--space",
+                space_key,
+                "--generation-id",
+                str(generation_id),
+            ]
+        )
+        == 0
     )
+    _complete_manifest(store, space_key=space_key, generation_id=generation_id)
+    queries = _write_queries(tmp_path / "queries.yaml", space_key=space_key, source_id="source")
     assert (
         cli.main(
             [
@@ -1771,6 +2137,8 @@ def test_every_cli_command_has_an_actual_success_path(
                 str(generation_id),
                 "--queries",
                 str(queries),
+                "--expected-queries-sha256",
+                _sha256(queries),
             ]
         )
         == 0
@@ -1801,9 +2169,7 @@ def test_cli_create_building_maps_profile_mismatch_to_exit_two(
         dimension=768,
         config_fingerprint=uuid.uuid4().hex * 2,
     )
-    alternate_store = PgVectorStore(
-        DSN, profile=alternate_profile, mode=ProfileMode.OBSERVE
-    )
+    alternate_store = PgVectorStore(DSN, profile=alternate_profile, mode=ProfileMode.OBSERVE)
     alternate_store.ensure_schema()
     space_key = _space("CREATE_PROFILE_MISMATCH")
     alternate_store.create_building_generation(space_key=space_key)
@@ -1824,13 +2190,10 @@ def test_cli_create_building_maps_sealed_inflight_to_exit_four(
     store = _store()
     store.ensure_schema()
     space_key = _space("CREATE_SEALED")
-    generation_id = store.create_building_generation(
-        space_key=space_key
-    ).generation_id
+    generation_id = store.create_building_generation(space_key=space_key).generation_id
     with psycopg.connect(DSN) as conn:
         conn.execute(
-            "UPDATE space_generation SET state='sealed' "
-            "WHERE space_key=%s AND generation_id=%s",
+            "UPDATE space_generation SET state='sealed' WHERE space_key=%s AND generation_id=%s",
             (space_key, generation_id),
         )
 
@@ -1853,15 +2216,14 @@ def test_discard_deletes_a_real_receipt_and_dependents_in_audited_order(
     space_key = _space("DISCARD_ORDER")
     generation_id = _prepare_building(store, space_key=space_key)
     _complete_manifest(store, space_key=space_key, generation_id=generation_id)
-    queries = _write_queries(
-        tmp_path / "queries.yaml", space_key=space_key, source_id="source"
-    )
+    queries = _write_queries(tmp_path / "queries.yaml", space_key=space_key, source_id="source")
     validate_generation(
         store,
         HashedEmbedder(),
         space_key=space_key,
         generation_id=generation_id,
         queries_path=queries,
+        expected_queries_sha256=_sha256(queries),
     )
 
     suffix = uuid.uuid4().hex
@@ -1902,12 +2264,7 @@ def test_discard_deletes_a_real_receipt_and_dependents_in_audited_order(
     monkeypatch.setenv("DATABRIDGE_EMBEDDER", "hashed")
     monkeypatch.setenv("DATABRIDGE_PROFILE_MODE", "observe")
     try:
-        assert (
-            cli.main(
-                ["create-building", "--space", space_key, "--discard-inflight"]
-            )
-            == 0
-        )
+        assert cli.main(["create-building", "--space", space_key, "--discard-inflight"]) == 0
         with psycopg.connect(DSN) as conn:
             deleted = [
                 str(row[0])
@@ -1993,10 +2350,7 @@ def test_discard_rejects_an_inflight_target_observed_as_active_or_retired(
     monkeypatch.setenv("DATABRIDGE_DSN", DSN)
     monkeypatch.setenv("DATABRIDGE_EMBEDDER", "hashed")
     monkeypatch.setenv("DATABRIDGE_PROFILE_MODE", "observe")
-    assert (
-        cli.main(["create-building", "--space", space_key, "--discard-inflight"])
-        == 4
-    )
+    assert cli.main(["create-building", "--space", space_key, "--discard-inflight"]) == 4
     assert observed_state.value in capsys.readouterr().err
     with psycopg.connect(DSN) as conn:
         row = conn.execute(
@@ -2006,3 +2360,379 @@ def test_discard_rejects_an_inflight_target_observed_as_active_or_retired(
             (space_key, generation_id, space_key, generation_id),
         ).fetchone()
     assert row == ("building", 1)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+def test_delete_legacy_success_is_space_scoped_and_idempotent(tmp_path: Path) -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space("DELETE_LEGACY")
+    other_space = _space("DELETE_LEGACY_OTHER")
+    generation_id = _prepare_legacy_cleanup(store, space_key=space_key, tmp_path=tmp_path)
+    _prepare_legacy_cleanup(store, space_key=other_space, tmp_path=tmp_path)
+
+    result = store.delete_legacy_chunks(space_key=space_key, generation_id=generation_id)
+    assert result.space_key == space_key
+    assert result.generation_id == generation_id
+    assert result.legacy_count_before == 1
+    assert result.deleted_count == 1
+    repeated = store.delete_legacy_chunks(space_key=space_key, generation_id=generation_id)
+    assert (repeated.legacy_count_before, repeated.deleted_count) == (0, 0)
+    with psycopg.connect(DSN) as conn:
+        counts = conn.execute(
+            "SELECT count(*) FILTER (WHERE space_key=%s AND generation_id IS NULL), "
+            "count(*) FILTER (WHERE space_key=%s AND generation_id IS NULL), "
+            "count(*) FILTER (WHERE space_key=%s AND generation_id=%s) FROM chunks",
+            (space_key, other_space, space_key, generation_id),
+        ).fetchone()
+    assert counts == (0, 1, 1)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+def test_delete_legacy_drift_is_checked_only_when_legacy_remains(tmp_path: Path) -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space("DELETE_DRIFT")
+    generation_id = _prepare_legacy_cleanup(store, space_key=space_key, tmp_path=tmp_path)
+    with psycopg.connect(DSN) as conn:
+        conn.execute(
+            "UPDATE chunks SET content=content || ' drift' WHERE space_key=%s AND generation_id=%s",
+            (space_key, generation_id),
+        )
+    with pytest.raises(LegacyCleanupWindowClosedError):
+        store.delete_legacy_chunks(space_key=space_key, generation_id=generation_id)
+
+    with psycopg.connect(DSN) as conn:
+        conn.execute(
+            "DELETE FROM chunks WHERE space_key=%s AND generation_id IS NULL",
+            (space_key,),
+        )
+    result = store.delete_legacy_chunks(space_key=space_key, generation_id=generation_id)
+    assert (result.legacy_count_before, result.deleted_count) == (0, 0)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+def test_delete_legacy_always_checks_activation_integrity(tmp_path: Path) -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space("DELETE_INTEGRITY")
+    generation_id = _prepare_legacy_cleanup(store, space_key=space_key, tmp_path=tmp_path)
+    with psycopg.connect(DSN) as conn:
+        conn.execute(
+            "DELETE FROM chunks WHERE space_key=%s AND generation_id IS NULL",
+            (space_key,),
+        )
+        conn.execute(
+            "DELETE FROM generation_validation WHERE space_key=%s AND generation_id=%s",
+            (space_key, generation_id),
+        )
+    with pytest.raises(ActivationIntegrityError):
+        store.delete_legacy_chunks(space_key=space_key, generation_id=generation_id)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+def test_delete_legacy_distinguishes_missing_and_non_active_targets() -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space("DELETE_TARGET")
+    with pytest.raises(GenerationTargetNotFoundError):
+        store.delete_legacy_chunks(space_key=space_key, generation_id=9_999_999)
+    building = store.create_building_generation(space_key=space_key)
+    with pytest.raises(GenerationTargetStateMismatchError):
+        store.delete_legacy_chunks(space_key=space_key, generation_id=building.generation_id)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "empty_active",
+        "receipt_missing",
+        "receipt_profile_mismatch",
+        "manifest_missing",
+        "manifest_in_progress",
+    ],
+)
+def test_delete_legacy_noop_still_checks_each_activation_invariant(
+    tmp_path: Path, failure: str
+) -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space(f"DELETE_NOOP_{failure.upper()}")
+    generation_id = _prepare_legacy_cleanup(store, space_key=space_key, tmp_path=tmp_path)
+    with psycopg.connect(DSN) as conn:
+        conn.execute(
+            "DELETE FROM chunks WHERE space_key=%s AND generation_id IS NULL",
+            (space_key,),
+        )
+        if failure == "empty_active":
+            conn.execute(
+                "DELETE FROM chunks WHERE space_key=%s AND generation_id=%s",
+                (space_key, generation_id),
+            )
+        elif failure == "receipt_missing":
+            conn.execute(
+                "DELETE FROM generation_validation WHERE space_key=%s AND generation_id=%s",
+                (space_key, generation_id),
+            )
+        elif failure == "receipt_profile_mismatch":
+            mismatch = "f" * 64
+            conn.execute(
+                """
+                INSERT INTO embedding_profile
+                    (profile_id, provider, model, dimension, config_fingerprint)
+                VALUES (%s, 'hashed', 'mismatch', 768, %s)
+                ON CONFLICT DO NOTHING
+                """,
+                (mismatch, mismatch),
+            )
+            conn.execute(
+                """
+                UPDATE generation_validation SET profile_id=%s
+                 WHERE space_key=%s AND generation_id=%s
+                """,
+                (mismatch, space_key, generation_id),
+            )
+        elif failure == "manifest_missing":
+            conn.execute(
+                "DELETE FROM generation_manifest WHERE space_key=%s AND generation_id=%s",
+                (space_key, generation_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE generation_manifest
+                   SET state='in_progress', total_chunks=NULL, completed_at=NULL
+                 WHERE space_key=%s AND generation_id=%s
+                """,
+                (space_key, generation_id),
+            )
+
+    with pytest.raises(ActivationIntegrityError):
+        store.delete_legacy_chunks(space_key=space_key, generation_id=generation_id)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+@pytest.mark.parametrize("drift", ["checksum", "chunk_count", "manifest_revision"])
+def test_delete_legacy_checks_each_content_drift_independently(tmp_path: Path, drift: str) -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space(f"DELETE_DRIFT_{drift.upper()}")
+    generation_id = _prepare_legacy_cleanup(store, space_key=space_key, tmp_path=tmp_path)
+    assignments = {
+        "checksum": "checksum=repeat('0', 64)",
+        "chunk_count": "chunk_count=chunk_count + 1",
+        "manifest_revision": "manifest_revision=manifest_revision + 1",
+    }
+    with psycopg.connect(DSN) as conn:
+        conn.execute(
+            f"UPDATE generation_validation SET {assignments[drift]} "
+            "WHERE space_key=%s AND generation_id=%s",
+            (space_key, generation_id),
+        )
+
+    with pytest.raises(LegacyCleanupWindowClosedError):
+        store.delete_legacy_chunks(space_key=space_key, generation_id=generation_id)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+def test_delete_legacy_runtime_profile_mismatch(tmp_path: Path) -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space("DELETE_PROFILE")
+    generation_id = _prepare_legacy_cleanup(store, space_key=space_key, tmp_path=tmp_path)
+    mismatched = PgVectorStore(
+        DSN,
+        profile=EmbeddingProfile("test", "mismatch", 768, "e" * 64),
+        mode=ProfileMode.OBSERVE,
+    )
+    with pytest.raises(EmbeddingProfileMismatchError):
+        mismatched.delete_legacy_chunks(space_key=space_key, generation_id=generation_id)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+def test_delete_legacy_lock_timeout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space("DELETE_LOCK")
+    generation_id = _prepare_legacy_cleanup(store, space_key=space_key, tmp_path=tmp_path)
+
+    def set_short_timeout(cur: psycopg.Cursor[object]) -> None:
+        cur.execute("SET LOCAL lock_timeout = '50ms'")
+
+    monkeypatch.setattr(PgVectorStore, "_set_lock_timeout", staticmethod(set_short_timeout))
+    lock_key = f"databridge:embedding-profile:{space_key}"
+    with psycopg.connect(DSN) as lock_conn:
+        lock_conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock_key,))
+        with pytest.raises(psycopg.errors.LockNotAvailable):
+            store.delete_legacy_chunks(space_key=space_key, generation_id=generation_id)
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+def test_delete_legacy_cli_success_output_and_marker_follow_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space("DELETE_CLI_SUCCESS")
+    generation_id = _prepare_legacy_cleanup(store, space_key=space_key, tmp_path=tmp_path)
+    cli = _load_cli()
+    monkeypatch.setenv("DATABRIDGE_DSN", DSN)
+    monkeypatch.setenv("DATABRIDGE_EMBEDDER", "hashed")
+    monkeypatch.setenv("DATABRIDGE_PROFILE_MODE", "observe")
+    original_emit = cli._emit_marker
+    commit_visible_at_marker = False
+
+    def assert_commit_then_emit(**kwargs: object) -> None:
+        nonlocal commit_visible_at_marker
+        with psycopg.connect(DSN) as observer:
+            row = observer.execute(
+                "SELECT count(*) FROM chunks WHERE space_key=%s AND generation_id IS NULL",
+                (space_key,),
+            ).fetchone()
+        commit_visible_at_marker = row == (0,)
+        original_emit(**kwargs)
+
+    monkeypatch.setattr(cli, "_emit_marker", assert_commit_then_emit)
+    assert (
+        cli.main(
+            [
+                "delete-legacy",
+                "--space",
+                space_key,
+                "--generation-id",
+                str(generation_id),
+                "--yes",
+            ]
+        )
+        == 0
+    )
+    assert commit_visible_at_marker is True
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 2
+    output = json.loads(lines[0])
+    assert set(output) == {
+        "space_key",
+        "generation_id",
+        "legacy_count_before",
+        "deleted_count",
+    }
+    assert output == {
+        "space_key": space_key,
+        "generation_id": generation_id,
+        "legacy_count_before": 1,
+        "deleted_count": 1,
+    }
+    assert isinstance(output["space_key"], str)
+    for field in ("generation_id", "legacy_count_before", "deleted_count"):
+        assert isinstance(output[field], int) and not isinstance(output[field], bool)
+    marker = json.loads(lines[1].split(" ", 1)[1])
+    assert marker["exit_code"] == 0
+    assert marker["reason"] == "ok"
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+@pytest.mark.parametrize("stale", ["checksum", "chunk_count", "manifest_revision"])
+def test_delete_legacy_cli_noop_ignores_each_stale_content_field(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    stale: str,
+) -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space(f"DELETE_CLI_NOOP_{stale.upper()}")
+    generation_id = _prepare_legacy_cleanup(store, space_key=space_key, tmp_path=tmp_path)
+    assignments = {
+        "checksum": "checksum=repeat('0', 64)",
+        "chunk_count": "chunk_count=chunk_count + 1",
+        "manifest_revision": "manifest_revision=manifest_revision + 1",
+    }
+    with psycopg.connect(DSN) as conn:
+        conn.execute(
+            "DELETE FROM chunks WHERE space_key=%s AND generation_id IS NULL",
+            (space_key,),
+        )
+        conn.execute(
+            f"UPDATE generation_validation SET {assignments[stale]} "
+            "WHERE space_key=%s AND generation_id=%s",
+            (space_key, generation_id),
+        )
+
+    cli = _load_cli()
+    monkeypatch.setenv("DATABRIDGE_DSN", DSN)
+    monkeypatch.setenv("DATABRIDGE_EMBEDDER", "hashed")
+    monkeypatch.setenv("DATABRIDGE_PROFILE_MODE", "observe")
+    assert (
+        cli.main(
+            [
+                "delete-legacy",
+                "--space",
+                space_key,
+                "--generation-id",
+                str(generation_id),
+                "--yes",
+            ]
+        )
+        == 0
+    )
+    lines = capsys.readouterr().out.splitlines()
+    output = json.loads(lines[0])
+    marker = json.loads(lines[1].split(" ", 1)[1])
+    assert output["legacy_count_before"] == 0
+    assert output["deleted_count"] == 0
+    assert marker["exit_code"] == 0
+    assert marker["reason"] == "ok"
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not _pg_available(), reason="postgres not reachable")
+def test_delete_legacy_cli_lock_timeout_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store = _store()
+    store.ensure_schema()
+    space_key = _space("DELETE_CLI_LOCK")
+    generation_id = _prepare_legacy_cleanup(store, space_key=space_key, tmp_path=tmp_path)
+
+    def set_short_timeout(cur: psycopg.Cursor[object]) -> None:
+        cur.execute("SET LOCAL lock_timeout = '50ms'")
+
+    monkeypatch.setattr(PgVectorStore, "_set_lock_timeout", staticmethod(set_short_timeout))
+    cli = _load_cli()
+    monkeypatch.setenv("DATABRIDGE_DSN", DSN)
+    monkeypatch.setenv("DATABRIDGE_EMBEDDER", "hashed")
+    monkeypatch.setenv("DATABRIDGE_PROFILE_MODE", "observe")
+    lock_key = f"databridge:embedding-profile:{space_key}"
+    with psycopg.connect(DSN) as lock_conn:
+        lock_conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (lock_key,))
+        assert (
+            cli.main(
+                [
+                    "delete-legacy",
+                    "--space",
+                    space_key,
+                    "--generation-id",
+                    str(generation_id),
+                    "--yes",
+                ]
+            )
+            == 5
+        )
+    marker = json.loads(capsys.readouterr().out.split(" ", 1)[1])
+    assert marker["exit_code"] == 5
+    assert marker["reason"] == "lock_timeout"

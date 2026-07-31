@@ -1,17 +1,27 @@
 """Vector store — plain pgvector, portable across Postgres / Cloud SQL / AlloyDB."""
 
 from databridge.store.exceptions import (
+    ActivationIntegrityError,
     EmbeddingProfileMismatchError,
     GenerationConcurrencyError,
     GenerationTargetError,
+    GenerationTargetNotFoundError,
+    GenerationTargetStateMismatchError,
     GenerationValidationError,
+    LegacyCleanupWindowClosedError,
+    SearchGenerationValidationError,
+    StructuralGenerationValidationError,
     ValidationQueryConfigurationError,
+    ValidationQueryShaMismatchError,
 )
 from databridge.store.pg import PgVectorStore, SearchHit
 from databridge.store.provenance import (
     Generation,
     GenerationChunkCount,
+    GenerationInventory,
+    GenerationSourceInventory,
     GenerationState,
+    LegacyCleanupResult,
     ProfileMode,
     ProfileModeConfigurationError,
     SpaceProfileReport,
@@ -19,18 +29,28 @@ from databridge.store.provenance import (
 )
 
 __all__ = [
+    "ActivationIntegrityError",
     "EmbeddingProfileMismatchError",
     "Generation",
     "GenerationConcurrencyError",
     "GenerationChunkCount",
+    "GenerationInventory",
+    "GenerationSourceInventory",
     "GenerationState",
     "GenerationTargetError",
+    "GenerationTargetNotFoundError",
+    "GenerationTargetStateMismatchError",
     "GenerationValidationError",
+    "LegacyCleanupResult",
+    "LegacyCleanupWindowClosedError",
     "PgVectorStore",
     "ProfileMode",
     "ProfileModeConfigurationError",
     "SearchHit",
+    "SearchGenerationValidationError",
     "SpaceProfileReport",
+    "StructuralGenerationValidationError",
     "ValidationQueryConfigurationError",
+    "ValidationQueryShaMismatchError",
     "resolve_profile_mode",
 ]
