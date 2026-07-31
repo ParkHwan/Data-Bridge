@@ -19,6 +19,7 @@ from databridge.rollout_checks import (
     check_report,
     check_rollback_is_safe,
     check_strict_mode,
+    check_writers_quiesced,
     correlate_execution,
     extract_report_body,
     read_generation_id,
@@ -464,3 +465,23 @@ def test_serving_revision_refuses_a_split_or_tagged_allocation() -> None:
     for traffic in ambiguous:
         with pytest.raises(RolloutCheckError):
             read_serving_revision(traffic)
+
+
+def test_writers_must_be_quiesced_before_state_is_read() -> None:
+    """Pausing the schedule does not stop a batch already in flight."""
+    done = [{"metadata": {"name": "e1"}, "status": {"runningCount": 0}}]
+    assert check_writers_quiesced(done) == []
+    # Cloud Run omits runningCount once nothing is running.
+    assert check_writers_quiesced([{"metadata": {"name": "e1"}, "status": {}}]) == []
+    running = [
+        {"metadata": {"name": "e1"}, "status": {"runningCount": 0}},
+        {"metadata": {"name": "e2"}, "status": {"runningCount": 1}},
+    ]
+    assert any("e2" in problem for problem in check_writers_quiesced(running))
+    # A count we cannot read is not a count of zero.
+    for bad in (True, False, "0", None):
+        assert check_writers_quiesced(
+            [{"metadata": {"name": "e1"}, "status": {"runningCount": bad}}]
+        ) != []
+    assert check_writers_quiesced([{"metadata": {"name": "e1"}}]) != []
+    assert check_writers_quiesced(["oops"]) != []

@@ -471,3 +471,31 @@ def read_serving_revision(traffic: Sequence[Mapping[str, object]]) -> str:
             "traffic is split or tagged; record the whole allocation before moving it"
         )
     return name
+
+
+def check_writers_quiesced(executions: Sequence[Mapping[str, object]]) -> list[str]:
+    """Check that no ingest execution is still running before state is read.
+
+    Whatever inventory and report say is only true while nothing writes. Reading them
+    beside a running batch produces numbers that were correct a moment ago, and a
+    rollback decided on those numbers can still be wrong by the time it lands.
+    """
+    problems: list[str] = []
+    for index, item in enumerate(executions):
+        if not isinstance(item, Mapping):
+            problems.append(f"execution[{index}] is not an object")
+            continue
+        name = item.get("metadata")
+        label = (
+            name.get("name") if isinstance(name, Mapping) else None
+        ) or f"execution[{index}]"
+        status = item.get("status")
+        if not isinstance(status, Mapping):
+            problems.append(f"{label} has no readable status")
+            continue
+        running = status.get("runningCount", 0)
+        if not _json_int(running):
+            problems.append(f"{label} runningCount is not a JSON integer")
+        elif running != 0:
+            problems.append(f"{label} is still running ({running} task(s))")
+    return problems

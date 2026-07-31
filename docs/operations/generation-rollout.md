@@ -237,7 +237,8 @@ images_aligned_ok() { preflight images --expected-image "${EXPECTED_IMAGE:?}"; }
 # Capture what is serving *before* the move; afterwards the service cannot tell you.
 # preflight serving-revision refuses a split or tagged allocation rather than naming
 # whichever entry happens to come first, and the move is chained onto it.
-ROLLBACK_REVISION=$(preflight serving-revision) \
+[ -d "${EVIDENCE:?}" ] \
+  && ROLLBACK_REVISION=$(preflight serving-revision) \
   && echo "ROLLBACK_REVISION=${ROLLBACK_REVISION:?}" \
   && preconditions_ok && recovery_accepted_ok && scheduler_paused_ok && images_aligned_ok \
   && gcloud run services update-traffic databridge \
@@ -585,21 +586,15 @@ long: the space serves no evidence in that window.
 
   Establishing that requires quiescence, not a single report. Do all of it, in order:
 
+  To cancel one that is in flight:
+
   ```bash
-  # 1. Stop every writer first, or the answer is stale before you read it.
+  # gcloud run jobs executions cancel <NAME> --project "$PROJECT" --region "$REGION"
   gcloud scheduler jobs pause databridge-confluence-ingest \
-    --project "$PROJECT" --location "$REGION"
-
-  # 2. Terminate the ingest execution that failed, if it is still running.
-  gcloud run jobs executions list --job databridge-confluence-ingest \
-    --project "$PROJECT" --region "$REGION" --limit 5 \
-    --format='table(metadata.name, status.runningCount, status.completionTime)'
-  # cancel any still-running execution before continuing:
-  #   gcloud run jobs executions cancel <NAME> --project "$PROJECT" --region "$REGION"
-
-  # 3. Only now read the state, and read both views.
-  run_generation inventory --space "$SPACE" --generation-id "${GENERATION:?}" \
-      | tee "${EVIDENCE:?}/inv.out" \
+       --project "$PROJECT" --location "$REGION" \
+    && preflight writers-quiesced \
+    && run_generation inventory --space "$SPACE" --generation-id "${GENERATION:?}" \
+         | tee "${EVIDENCE:?}/inv.out" \
     && show_output "${EVIDENCE:?}/inv.out" > "${EVIDENCE:?}/inv.body" \
     && run_generation report --space "$SPACE" | tee "${EVIDENCE:?}/report.out" \
     && show_output "${EVIDENCE:?}/report.out" > "${EVIDENCE:?}/report.body" \
@@ -610,8 +605,14 @@ long: the space serves no evidence in that window.
          --to-revisions "${ROLLBACK_REVISION:?}=100"
   ```
 
-  One chain, deliberately. Run as separate blocks, a failed capture leaves the previous
-  file in place and the check approves evidence from an earlier attempt.
+  One chain, deliberately, and it starts by stopping the writers. Whatever inventory and
+  report say is only true while nothing writes: read beside a running batch, the numbers
+  were correct a moment ago and the rollback lands on a state that has moved.
+  `writers-quiesced` fails while any ingest execution still has a running task — pausing
+  the schedule does not stop a batch already in flight; cancel it and re-run the chain.
+
+  Run as separate blocks instead, and a failed capture leaves the previous file in place
+  for the check to approve.
 
   `$ROLLBACK_REVISION` is the revision recorded in step 2, before traffic moved; the service
   cannot tell you afterwards which one it was.

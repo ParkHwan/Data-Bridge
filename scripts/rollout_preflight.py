@@ -19,6 +19,7 @@ from databridge.rollout_checks import (
     check_report,
     check_rollback_is_safe,
     check_strict_mode,
+    check_writers_quiesced,
     correlate_execution,
     extract_report_body,
     read_generation_id,
@@ -235,6 +236,17 @@ def _operation_id(args: argparse.Namespace) -> int:
     return 0
 
 
+def _quiesced(args: argparse.Namespace) -> int:
+    project, region = _require_location(args)
+    value = _gcloud_json(
+        ["run", "jobs", "executions", "list", "--job", str(args.job),
+         "--project", project, "--region", region]
+    )
+    if not isinstance(value, list):
+        raise RolloutCheckError("execution list did not return a JSON list")
+    return _report_problems(check_writers_quiesced(value))
+
+
 def _serving_revision(args: argparse.Namespace) -> int:
     project, region = _require_location(args)
     value = _gcloud_json(
@@ -360,6 +372,10 @@ def _parser() -> argparse.ArgumentParser:
     strict = _add(commands, "strict")
     strict.add_argument("--service", default=DEFAULT_SERVICE)
     strict.set_defaults(handler=_strict)
+
+    quiesced = _add(commands, "writers-quiesced")
+    quiesced.add_argument("--job", default="databridge-confluence-ingest")
+    quiesced.set_defaults(handler=_quiesced)
 
     serving = _add(commands, "serving-revision")
     serving.add_argument("--service", default=DEFAULT_SERVICE)
