@@ -226,6 +226,13 @@ job images drift silently. Check digests rather than assuming.
 ```bash
 images_aligned_ok() { preflight images --expected-image "${EXPECTED_IMAGE:?}"; }
 
+# Capture what is serving *before* the move. After it, this is unrecoverable from the
+# service, and the interrupted-rollback path below needs it by name.
+ROLLBACK_REVISION=$(gcloud run services describe databridge \
+  --project "$PROJECT" --region "$REGION" \
+  --format='value(status.traffic[0].revisionName)')
+echo "ROLLBACK_REVISION=${ROLLBACK_REVISION:?could not read the serving revision}"
+
 preconditions_ok && recovery_accepted_ok && scheduler_paused_ok && images_aligned_ok && \
 gcloud run services update-traffic databridge --project "$PROJECT" --region "$REGION" --to-latest
 ```
@@ -595,10 +602,13 @@ long: the space serves no evidence in that window.
   ```bash
   preflight rollback-safe --inventory /tmp/inv.body --report /tmp/report.body && \
   gcloud run services update-traffic databridge --project "$PROJECT" --region "$REGION" \
-    --to-revisions "<the revision that was serving before step 2>=100"
+    --to-revisions "${ROLLBACK_REVISION:?}=100"
   ```
 
-  It requires `total_chunks` to be 0 and **every** generation to hold zero chunks. Reading
+  `$ROLLBACK_REVISION` is the revision recorded in step 2, before traffic moved; the service
+  cannot tell you afterwards which one it was.
+
+  The check requires `total_chunks` to be 0 and **every** generation to hold zero chunks. Reading
   those two numbers by eye is how this gets decided wrongly, and a wrong reading makes the old
   space-only reader return legacy and building rows together.
 
