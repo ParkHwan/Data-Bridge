@@ -18,7 +18,9 @@ PROJECT=${PROJECT:-genaiacademy-ph}
 REGION=us-central1
 BUILD_SA=databridge-build@${PROJECT}.iam.gserviceaccount.com
 RUNTIME_SA=databridge-run@${PROJECT}.iam.gserviceaccount.com
+GENERATION_SA=databridge-generation@${PROJECT}.iam.gserviceaccount.com
 SCHEDULER_SA=databridge-scheduler@${PROJECT}.iam.gserviceaccount.com
+QUERY_BUCKET=${QUERY_BUCKET:-${PROJECT}-databridge-validation-queries}
 REPO_URI=https://github.com/ParkHwan/Data-Bridge.git
 # Production search is intentionally pinned to the permanent, single MFS corpus.
 : "${DATABRIDGE_SPACE:=MFS}"
@@ -28,7 +30,7 @@ REPO_URI=https://github.com/ParkHwan/Data-Bridge.git
 : "${SPACE_KEY:?Set SPACE_KEY to a dedicated key such as CONF_DEMO}"
 
 gcloud services enable run.googleapis.com secretmanager.googleapis.com \
-  cloudscheduler.googleapis.com --project "$PROJECT"
+  cloudscheduler.googleapis.com storage.googleapis.com --project "$PROJECT"
 
 # Fail before changing any Cloud Run resource. A secret reference alone is not enough:
 # the version selected by `latest` must exist and be enabled when an instance starts.
@@ -61,6 +63,9 @@ fi
 gcloud iam service-accounts describe "$BUILD_SA" --project "$PROJECT" >/dev/null 2>&1 ||
   gcloud iam service-accounts create databridge-build --project "$PROJECT" \
     --display-name "Data-Bridge CI/CD (Cloud Build)"
+gcloud iam service-accounts describe "$GENERATION_SA" --project "$PROJECT" >/dev/null 2>&1 ||
+  gcloud iam service-accounts create databridge-generation --project "$PROJECT" \
+    --display-name "Data-Bridge generation management"
 
 # 2) Minimal grants: push images, deploy the service + run the migrate job,
 #    write logs, act as the runtime SA. No roles/editor, no run.admin.
@@ -71,6 +76,13 @@ for role in roles/artifactregistry.writer roles/run.developer roles/logging.logW
 done
 gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" --project "$PROJECT" \
   --member "serviceAccount:$BUILD_SA" --role roles/iam.serviceAccountUser --format=none
+for role in roles/cloudsql.client roles/aiplatform.user; do
+  gcloud projects add-iam-policy-binding "$PROJECT" \
+    --member "serviceAccount:$GENERATION_SA" --role "$role" \
+    --condition=None --format=none
+done
+gcloud iam service-accounts add-iam-policy-binding "$GENERATION_SA" --project "$PROJECT" \
+  --member "serviceAccount:$BUILD_SA" --role roles/iam.serviceAccountUser --format=none
 
 # Secret-level access is sufficient for all four resources because they share the runtime SA.
 gcloud secrets add-iam-policy-binding DATABRIDGE_DSN --project "$PROJECT" \
@@ -79,6 +91,23 @@ gcloud secrets add-iam-policy-binding DATABRIDGE_DSN --project "$PROJECT" \
 gcloud secrets add-iam-policy-binding CONFLUENCE_API_TOKEN --project "$PROJECT" \
   --member "serviceAccount:$RUNTIME_SA" --role roles/secretmanager.secretAccessor \
   --condition=None --format=none
+gcloud secrets add-iam-policy-binding DATABRIDGE_DSN --project "$PROJECT" \
+  --member "serviceAccount:$GENERATION_SA" --role roles/secretmanager.secretAccessor \
+  --condition=None --format=none
+
+# Validation query inputs are operator-authored immutable objects. The management job
+# can only read them; it has no object creation/deletion permission. Its dedicated SA
+# separates IAM/audit identity, but intentionally shares the application's DB secret and
+# therefore does not provide DB-plane privilege separation.
+if ! gcloud storage buckets describe "gs://${QUERY_BUCKET}" \
+  --project "$PROJECT" >/dev/null 2>&1; then
+  gcloud storage buckets create "gs://${QUERY_BUCKET}" --project "$PROJECT" \
+    --location "$REGION" --uniform-bucket-level-access --public-access-prevention
+fi
+gcloud storage buckets update "gs://${QUERY_BUCKET}" --project "$PROJECT" \
+  --uniform-bucket-level-access --public-access-prevention --versioning
+gcloud storage buckets add-iam-policy-binding "gs://${QUERY_BUCKET}" \
+  --member "serviceAccount:$GENERATION_SA" --role roles/storage.objectViewer
 
 IMAGE=$(gcloud run services describe databridge --project "$PROJECT" --region "$REGION" \
   --format='value(spec.template.spec.containers[0].image)')
@@ -112,6 +141,35 @@ if gcloud run jobs describe databridge-ingest \
     --remove-env-vars DATABRIDGE_DSN \
     --update-env-vars "DATABRIDGE_EMBEDDER=vertex,DATABRIDGE_PROFILE_MODE=observe" \
     --update-secrets "DATABRIDGE_DSN=DATABRIDGE_DSN:latest"
+fi
+
+# Persistent management tool; individual lifecycle commands are one-off executions.
+# Command is an argv list so execution overrides begin with the subcommand rather than
+# repeating scripts/generation.py. The GCS mount is read-only by both IAM and volume mode.
+if ! gcloud run jobs describe databridge-generation \
+  --project "$PROJECT" --region "$REGION" >/dev/null 2>&1; then
+  gcloud run jobs create databridge-generation \
+    --project "$PROJECT" --region "$REGION" --image "$IMAGE" \
+    --command python,scripts/generation.py \
+    --set-cloudsql-instances "${PROJECT}:${REGION}:databridge-demo" \
+    --set-env-vars "DATABRIDGE_EMBEDDER=vertex,DATABRIDGE_PROFILE_MODE=observe,GOOGLE_CLOUD_PROJECT=${PROJECT},GOOGLE_CLOUD_LOCATION=${REGION}" \
+    --set-secrets "DATABRIDGE_DSN=DATABRIDGE_DSN:latest" \
+    --service-account "$GENERATION_SA" \
+    --add-volume "name=queries,type=cloud-storage,bucket=${QUERY_BUCKET},readonly=true" \
+    --add-volume-mount "volume=queries,mount-path=/queries" \
+    --max-retries 0 --tasks 1 --parallelism 1 --task-timeout 3600s
+else
+  gcloud run jobs update databridge-generation \
+    --project "$PROJECT" --region "$REGION" --image "$IMAGE" \
+    --command python,scripts/generation.py --args="" \
+    --set-cloudsql-instances "${PROJECT}:${REGION}:databridge-demo" \
+    --update-env-vars "DATABRIDGE_EMBEDDER=vertex,DATABRIDGE_PROFILE_MODE=observe,GOOGLE_CLOUD_PROJECT=${PROJECT},GOOGLE_CLOUD_LOCATION=${REGION}" \
+    --remove-env-vars DATABRIDGE_DSN \
+    --update-secrets "DATABRIDGE_DSN=DATABRIDGE_DSN:latest" \
+    --service-account "$GENERATION_SA" \
+    --add-volume "name=queries,type=cloud-storage,bucket=${QUERY_BUCKET},readonly=true" \
+    --add-volume-mount "volume=queries,mount-path=/queries" \
+    --max-retries 0 --tasks 1 --parallelism 1 --task-timeout 3600s
 fi
 
 # 4) Scheduled Confluence ingestion. The self-authored Confluence corpus must use a

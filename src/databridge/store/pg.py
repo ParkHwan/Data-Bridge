@@ -37,6 +37,8 @@ from databridge.store.exceptions import (
 from databridge.store.provenance import (
     Generation,
     GenerationChunkCount,
+    GenerationInventory,
+    GenerationSourceInventory,
     GenerationState,
     ProfileMode,
     SpaceProfileReport,
@@ -368,6 +370,56 @@ class PgVectorStore:
                 }
                 for row in cur.fetchall()
             ]
+
+    def generation_inventory(
+        self, *, space_key: str, generation_id: int
+    ) -> GenerationInventory:
+        """Inspect one generation without a state gate, profile check, or lock."""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT g.state,
+                       p.config_fingerprint,
+                       c.source_id,
+                       count(c.id) AS chunk_count,
+                       coalesce(
+                         array_agg(DISTINCT c.heading ORDER BY c.heading)
+                           FILTER (WHERE c.heading IS NOT NULL),
+                         '{}'
+                       ) AS headings,
+                       (sum(count(c.id)) OVER ())::bigint AS total_chunks
+                  FROM space_generation g
+                  JOIN embedding_profile p ON p.profile_id = g.profile_id
+                  LEFT JOIN chunks c
+                    ON c.space_key = g.space_key
+                   AND c.generation_id = g.generation_id
+                 WHERE g.space_key = %s AND g.generation_id = %s
+                 GROUP BY g.state, p.config_fingerprint, c.source_id
+                 ORDER BY c.source_id
+                """,
+                (space_key, generation_id),
+            )
+            rows = cur.fetchall()
+        if not rows:
+            raise GenerationTargetError("Inventory target was not found in this space")
+
+        sources: dict[str, GenerationSourceInventory] = {}
+        for row in rows:
+            source_id = row[2]
+            if source_id is None:
+                continue
+            sources[str(source_id)] = GenerationSourceInventory(
+                chunk_count=int(row[3]),
+                headings=tuple(str(heading) for heading in row[4]),
+            )
+        return GenerationInventory(
+            space_key=space_key,
+            generation_id=generation_id,
+            generation_state=GenerationState(str(rows[0][0])),
+            profile_fingerprint=str(rows[0][1]),
+            total_chunks=int(rows[0][5]),
+            sources=sources,
+        )
 
     def _profile_report(
         self, cur: psycopg.Cursor, *, space_key: str

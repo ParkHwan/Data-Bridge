@@ -59,6 +59,22 @@ class GenerationChunkCount:
 
 
 @dataclass(frozen=True, slots=True)
+class GenerationSourceInventory:
+    chunk_count: int
+    headings: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class GenerationInventory:
+    space_key: str
+    generation_id: int
+    generation_state: GenerationState
+    profile_fingerprint: str
+    total_chunks: int
+    sources: dict[str, GenerationSourceInventory]
+
+
+@dataclass(frozen=True, slots=True)
 class SpaceProfileReport:
     space_key: str
     active_generation_id: int | None
