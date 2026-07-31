@@ -69,11 +69,14 @@ EXPECTED_IMAGE='us-central1-docker.pkg.dev/genaiacademy-ph/cloud-run-source-depl
 SERVICE_URL=$(gcloud run services describe databridge --project "$PROJECT" --region "$REGION" \
   --format='value(status.url)')
 set -o pipefail    # required: without it a failing wrapper is masked by tee
+                   # (verified: without it, `false | tee` reports success and the chain
+                   #  continues). Re-run this whole block in any new shell.
 
 # One directory per rollout attempt. Writing evidence to fixed /tmp paths lets a failed
 # capture leave an earlier attempt's file in place, and the next check would approve it.
-EVIDENCE=$(mktemp -d "${TMPDIR:-/tmp}/databridge-rollout.XXXXXX")
-echo "EVIDENCE=$EVIDENCE"
+# Every use is ${EVIDENCE:?}, so an unset value stops the command instead of writing to /.
+EVIDENCE=$(mktemp -d "${TMPDIR:-/tmp}/databridge-rollout.XXXXXX") || EVIDENCE=""
+echo "EVIDENCE=${EVIDENCE:?could not create the evidence directory}"
 
 run_generation() { scripts/run_generation_job.sh --project "$PROJECT" --region "$REGION" "$@"; }
 preflight() { uv run python scripts/rollout_preflight.py "$@" --project "$PROJECT" --region "$REGION"; }
@@ -254,9 +257,9 @@ worse, because the old reader returns legacy and building rows together.
 ## Step 3 — Create the building generation
 
 ```bash
-run_generation create-building --space "$SPACE" | tee "$EVIDENCE/create.out"
+run_generation create-building --space "$SPACE" | tee "${EVIDENCE:?}/create.out"
 unset GENERATION
-GENERATION=$(preflight generation-id --input "$EVIDENCE/create.out")
+GENERATION=$(preflight generation-id --input "${EVIDENCE:?}/create.out")
 echo "GENERATION=${GENERATION:?STOP: no usable generation id — do not continue}"
 ```
 
@@ -315,9 +318,9 @@ generation. Discarding creates a **new** generation, so re-derive the id and run
 again before doing anything else:
 
 ```bash
-run_generation create-building --space "$SPACE" --discard-inflight | tee "$EVIDENCE/create.out"
+run_generation create-building --space "$SPACE" --discard-inflight | tee "${EVIDENCE:?}/create.out"
 unset GENERATION
-GENERATION=$(preflight generation-id --input "$EVIDENCE/create.out")
+GENERATION=$(preflight generation-id --input "${EVIDENCE:?}/create.out")
 echo "GENERATION=${GENERATION:?STOP: no usable generation id — do not continue}"    # a new id
 
 verify_ingest_scope && \
@@ -334,7 +337,7 @@ exists. Always re-read `$GENERATION` first.
 Then confirm what landed:
 
 ```bash
-run_generation inventory --space "$SPACE" --generation-id "${GENERATION:?}" | tee "$EVIDENCE/inv.out" && show_output "$EVIDENCE/inv.out"
+run_generation inventory --space "$SPACE" --generation-id "${GENERATION:?}" | tee "${EVIDENCE:?}/inv.out" && show_output "${EVIDENCE:?}/inv.out"
 ```
 
 Check the source set and per-source chunk counts against what you expect from Confluence. The
@@ -494,7 +497,7 @@ carries `space_key`, `generation_id`, `legacy_count_before`, `deleted_count`.
 Confirm:
 
 ```bash
-run_generation report --space "$SPACE" | tee "$EVIDENCE/report.out" && show_output "$EVIDENCE/report.out"
+run_generation report --space "$SPACE" | tee "${EVIDENCE:?}/report.out" && show_output "${EVIDENCE:?}/report.out"
 ```
 
 Legacy count is 0, and the active generation's count matches step 4.
@@ -532,9 +535,9 @@ strict_preflight_ok() {
     -d '{"question":"<a question you know this corpus answers>"}' >/dev/null || return 1
 
   # The active generation must be the one this rollout activated, with no legacy left.
-  run_generation report --space "$SPACE" >"$EVIDENCE/report.out" || return 1
-  show_output "$EVIDENCE/report.out" > "$EVIDENCE/report.body" || return 1
-  preflight report --input "$EVIDENCE/report.body" --expected-generation "${GENERATION:?}" || return 1
+  run_generation report --space "$SPACE" >"${EVIDENCE:?}/report.out" || return 1
+  show_output "${EVIDENCE:?}/report.out" > "${EVIDENCE:?}/report.body" || return 1
+  preflight report --input "${EVIDENCE:?}/report.body" --expected-generation "${GENERATION:?}" || return 1
   echo "strict preflight OK"
 }
 ```
@@ -596,12 +599,12 @@ long: the space serves no evidence in that window.
 
   # 3. Only now read the state, and read both views.
   run_generation inventory --space "$SPACE" --generation-id "${GENERATION:?}" \
-      | tee "$EVIDENCE/inv.out" \
-    && show_output "$EVIDENCE/inv.out" > "$EVIDENCE/inv.body" \
-    && run_generation report --space "$SPACE" | tee "$EVIDENCE/report.out" \
-    && show_output "$EVIDENCE/report.out" > "$EVIDENCE/report.body" \
+      | tee "${EVIDENCE:?}/inv.out" \
+    && show_output "${EVIDENCE:?}/inv.out" > "${EVIDENCE:?}/inv.body" \
+    && run_generation report --space "$SPACE" | tee "${EVIDENCE:?}/report.out" \
+    && show_output "${EVIDENCE:?}/report.out" > "${EVIDENCE:?}/report.body" \
     && preflight rollback-safe \
-         --inventory "$EVIDENCE/inv.body" --report "$EVIDENCE/report.body" \
+         --inventory "${EVIDENCE:?}/inv.body" --report "${EVIDENCE:?}/report.body" \
     && gcloud run services update-traffic databridge \
          --project "$PROJECT" --region "$REGION" \
          --to-revisions "${ROLLBACK_REVISION:?}=100"
