@@ -12,6 +12,7 @@ from databridge.embed import EmbeddingProfile
 
 class GenerationState(StrEnum):
     BUILDING = "building"
+    SEALED = "sealed"
     ACTIVE = "active"
     RETIRED = "retired"
 
@@ -69,6 +70,7 @@ class SpaceProfileReport:
     stored_fingerprint: str | None
     runtime_fingerprint: str
     fingerprint_matches: bool | None
+    sealed_generation_exists: bool
 
 
 def profile_id_for(profile: EmbeddingProfile) -> str:

@@ -17,7 +17,7 @@ Space isolation is a plain ``WHERE space_key = %s``.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import resources
@@ -25,10 +25,15 @@ from typing import Any
 
 import psycopg
 from pgvector.psycopg import register_vector
+from psycopg.types.json import Jsonb
 
 from databridge.embed.base import EMBEDDING_DIM, EmbeddingProfile
 from databridge.ingest.chunker import Chunk
-from databridge.store.exceptions import EmbeddingProfileMismatchError
+from databridge.store.exceptions import (
+    EmbeddingProfileMismatchError,
+    GenerationConcurrencyError,
+    GenerationTargetError,
+)
 from databridge.store.provenance import (
     Generation,
     GenerationChunkCount,
@@ -54,6 +59,22 @@ class SearchHit:
     rrf_score: float | None = None
     fts_rank: int | None = None
     trgm_rank: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _GenerationSearchHit:
+    generation_id: int
+    chunk_id: str
+    source_id: str
+    space_key: str
+    title: str
+    heading: str | None
+    breadcrumb: str | None
+    content: str
+    distance: float
+    rrf_score: float
+    fts_rank: int | None
+    trgm_rank: int | None
 
 
 class PgVectorStore:
@@ -310,6 +331,44 @@ class PgVectorStore:
         with self._connect() as conn, conn.cursor() as cur:
             return self._profile_report(cur, space_key=space_key)
 
+    def generation_report(self, *, space_key: str) -> list[dict[str, object]]:
+        """Return generation and manifest state for operator-facing CLI output."""
+        self._require_profile()
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT g.generation_id, g.state, g.created_at, g.activated_at,
+                       count(c.id), m.state, m.revision, m.page_count,
+                       m.skipped_pages, m.suppressed_pages
+                  FROM space_generation g
+                  LEFT JOIN chunks c
+                    ON c.space_key = g.space_key AND c.generation_id = g.generation_id
+                  LEFT JOIN generation_manifest m
+                    ON m.space_key = g.space_key AND m.generation_id = g.generation_id
+                 WHERE g.space_key = %s
+                 GROUP BY g.generation_id, g.state, g.created_at, g.activated_at,
+                          m.state, m.revision, m.page_count,
+                          m.skipped_pages, m.suppressed_pages
+                 ORDER BY g.generation_id
+                """,
+                (space_key,),
+            )
+            return [
+                {
+                    "generation_id": int(row[0]),
+                    "state": str(row[1]),
+                    "created_at": row[2],
+                    "activated_at": row[3],
+                    "chunk_count": int(row[4]),
+                    "manifest_state": row[5],
+                    "manifest_revision": row[6],
+                    "page_count": row[7],
+                    "skipped_pages": row[8],
+                    "suppressed_pages": row[9],
+                }
+                for row in cur.fetchall()
+            ]
+
     def _profile_report(
         self, cur: psycopg.Cursor, *, space_key: str
     ) -> SpaceProfileReport:
@@ -375,6 +434,9 @@ class PgVectorStore:
                 if stored_fingerprint is None
                 else stored_fingerprint == profile.config_fingerprint
             ),
+            sealed_generation_exists=any(
+                item.state is GenerationState.SEALED for item in counts
+            ),
         )
 
     @staticmethod
@@ -392,7 +454,13 @@ class PgVectorStore:
         generation_id: int | None,
         allow_empty_bootstrap: bool,
     ) -> Generation:
-        """Resolve and validate a write target while the space xact lock is held."""
+        """Resolve and validate a write target while the space xact lock is held.
+
+        A batch commits each source mutation separately. If another path activates a
+        build between those transactions, the fixed batch target becomes ``retired``;
+        this fresh ``FOR UPDATE`` read rejects the next mutation and deliberately
+        leaves the already-begun manifest ``in_progress`` (fail closed).
+        """
         profile = self._require_profile()
         if generation_id is not None:
             generation = self._get_generation(
@@ -406,9 +474,10 @@ class PgVectorStore:
                     "Target embedding generation does not exist in this space"
                 )
             self._assert_matching_profile(generation, profile)
-            if generation.state is not GenerationState.BUILDING:
-                raise EmbeddingProfileMismatchError(
-                    "Explicit write target must be a building generation"
+            if generation.state not in (GenerationState.BUILDING, GenerationState.ACTIVE):
+                raise GenerationTargetError(
+                    f"Explicit write target is {generation.state.value}; "
+                    "sealed and retired generations reject mutations"
                 )
             return generation
 
@@ -467,9 +536,14 @@ class PgVectorStore:
             generation = self._get_generation(
                 cur, space_key=space_key, generation_id=generation_id
             )
-            if generation is None or generation.state is not GenerationState.BUILDING:
-                raise EmbeddingProfileMismatchError(
-                    "Explicit batch target must be a building generation in this space"
+            if generation is None:
+                raise GenerationTargetError(
+                    "Explicit batch target was not found in this space"
+                )
+            if generation.state not in (GenerationState.BUILDING, GenerationState.ACTIVE):
+                raise GenerationTargetError(
+                    f"Explicit batch target is {generation.state.value}; "
+                    "sealed and retired generations are not batch targets"
                 )
         self._assert_matching_profile(generation, profile)
         return generation
@@ -504,12 +578,95 @@ class PgVectorStore:
         logger.warning("No active embedding generation observed for populated space=%s", space_key)
         return None
 
-    def create_building_generation(self, *, space_key: str) -> Generation:
-        """Create an inactive generation for an explicit clean rebuild."""
+    @staticmethod
+    def _set_lock_timeout(cur: psycopg.Cursor) -> None:
+        cur.execute("SET LOCAL lock_timeout = '30s'")
+
+    def create_building_generation(
+        self, *, space_key: str, discard_inflight: bool = False
+    ) -> Generation:
+        """Create or reuse the one in-flight generation for a space."""
+        generation, _ = self.create_building_generation_with_status(
+            space_key=space_key, discard_inflight=discard_inflight
+        )
+        return generation
+
+    def create_building_generation_with_status(
+        self, *, space_key: str, discard_inflight: bool = False
+    ) -> tuple[Generation, str]:
+        """Return the in-flight generation and ``created``/``reused`` status."""
         profile = self._require_profile()
         with self._connect() as conn, conn.cursor() as cur:
             self._lock_space_for_update(cur, space_key)
             profile_id = self._ensure_profile(cur, profile)
+            cur.execute(
+                """
+                SELECT generation_id
+                  FROM space_generation
+                 WHERE space_key = %s AND state IN ('building', 'sealed')
+                 FOR UPDATE
+                """,
+                (space_key,),
+            )
+            rows = cur.fetchall()
+            if len(rows) > 1:
+                ids = ",".join(str(row[0]) for row in rows)
+                raise GenerationTargetError(
+                    f"Duplicate in-flight generations for {space_key}: {ids}"
+                )
+            inflight = (
+                None
+                if not rows
+                else self._get_generation(
+                    cur,
+                    space_key=space_key,
+                    generation_id=int(rows[0][0]),
+                    for_update=True,
+                )
+            )
+            if inflight is not None and discard_inflight:
+                if inflight.state not in (
+                    GenerationState.BUILDING,
+                    GenerationState.SEALED,
+                ):
+                    raise GenerationTargetError(
+                        "Discard target must be building or sealed, got "
+                        f"{inflight.state.value}"
+                    )
+                # Destructive cleanup is deliberately visible and ordered: the audit
+                # receipt is removed only through this explicit operator command.
+                params = (space_key, inflight.generation_id)
+                cur.execute(
+                    "DELETE FROM generation_validation "
+                    "WHERE space_key = %s AND generation_id = %s",
+                    params,
+                )
+                cur.execute(
+                    "DELETE FROM generation_manifest "
+                    "WHERE space_key = %s AND generation_id = %s",
+                    params,
+                )
+                cur.execute(
+                    "DELETE FROM chunks WHERE space_key = %s AND generation_id = %s",
+                    params,
+                )
+                cur.execute(
+                    "DELETE FROM space_generation "
+                    "WHERE space_key = %s AND generation_id = %s "
+                    "AND state IN ('building', 'sealed')",
+                    params,
+                )
+                if cur.rowcount != 1:
+                    raise GenerationTargetError("In-flight generation changed before discard")
+                inflight = None
+            elif inflight is not None:
+                if inflight.state is GenerationState.SEALED:
+                    raise GenerationTargetError(
+                        "In-flight generation is sealed; use --discard-inflight to replace it"
+                    )
+                self._assert_matching_profile(inflight, profile)
+                return inflight, "reused"
+
             cur.execute(
                 """
                 INSERT INTO space_generation (space_key, profile_id, state)
@@ -529,12 +686,165 @@ class PgVectorStore:
             )
             if generation is None:
                 raise RuntimeError("Created embedding generation could not be read back")
+            return generation, "created"
+
+    def resolve_batch_target(
+        self, *, space_key: str, generation_id: int | None
+    ) -> Generation:
+        """Resolve one immutable target before a batch starts mutating storage."""
+        profile = self._require_profile()
+        with self._connect() as conn, conn.cursor() as cur:
+            self._lock_space_for_update(cur, space_key)
+            if generation_id is None:
+                return self._resolve_write_generation(
+                    cur,
+                    space_key=space_key,
+                    generation_id=None,
+                    allow_empty_bootstrap=True,
+                )
+            generation = self._get_generation(
+                cur,
+                space_key=space_key,
+                generation_id=generation_id,
+                for_update=True,
+            )
+            if generation is None:
+                raise GenerationTargetError("Batch target was not found in this space")
+            self._assert_matching_profile(generation, profile)
+            if generation.state is not GenerationState.BUILDING:
+                raise GenerationTargetError(
+                    f"Explicit batch target must be building, got {generation.state.value}"
+                )
             return generation
+
+    def _assert_manifest_target(
+        self, cur: psycopg.Cursor, *, space_key: str, generation_id: int
+    ) -> Generation:
+        generation = self._get_generation(
+            cur,
+            space_key=space_key,
+            generation_id=generation_id,
+            for_update=True,
+        )
+        if generation is None:
+            raise GenerationTargetError("Manifest target was not found in this space")
+        if generation.state not in (GenerationState.BUILDING, GenerationState.ACTIVE):
+            raise GenerationTargetError(
+                f"Manifest target is {generation.state.value}; expected building or active"
+            )
+        self._assert_matching_profile(generation, self._require_profile())
+        return generation
+
+    def begin_manifest(self, *, space_key: str, generation_id: int) -> int:
+        """Invalidate the prior manifest and atomically advance its execution revision."""
+        with self._connect() as conn, conn.cursor() as cur:
+            self._set_lock_timeout(cur)
+            self._lock_space_for_update(cur, space_key)
+            self._assert_manifest_target(
+                cur, space_key=space_key, generation_id=generation_id
+            )
+            cur.execute(
+                """
+                INSERT INTO generation_manifest
+                    (space_key, generation_id, state)
+                VALUES (%s, %s, 'in_progress')
+                ON CONFLICT (space_key, generation_id) DO UPDATE
+                   SET state = 'in_progress',
+                       revision = generation_manifest.revision + 1,
+                       source_counts = '{}'::jsonb,
+                       total_chunks = NULL,
+                       started_at = now(),
+                       completed_at = NULL
+                RETURNING revision
+                """,
+                (space_key, generation_id),
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise RuntimeError("Manifest begin did not return a revision")
+            return int(row[0])
+
+    def finalize_manifest(
+        self,
+        *,
+        space_key: str,
+        generation_id: int,
+        source_counts: Mapping[str, int],
+        total_chunks: int,
+        page_count: int,
+        skipped_pages: int,
+        suppressed_pages: int,
+    ) -> None:
+        """Complete only a manifest execution that was explicitly begun."""
+        with self._connect() as conn, conn.cursor() as cur:
+            self._set_lock_timeout(cur)
+            self._lock_space_for_update(cur, space_key)
+            self._assert_manifest_target(
+                cur, space_key=space_key, generation_id=generation_id
+            )
+            cur.execute(
+                """
+                UPDATE generation_manifest
+                   SET state = 'complete', source_counts = %s, total_chunks = %s,
+                       page_count = %s, skipped_pages = %s, suppressed_pages = %s,
+                       completed_at = now()
+                 WHERE space_key = %s AND generation_id = %s AND state = 'in_progress'
+                """,
+                (
+                    Jsonb(dict(source_counts)),
+                    total_chunks,
+                    page_count,
+                    skipped_pages,
+                    suppressed_pages,
+                    space_key,
+                    generation_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise GenerationTargetError(
+                    "Manifest finalize requires one preceding in_progress manifest"
+                )
+
+    @staticmethod
+    def generation_checksum(
+        cur: psycopg.Cursor, *, space_key: str, generation_id: int
+    ) -> tuple[str, int]:
+        """Hash one generation for same-database TOCTOU comparisons.
+
+        ``embedding::text`` is deliberately database-version-local; this is not a
+        portable content hash and is compared only within one rollout on one database.
+        """
+        cur.execute(
+            """
+            SELECT encode(
+                       sha256(convert_to(
+                           count(*)::text || ':' || coalesce(string_agg(
+                               md5(chunk_id) || md5(source_id) || md5(title)
+                               || coalesce(md5(heading), 'NULL')
+                               || coalesce(md5(breadcrumb), 'NULL')
+                               || md5(content) || md5(embedding::text),
+                               '' ORDER BY chunk_id
+                           ), ''),
+                           'UTF8'
+                       )),
+                       'hex'
+                   ),
+                   count(*)
+              FROM chunks
+             WHERE space_key = %s AND generation_id = %s
+            """,
+            (space_key, generation_id),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise RuntimeError("Generation checksum query returned no row")
+        return str(row[0]), int(row[1])
 
     def activate_generation(self, *, space_key: str, generation_id: int) -> Generation:
         """Atomically retire the current generation and activate a verified build."""
         profile = self._require_profile()
         with self._connect() as conn, conn.cursor() as cur:
+            self._set_lock_timeout(cur)
             self._lock_space_for_update(cur, space_key)
             target = self._get_generation(
                 cur,
@@ -542,11 +852,40 @@ class PgVectorStore:
                 generation_id=generation_id,
                 for_update=True,
             )
-            if target is None or target.state is not GenerationState.BUILDING:
-                raise EmbeddingProfileMismatchError(
-                    "Only a building generation in this space can be activated"
+            if target is None:
+                raise GenerationTargetError("Activation target was not found in this space")
+            if target.state is not GenerationState.SEALED:
+                raise GenerationTargetError(
+                    f"Activation target must be sealed, got {target.state.value}"
                 )
             self._assert_matching_profile(target, profile)
+            checksum, _ = self.generation_checksum(
+                cur, space_key=space_key, generation_id=generation_id
+            )
+            cur.execute(
+                """
+                SELECT v.checksum, v.manifest_revision, m.revision
+                  FROM generation_validation v
+                  JOIN generation_manifest m
+                    ON m.space_key = v.space_key
+                   AND m.generation_id = v.generation_id
+                 WHERE v.space_key = %s AND v.generation_id = %s
+                """,
+                (space_key, generation_id),
+            )
+            receipt = cur.fetchone()
+            if receipt is None:
+                raise GenerationConcurrencyError(
+                    "Sealed generation has no validation receipt or manifest"
+                )
+            if str(receipt[0]) != checksum:
+                raise GenerationConcurrencyError(
+                    "Generation content changed after validation"
+                )
+            if int(receipt[1]) != int(receipt[2]):
+                raise GenerationConcurrencyError(
+                    "Manifest revision changed after validation"
+                )
             cur.execute(
                 """
                 UPDATE space_generation
@@ -559,12 +898,14 @@ class PgVectorStore:
                 """
                 UPDATE space_generation
                    SET state = 'active', activated_at = now()
-                 WHERE space_key = %s AND generation_id = %s AND state = 'building'
+                 WHERE space_key = %s AND generation_id = %s AND state = 'sealed'
                 """,
                 (space_key, generation_id),
             )
             if cur.rowcount != 1:
-                raise RuntimeError("Embedding generation activation did not update one row")
+                raise GenerationConcurrencyError(
+                    "Embedding generation activation did not update one sealed row"
+                )
             activated = self._get_generation(
                 cur,
                 space_key=space_key,
@@ -707,6 +1048,72 @@ class PgVectorStore:
         if not 0.0 <= trgm_threshold <= 1.0:
             msg = f"trgm_threshold must be in [0, 1], got {trgm_threshold}"
             raise ValueError(msg)
+        with self._connect() as conn, conn.cursor() as cur:
+            generation = self._resolve_search_generation(cur, space_key=space_key)
+            if generation is None:
+                return []
+            generation_hits = self._search_hybrid_in_generation(
+                cur,
+                space_key=space_key,
+                generation_id=generation.generation_id,
+                query_embedding=query_embedding,
+                query_text=query_text,
+                top_k=top_k,
+                candidate_k=candidate_k,
+                rrf_k=rrf_k,
+                trgm_threshold=trgm_threshold,
+            )
+        return [
+            SearchHit(
+                chunk_id=hit.chunk_id,
+                source_id=hit.source_id,
+                space_key=hit.space_key,
+                title=hit.title,
+                heading=hit.heading,
+                breadcrumb=hit.breadcrumb,
+                content=hit.content,
+                distance=hit.distance,
+                rrf_score=hit.rrf_score,
+                fts_rank=hit.fts_rank,
+                trgm_rank=hit.trgm_rank,
+            )
+            for hit in generation_hits
+        ]
+
+    def _search_hybrid_in_generation(
+        self,
+        cur: psycopg.Cursor,
+        *,
+        space_key: str,
+        generation_id: int,
+        query_embedding: list[float],
+        query_text: str,
+        top_k: int,
+        candidate_k: int,
+        rrf_k: int,
+        trgm_threshold: float,
+    ) -> list[_GenerationSearchHit]:
+        """Run the production RRF body against an explicit generation.
+
+        This primitive intentionally has no generation-state gate. Production resolves
+        an active generation before calling it; validation supplies a building ID and
+        performs its state/TOCTOU checks in T1 and T2.
+        """
+        if len(query_embedding) != EMBEDDING_DIM:
+            msg = f"query embedding dimension {len(query_embedding)} != {EMBEDDING_DIM}"
+            raise ValueError(msg)
+        if top_k < 1:
+            msg = f"top_k must be >= 1, got {top_k}"
+            raise ValueError(msg)
+        if candidate_k < top_k:
+            msg = f"candidate_k must be >= top_k, got {candidate_k} < {top_k}"
+            raise ValueError(msg)
+        if rrf_k <= 0:
+            msg = f"rrf_k must be > 0, got {rrf_k}"
+            raise ValueError(msg)
+        if not 0.0 <= trgm_threshold <= 1.0:
+            msg = f"trgm_threshold must be in [0, 1], got {trgm_threshold}"
+            raise ValueError(msg)
 
         space_filter = "AND space_key = %(space)s AND generation_id = %(generation)s"
         # Candidate rank feeds straight into RRF scoring, so tie order must be
@@ -716,7 +1123,7 @@ class PgVectorStore:
         # breaks every tie stably.
         vector_sql = f"""
             SELECT chunk_id, source_id, space_key, title, heading, breadcrumb, content,
-                   embedding <=> %(query)s::vector AS distance
+                   generation_id, embedding <=> %(query)s::vector AS distance
             FROM chunks
             WHERE TRUE {space_filter}
             ORDER BY distance, space_key, chunk_id
@@ -724,7 +1131,7 @@ class PgVectorStore:
         """
         fts_sql = f"""
             SELECT chunk_id, source_id, space_key, title, heading, breadcrumb, content,
-                   embedding <=> %(query)s::vector AS distance,
+                   generation_id, embedding <=> %(query)s::vector AS distance,
                    ts_rank_cd(
                        content_tsv, websearch_to_tsquery('english', %(query_text)s)
                    ) AS text_score
@@ -741,7 +1148,7 @@ class PgVectorStore:
         # degrade to empty when nothing is similar enough.
         trgm_sql = f"""
             SELECT chunk_id, source_id, space_key, title, heading, breadcrumb, content,
-                   embedding <=> %(query)s::vector AS distance,
+                   generation_id, embedding <=> %(query)s::vector AS distance,
                    word_similarity(%(query_text)s, content) AS trgm_score
             FROM chunks
             WHERE %(query_text)s <%% content
@@ -749,30 +1156,25 @@ class PgVectorStore:
             ORDER BY trgm_score DESC, space_key, chunk_id
             LIMIT %(candidate_k)s
         """
-        with self._connect() as conn, conn.cursor() as cur:
-            generation = self._resolve_search_generation(cur, space_key=space_key)
-            if generation is None:
-                return []
-            params: dict[str, object] = {
-                "query": query_embedding,
-                "query_text": query_text,
-                "candidate_k": candidate_k,
-                "space": space_key,
-                "generation": generation.generation_id,
-            }
-            cur.execute(vector_sql, params)
-            vector_rows = cur.fetchall()
-            cur.execute(fts_sql, params)
-            fts_rows = cur.fetchall()
-            # SET does not accept bind parameters; set_config() does (text value).
-            # is_local=true scopes the GUC to this transaction so it cannot leak to a
-            # later query if the connection is ever pooled.
-            cur.execute(
-                "SELECT set_config('pg_trgm.word_similarity_threshold', %s, true)",
-                (str(trgm_threshold),),
-            )
-            cur.execute(trgm_sql, params)
-            trgm_rows = cur.fetchall()
+        params: dict[str, object] = {
+            "query": query_embedding,
+            "query_text": query_text,
+            "candidate_k": candidate_k,
+            "space": space_key,
+            "generation": generation_id,
+        }
+        cur.execute(vector_sql, params)
+        vector_rows = cur.fetchall()
+        cur.execute(fts_sql, params)
+        fts_rows = cur.fetchall()
+        # SET does not accept bind parameters; set_config() does (text value).
+        # is_local=true scopes the GUC to this transaction.
+        cur.execute(
+            "SELECT set_config('pg_trgm.word_similarity_threshold', %s, true)",
+            (str(trgm_threshold),),
+        )
+        cur.execute(trgm_sql, params)
+        trgm_rows = cur.fetchall()
 
         # chunk_id is only unique within a space (the table has a composite PK).
         # Keep both parts internally so unfiltered searches do not collapse rows.
@@ -801,16 +1203,17 @@ class PgVectorStore:
         scored.sort(
             key=lambda item: (
                 -item[0],
-                float(rows_by_key[item[1]][7]),
+                float(rows_by_key[item[1]][8]),
                 item[1],
             )
         )
 
-        hits: list[SearchHit] = []
+        hits: list[_GenerationSearchHit] = []
         for score, candidate_key in scored[:top_k]:
             row = rows_by_key[candidate_key]
             hits.append(
-                SearchHit(
+                _GenerationSearchHit(
+                    generation_id=int(row[7]),
                     chunk_id=row[0],
                     source_id=row[1],
                     space_key=row[2],
@@ -818,7 +1221,7 @@ class PgVectorStore:
                     heading=row[4],
                     breadcrumb=row[5],
                     content=row[6],
-                    distance=float(row[7]),
+                    distance=float(row[8]),
                     rrf_score=score,
                     fts_rank=fts_ranks.get(candidate_key),
                     trgm_rank=trgm_ranks.get(candidate_key),

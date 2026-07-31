@@ -31,6 +31,7 @@ from databridge.confluence.parser import ADFParser
 from databridge.embed import HashedEmbedder
 from databridge.ingest.chunker import Chunk, chunk_document
 from databridge.store import (
+    Generation,
     GenerationChunkCount,
     GenerationState,
     SpaceProfileReport,
@@ -636,6 +637,24 @@ class _BatchStore:
         self.events: list[str] = []
         self.generation_ids: list[int | None] = []
 
+    def resolve_batch_target(
+        self, *, space_key: str, generation_id: int | None
+    ) -> Generation:
+        assert space_key == "CONF_DEMO"
+        target_id = generation_id or 41
+        self.events.append(f"resolve:{target_id}")
+        return Generation(
+            generation_id=target_id,
+            space_key=space_key,
+            profile=HashedEmbedder().profile,
+            state=GenerationState.BUILDING if generation_id else GenerationState.ACTIVE,
+        )
+
+    def begin_manifest(self, *, space_key: str, generation_id: int) -> int:
+        assert space_key == "CONF_DEMO"
+        self.events.append(f"begin:{generation_id}")
+        return 1
+
     @contextmanager
     def advisory_lock(self, key: str) -> Iterator[bool]:
         self.events.append(f"lock:{key}")
@@ -697,7 +716,25 @@ class _BatchStore:
             stored_fingerprint=profile.config_fingerprint,
             runtime_fingerprint=profile.config_fingerprint,
             fingerprint_matches=True,
+            sealed_generation_exists=False,
         )
+
+    def finalize_manifest(
+        self,
+        *,
+        space_key: str,
+        generation_id: int,
+        source_counts: dict[str, int],
+        total_chunks: int,
+        page_count: int,
+        skipped_pages: int,
+        suppressed_pages: int,
+    ) -> None:
+        assert space_key == "CONF_DEMO"
+        assert total_chunks == sum(source_counts.values())
+        assert page_count == len(source_counts)
+        assert skipped_pages >= 0 and suppressed_pages >= 0
+        self.events.append(f"finalize:{generation_id}")
 
 
 @pytest.mark.asyncio
@@ -712,7 +749,16 @@ async def test_batch_replaces_all_pages_before_safe_gc() -> None:
     )
     assert result.pages == 2
     assert result.vertex_calls == 2
-    assert store.events[1:] == ["replace:p1", "replace:p2", "list", "delete:stale", "unlock"]
+    assert store.events[1:] == [
+        "resolve:41",
+        "begin:41",
+        "replace:p1",
+        "replace:p2",
+        "list",
+        "delete:stale",
+        "finalize:41",
+        "unlock",
+    ]
 
 
 @pytest.mark.asyncio
@@ -746,7 +792,14 @@ async def test_batch_skips_empty_page_and_ingests_remaining_pages() -> None:
     )
     assert result.pages == 1
     assert result.skipped_pages == 1
-    assert store.events[1:] == ["replace:p1", "list", "unlock"]
+    assert store.events[1:] == [
+        "resolve:41",
+        "begin:41",
+        "replace:p1",
+        "list",
+        "finalize:41",
+        "unlock",
+    ]
 
 
 @pytest.mark.asyncio
@@ -780,7 +833,15 @@ async def test_batch_suppresses_children_only_page_and_garbage_collects_old_chun
     assert result.pages == 1
     assert result.skipped_pages == 0
     assert result.suppressed_pages == 1
-    assert store.events[1:] == ["replace:p1", "list", "delete:container", "unlock"]
+    assert store.events[1:] == [
+        "resolve:41",
+        "begin:41",
+        "replace:p1",
+        "list",
+        "delete:container",
+        "finalize:41",
+        "unlock",
+    ]
 
 
 @pytest.mark.asyncio
@@ -851,6 +912,8 @@ async def test_batch_store_failure_does_not_enter_gc_phase() -> None:
         )
     assert store.events == [
         "lock:databridge:confluence:CONF_DEMO:folder-1",
+        "resolve:41",
+        "begin:41",
         "replace:p1",
         "replace:p2",
         "unlock",

@@ -18,6 +18,7 @@ from databridge.ingest.markdown import SourceDocument
 from databridge.store import (
     EmbeddingProfileMismatchError,
     GenerationState,
+    GenerationTargetError,
     PgVectorStore,
     ProfileMode,
 )
@@ -106,6 +107,77 @@ def _replace(
         embeddings=embedder.embed([c.embedding_text for c in chunks]),
         generation_id=generation_id,
     )
+
+
+def _seal_for_activation(
+    store: PgVectorStore, *, space_key: str, generation_id: int
+) -> None:
+    source_ids = store.list_source_ids(space_key=space_key, generation_id=generation_id)
+    with psycopg.connect(DSN) as conn:
+        counts = {
+            str(row[0]): int(row[1])
+            for row in conn.execute(
+                """
+                SELECT source_id, count(*)
+                  FROM chunks
+                 WHERE space_key = %s AND generation_id = %s
+                 GROUP BY source_id
+                """,
+                (space_key, generation_id),
+            ).fetchall()
+        }
+    assert set(counts) == source_ids
+    store.begin_manifest(space_key=space_key, generation_id=generation_id)
+    store.finalize_manifest(
+        space_key=space_key,
+        generation_id=generation_id,
+        source_counts=counts,
+        total_chunks=sum(counts.values()),
+        page_count=len(counts),
+        skipped_pages=0,
+        suppressed_pages=0,
+    )
+    with store._connect() as conn, conn.cursor() as cur:
+        store._lock_space_for_update(cur, space_key)
+        checksum, chunk_count = store.generation_checksum(
+            cur, space_key=space_key, generation_id=generation_id
+        )
+        row = cur.execute(
+            """
+            SELECT g.profile_id, m.revision
+              FROM space_generation g
+              JOIN generation_manifest m
+                ON m.space_key = g.space_key AND m.generation_id = g.generation_id
+             WHERE g.space_key = %s AND g.generation_id = %s
+            """,
+            (space_key, generation_id),
+        ).fetchone()
+        assert row is not None
+        cur.execute(
+            """
+            INSERT INTO generation_validation
+                (space_key, generation_id, checksum, chunk_count, manifest_revision,
+                 profile_id, query_file_sha256, query_count, validator_version)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 5, 'test')
+            """,
+            (
+                space_key,
+                generation_id,
+                checksum,
+                chunk_count,
+                int(row[1]),
+                str(row[0]),
+                "0" * 64,
+            ),
+        )
+        cur.execute(
+            """
+            UPDATE space_generation SET state = 'sealed'
+             WHERE space_key = %s AND generation_id = %s AND state = 'building'
+            """,
+            (space_key, generation_id),
+        )
+        assert cur.rowcount == 1
 
 
 def test_upsert_search_and_space_isolation() -> None:
@@ -435,6 +507,10 @@ def test_generation_build_is_isolated_until_atomic_activation() -> None:
         embedder.embed(["content"])[0], space_key=space
     )[0].content
 
+    _seal_for_activation(
+        store, space_key=space, generation_id=building.generation_id
+    )
+
     activated = store.activate_generation(
         space_key=space, generation_id=building.generation_id
     )
@@ -479,7 +555,7 @@ def test_failed_activation_preserves_existing_active_pointer() -> None:
     _replace(store, HashedEmbedder(), _doc("active", space, "active"))
     active_before = store.profile_report(space_key=space).active_generation_id
 
-    with pytest.raises(EmbeddingProfileMismatchError):
+    with pytest.raises(GenerationTargetError):
         store.activate_generation(space_key=space, generation_id=9_223_372_036_854_775_000)
 
     assert store.profile_report(space_key=space).active_generation_id == active_before
@@ -531,6 +607,15 @@ def test_writer_activation_race_is_serialized() -> None:
     space = _unique_space("ACTIVATION_RACE")
     _replace(store, embedder, _doc("old", space, "old"))
     building = store.create_building_generation(space_key=space)
+    _replace(
+        store,
+        embedder,
+        _doc("new", space, "new"),
+        generation_id=building.generation_id,
+    )
+    _seal_for_activation(
+        store, space_key=space, generation_id=building.generation_id
+    )
     barrier = threading.Barrier(2)
 
     def write() -> str:
@@ -542,7 +627,7 @@ def test_writer_activation_race_is_serialized() -> None:
                 _doc("racing", space, "racing"),
                 generation_id=building.generation_id,
             )
-        except EmbeddingProfileMismatchError:
+        except GenerationTargetError:
             return "activation-won"
         return "writer-won"
 
