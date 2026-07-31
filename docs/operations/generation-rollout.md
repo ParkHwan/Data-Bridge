@@ -70,6 +70,11 @@ SERVICE_URL=$(gcloud run services describe databridge --project "$PROJECT" --reg
   --format='value(status.url)')
 set -o pipefail    # required: without it a failing wrapper is masked by tee
 
+# One directory per rollout attempt. Writing evidence to fixed /tmp paths lets a failed
+# capture leave an earlier attempt's file in place, and the next check would approve it.
+EVIDENCE=$(mktemp -d "${TMPDIR:-/tmp}/databridge-rollout.XXXXXX")
+echo "EVIDENCE=$EVIDENCE"
+
 run_generation() { scripts/run_generation_job.sh --project "$PROJECT" --region "$REGION" "$@"; }
 preflight() { uv run python scripts/rollout_preflight.py "$@" --project "$PROJECT" --region "$REGION"; }
 
@@ -226,15 +231,14 @@ job images drift silently. Check digests rather than assuming.
 ```bash
 images_aligned_ok() { preflight images --expected-image "${EXPECTED_IMAGE:?}"; }
 
-# Capture what is serving *before* the move. After it, this is unrecoverable from the
-# service, and the interrupted-rollback path below needs it by name.
-ROLLBACK_REVISION=$(gcloud run services describe databridge \
-  --project "$PROJECT" --region "$REGION" \
-  --format='value(status.traffic[0].revisionName)')
-echo "ROLLBACK_REVISION=${ROLLBACK_REVISION:?could not read the serving revision}"
-
-preconditions_ok && recovery_accepted_ok && scheduler_paused_ok && images_aligned_ok && \
-gcloud run services update-traffic databridge --project "$PROJECT" --region "$REGION" --to-latest
+# Capture what is serving *before* the move; afterwards the service cannot tell you.
+# preflight serving-revision refuses a split or tagged allocation rather than naming
+# whichever entry happens to come first, and the move is chained onto it.
+ROLLBACK_REVISION=$(preflight serving-revision) \
+  && echo "ROLLBACK_REVISION=${ROLLBACK_REVISION:?}" \
+  && preconditions_ok && recovery_accepted_ok && scheduler_paused_ok && images_aligned_ok \
+  && gcloud run services update-traffic databridge \
+       --project "$PROJECT" --region "$REGION" --to-latest
 ```
 
 A job left on the old image writes with old schema assumptions and fails against the migrated
@@ -250,9 +254,9 @@ worse, because the old reader returns legacy and building rows together.
 ## Step 3 — Create the building generation
 
 ```bash
-run_generation create-building --space "$SPACE" | tee /tmp/create.out
+run_generation create-building --space "$SPACE" | tee "$EVIDENCE/create.out"
 unset GENERATION
-GENERATION=$(preflight generation-id --input /tmp/create.out)
+GENERATION=$(preflight generation-id --input "$EVIDENCE/create.out")
 echo "GENERATION=${GENERATION:?STOP: no usable generation id — do not continue}"
 ```
 
@@ -311,9 +315,9 @@ generation. Discarding creates a **new** generation, so re-derive the id and run
 again before doing anything else:
 
 ```bash
-run_generation create-building --space "$SPACE" --discard-inflight | tee /tmp/create.out
+run_generation create-building --space "$SPACE" --discard-inflight | tee "$EVIDENCE/create.out"
 unset GENERATION
-GENERATION=$(preflight generation-id --input /tmp/create.out)
+GENERATION=$(preflight generation-id --input "$EVIDENCE/create.out")
 echo "GENERATION=${GENERATION:?STOP: no usable generation id — do not continue}"    # a new id
 
 verify_ingest_scope && \
@@ -330,7 +334,7 @@ exists. Always re-read `$GENERATION` first.
 Then confirm what landed:
 
 ```bash
-run_generation inventory --space "$SPACE" --generation-id "${GENERATION:?}" | tee /tmp/inv.out && show_output /tmp/inv.out
+run_generation inventory --space "$SPACE" --generation-id "${GENERATION:?}" | tee "$EVIDENCE/inv.out" && show_output "$EVIDENCE/inv.out"
 ```
 
 Check the source set and per-source chunk counts against what you expect from Confluence. The
@@ -490,7 +494,7 @@ carries `space_key`, `generation_id`, `legacy_count_before`, `deleted_count`.
 Confirm:
 
 ```bash
-run_generation report --space "$SPACE" | tee /tmp/report.out && show_output /tmp/report.out
+run_generation report --space "$SPACE" | tee "$EVIDENCE/report.out" && show_output "$EVIDENCE/report.out"
 ```
 
 Legacy count is 0, and the active generation's count matches step 4.
@@ -528,9 +532,9 @@ strict_preflight_ok() {
     -d '{"question":"<a question you know this corpus answers>"}' >/dev/null || return 1
 
   # The active generation must be the one this rollout activated, with no legacy left.
-  run_generation report --space "$SPACE" >/tmp/report.out || return 1
-  show_output /tmp/report.out > /tmp/report.body || return 1
-  preflight report --input /tmp/report.body --expected-generation "${GENERATION:?}" || return 1
+  run_generation report --space "$SPACE" >"$EVIDENCE/report.out" || return 1
+  show_output "$EVIDENCE/report.out" > "$EVIDENCE/report.body" || return 1
+  preflight report --input "$EVIDENCE/report.body" --expected-generation "${GENERATION:?}" || return 1
   echo "strict preflight OK"
 }
 ```
@@ -592,18 +596,19 @@ long: the space serves no evidence in that window.
 
   # 3. Only now read the state, and read both views.
   run_generation inventory --space "$SPACE" --generation-id "${GENERATION:?}" \
-    | tee /tmp/inv.out && show_output /tmp/inv.out > /tmp/inv.body
-  run_generation report --space "$SPACE" \
-    | tee /tmp/report.out && show_output /tmp/report.out > /tmp/report.body
+      | tee "$EVIDENCE/inv.out" \
+    && show_output "$EVIDENCE/inv.out" > "$EVIDENCE/inv.body" \
+    && run_generation report --space "$SPACE" | tee "$EVIDENCE/report.out" \
+    && show_output "$EVIDENCE/report.out" > "$EVIDENCE/report.body" \
+    && preflight rollback-safe \
+         --inventory "$EVIDENCE/inv.body" --report "$EVIDENCE/report.body" \
+    && gcloud run services update-traffic databridge \
+         --project "$PROJECT" --region "$REGION" \
+         --to-revisions "${ROLLBACK_REVISION:?}=100"
   ```
 
-  Then let the check decide, and chain the rollback onto it:
-
-  ```bash
-  preflight rollback-safe --inventory /tmp/inv.body --report /tmp/report.body && \
-  gcloud run services update-traffic databridge --project "$PROJECT" --region "$REGION" \
-    --to-revisions "${ROLLBACK_REVISION:?}=100"
-  ```
+  One chain, deliberately. Run as separate blocks, a failed capture leaves the previous
+  file in place and the check approves evidence from an earlier attempt.
 
   `$ROLLBACK_REVISION` is the revision recorded in step 2, before traffic moved; the service
   cannot tell you afterwards which one it was.

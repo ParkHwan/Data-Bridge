@@ -23,6 +23,7 @@ from databridge.rollout_checks import (
     extract_report_body,
     read_generation_id,
     read_operation_id,
+    read_serving_revision,
 )
 
 DEFAULT_JOB = "databridge-generation"
@@ -234,6 +235,24 @@ def _operation_id(args: argparse.Namespace) -> int:
     return 0
 
 
+def _serving_revision(args: argparse.Namespace) -> int:
+    project, region = _require_location(args)
+    value = _gcloud_json(
+        ["run", "services", "describe", str(args.service), "--project", project,
+         "--region", region]
+    )
+    service = _object(value, label="service")
+    status = _object(service.get("status"), label="service status")
+    traffic = status.get("traffic")
+    if not isinstance(traffic, list):
+        raise RolloutCheckError("service traffic is missing or is not a list")
+    entries = [item for item in traffic if isinstance(item, Mapping)]
+    if len(entries) != len(traffic):
+        raise RolloutCheckError("a traffic entry is not an object")
+    print(read_serving_revision(entries))
+    return 0
+
+
 def _rollback_safe(args: argparse.Namespace) -> int:
     return _report_problems(
         check_rollback_is_safe(
@@ -341,6 +360,10 @@ def _parser() -> argparse.ArgumentParser:
     strict = _add(commands, "strict")
     strict.add_argument("--service", default=DEFAULT_SERVICE)
     strict.set_defaults(handler=_strict)
+
+    serving = _add(commands, "serving-revision")
+    serving.add_argument("--service", default=DEFAULT_SERVICE)
+    serving.set_defaults(handler=_serving_revision)
 
     rollback = _add(commands, "rollback-safe")
     rollback.add_argument("--inventory", required=True)

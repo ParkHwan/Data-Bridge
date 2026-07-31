@@ -23,6 +23,7 @@ from databridge.rollout_checks import (
     extract_report_body,
     read_generation_id,
     read_operation_id,
+    read_serving_revision,
 )
 
 _MISSING = object()
@@ -447,3 +448,19 @@ def test_rollback_is_refused_while_any_generation_holds_chunks() -> None:
             report={"generations": [{"generation_id": 1, "chunk_count": bad}]},
         ) != []
     assert check_rollback_is_safe(inventory={"total_chunks": 0}, report={}) != []
+
+
+def test_serving_revision_refuses_a_split_or_tagged_allocation() -> None:
+    """traffic[0] would name a tag target or half a split as "the serving revision"."""
+    assert read_serving_revision([{"revisionName": "rev-a", "percent": 100}]) == "rev-a"
+    ambiguous = (
+        [],
+        [{"revisionName": "rev-a", "percent": 50}, {"revisionName": "rev-b", "percent": 50}],
+        [{"revisionName": "rev-a", "percent": 100}, {"revisionName": "rev-b", "tag": "x"}],
+        [{"percent": 100}],
+        [{"revisionName": "", "percent": 100}],
+        [{"revisionName": "rev-a", "percent": "100"}],
+    )
+    for traffic in ambiguous:
+        with pytest.raises(RolloutCheckError):
+            read_serving_revision(traffic)

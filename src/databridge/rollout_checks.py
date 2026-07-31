@@ -446,3 +446,28 @@ def check_rollback_is_safe(
                 "rolling back would mix generations"
             )
     return problems
+
+
+def read_serving_revision(traffic: Sequence[Mapping[str, object]]) -> str:
+    """Return the one revision serving all traffic, refusing anything ambiguous.
+
+    Taking ``traffic[0]`` would name a tag target or one half of a split as "the serving
+    revision", and the rollback would then send traffic somewhere that was never serving.
+    """
+    serving = [
+        item
+        for item in traffic
+        if isinstance(item, Mapping) and item.get("percent") == 100
+    ]
+    if len(serving) != 1:
+        raise RolloutCheckError(
+            f"expected exactly one revision at 100 percent, found {len(serving)}"
+        )
+    name = serving[0].get("revisionName")
+    if not isinstance(name, str) or not name:
+        raise RolloutCheckError("the serving traffic target has no revision name")
+    if len(traffic) != 1:
+        raise RolloutCheckError(
+            "traffic is split or tagged; record the whole allocation before moving it"
+        )
+    return name
