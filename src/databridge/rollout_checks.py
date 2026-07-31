@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 from typing import TypeGuard
 
 WRAPPER_PREFIX = "DATABRIDGE_WRAPPER_RESULT "
@@ -517,4 +518,56 @@ def check_writers_quiesced(executions: Sequence[Mapping[str, object]]) -> list[s
         ]
         if len(completed) != 1 or completed[0].get("status") not in {"True", "False"}:
             problems.append(f"{label} has no single readable Completed condition")
+    return problems
+
+
+def check_recovery_point(
+    backups: Sequence[Mapping[str, object]],
+    *,
+    now: datetime,
+    max_age_hours: int,
+) -> list[str]:
+    """Require a restore point that actually exists and is recent enough.
+
+    "PITR is enabled" is not the same as being able to recover: this instance had the
+    flag unset, no automated backups and zero backup runs, so get-latest-recovery-time
+    reported that no usable recovery point existed at all. What matters before an
+    irreversible delete is a concrete artefact, so this asks for a SUCCESSFUL backup run
+    no older than max_age_hours.
+
+    Field names measured on a real backup run: status, endTime, type.
+    """
+    problems: list[str] = []
+    if max_age_hours <= 0:
+        return ["max_age_hours must be positive"]
+    cutoff = now - timedelta(hours=max_age_hours)
+
+    fresh: list[str] = []
+    for index, item in enumerate(backups):
+        if not isinstance(item, Mapping):
+            problems.append(f"backup[{index}] is not an object")
+            continue
+        if item.get("status") != "SUCCESSFUL":
+            continue
+        end_time = item.get("endTime")
+        if not isinstance(end_time, str) or not end_time:
+            problems.append(
+                f"backup {item.get('id')!r} is SUCCESSFUL but has no endTime"
+            )
+            continue
+        try:
+            finished = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+        except ValueError:
+            problems.append(f"backup {item.get('id')!r} has an unreadable endTime")
+            continue
+        if finished.tzinfo is None:
+            finished = finished.replace(tzinfo=UTC)
+        if finished >= cutoff:
+            fresh.append(str(item.get("id")))
+
+    if not fresh:
+        problems.append(
+            f"no SUCCESSFUL backup finished within {max_age_hours}h; "
+            "take one before the irreversible step"
+        )
     return problems

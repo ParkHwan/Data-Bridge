@@ -127,19 +127,26 @@ box instead of running the check.
 
 - [ ] You can author the validation query file. It does not exist in the repository yet; it is
       written from `inventory` output between steps 4 and 5 (see step 4a).
-- [ ] The retention window is long enough for **your** rollout. The function proves a window
-      exists; only you know how long these steps will take and whether that fits inside it:
-
-```bash
-gcloud sql instances describe databridge-demo --project "$PROJECT" \
-  --format='value(settings.backupConfiguration.transactionLogRetentionDays)'
-```
-
 - [ ] The cost of recovery is acceptable to whoever owns this data, and the RTO below is one
       you have agreed **before** starting.
 
-These two are what authorise the irreversible deletion in step 8, so they get a token rather
-than a checkbox. Record the retention you saw and accepted:
+**Take the backup before you start.** `preconditions_ok` requires a SUCCESSFUL backup finished
+within the last 24 hours, because a flag saying recovery is possible is not a recovery point —
+this instance had automated backups off, PITR unset and zero backup runs, so
+`get-latest-recovery-time` reported that none existed at all.
+
+```bash
+gcloud sql backups create --instance=databridge-demo --project="$PROJECT" \
+  --description="pre-v0.2.8-rollout"
+```
+
+Only one step of this rollout destroys anything. Every chunk deletion in the code is scoped to a
+generation except `delete-legacy`, so steps 1–7 leave the legacy rows intact and a bad outcome
+is recoverable by leaving them alone. Take a second backup immediately before step 8, which is
+the one that is not.
+
+This is what authorises the irreversible deletion in step 8, so it gets a token rather than a
+checkbox. Record the retention you saw and accepted:
 
 ```bash
 RECOVERY_ACCEPTED_DAYS=7      # the retention you read above, and accepted
@@ -473,12 +480,20 @@ change lifecycle state with SQL.
 Only after step 7 passed. First-cutover-only, and irreversible.
 
 ```bash
+# The one destructive step. Take its own backup first: the restore point should be as
+# close to it as possible, and preconditions_ok only proves one exists within 24 hours.
+recovery_point_fresh() {
+  gcloud sql backups create --instance=databridge-demo --project "$PROJECT" \
+    --description="pre-delete-legacy" || return 1
+  preflight recovery-point --max-age-hours 1
+}
+
 serving_verified_ok() {
   [ "${SERVING_VERIFIED:-}" = "${GENERATION:?}" ] || {
     echo "STOP: step 7 was not completed for generation ${GENERATION}" >&2; return 1; }
 }
 
-recovery_accepted_ok && serving_verified_ok && \
+recovery_accepted_ok && serving_verified_ok && recovery_point_fresh && \
 run_generation delete-legacy --space "$SPACE" --generation-id "${GENERATION:?}" --yes
 ```
 

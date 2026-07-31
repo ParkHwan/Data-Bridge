@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from datetime import UTC, datetime
 
 import pytest
 
@@ -16,6 +17,7 @@ from databridge.rollout_checks import (
     check_generation_job,
     check_images,
     check_ingest_scope,
+    check_recovery_point,
     check_report,
     check_rollback_is_safe,
     check_strict_mode,
@@ -500,3 +502,41 @@ def test_writers_must_be_quiesced_before_state_is_read() -> None:
     assert check_writers_quiesced([_execution("e1", completionTime="")]) != []
     assert check_writers_quiesced([{"metadata": {"name": "e1"}}]) != []
     assert check_writers_quiesced(["oops"]) != []
+
+
+def test_recovery_point_requires_a_backup_that_exists_and_is_recent() -> None:
+    """A flag saying recovery is possible is not a recovery point.
+
+    Measured on the real instance: pointInTimeRecoveryEnabled was unset, automated
+    backups were off and no backup run existed, so requiring the flag would have
+    reported a plan that could not be executed.
+    """
+    now = datetime(2026, 8, 1, 12, 0, tzinfo=UTC)
+
+    def backup(**over: object) -> dict[str, object]:
+        # Field names measured on a real backup run.
+        base: dict[str, object] = {
+            "id": "1785537156832",
+            "status": "SUCCESSFUL",
+            "type": "ON_DEMAND",
+            "endTime": "2026-08-01T11:00:00.000Z",
+        }
+        base.update(over)
+        return base
+
+    assert check_recovery_point([backup()], now=now, max_age_hours=24) == []
+    assert check_recovery_point([], now=now, max_age_hours=24) != []
+    # Too old, failed, or still running are all "no recovery point".
+    assert check_recovery_point(
+        [backup(endTime="2026-07-28T11:00:00.000Z")], now=now, max_age_hours=24
+    ) != []
+    assert check_recovery_point([backup(status="FAILED")], now=now, max_age_hours=24) != []
+    assert check_recovery_point([backup(status="RUNNING")], now=now, max_age_hours=24) != []
+    # A SUCCESSFUL run we cannot date is not evidence of anything.
+    assert check_recovery_point([backup(endTime=None)], now=now, max_age_hours=24) != []
+    assert check_recovery_point([backup(endTime="not-a-time")], now=now, max_age_hours=24) != []
+    assert check_recovery_point(["oops"], now=now, max_age_hours=24) != []
+    # One fresh backup beside older ones is enough.
+    assert check_recovery_point(
+        [backup(endTime="2026-07-20T11:00:00.000Z"), backup()], now=now, max_age_hours=24
+    ) == []

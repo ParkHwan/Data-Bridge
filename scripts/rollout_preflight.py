@@ -8,6 +8,7 @@ import json
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 from databridge.rollout_checks import (
@@ -16,6 +17,7 @@ from databridge.rollout_checks import (
     check_generation_job,
     check_images,
     check_ingest_scope,
+    check_recovery_point,
     check_report,
     check_rollback_is_safe,
     check_strict_mode,
@@ -126,22 +128,37 @@ def _preconditions(args: argparse.Namespace) -> int:
                 "run one read-only command through the wrapper before continuing"
             )
     else:
-        problems.append(
-            "no execution exists yet, so task read access is unproven; "
-            "run one read-only command through the wrapper before continuing"
+        # No execution to probe, so run one read-only command through the wrapper. Do not
+        # require it to succeed: before the rollout image reaches the job, the CLI emits no
+        # result marker and the wrapper correctly answers 81. Reaching any judgement about
+        # the Task is itself the proof that Tasks are readable — only 80 and 85 mean we
+        # could not observe, and those are what this is testing for.
+        probe = subprocess.run(
+            ["scripts/run_generation_job.sh", "--project", project, "--region", region,
+             "report", "--space", str(args.space)],
+            check=False, capture_output=True, text=True,
         )
+        if probe.returncode in {80, 85}:
+            problems.append(
+                f"the wrapper could not observe its own run (exit {probe.returncode}); "
+                "check run.tasks.get / run.tasks.list"
+            )
 
-    if _gcloud_value(
-        ["sql", "instances", "describe", str(args.instance), "--project", project],
-        "settings.backupConfiguration.pointInTimeRecoveryEnabled",
-    ) != "True":
-        problems.append("point-in-time recovery is not enabled")
-    # Enabled is not usable: the window has to exist and be readable.
-    if not _run(
-        ["gcloud", "sql", "instances", "get-latest-recovery-time", str(args.instance),
-         "--project", project]
-    ).strip():
-        problems.append("the recovery window is empty or unreadable")
+    # A restore point that exists, not a flag that says one could. This instance had
+    # pointInTimeRecoveryEnabled unset, automated backups off and zero backup runs, so
+    # requiring the flag would have reported a recovery plan that did not exist.
+    backups = _gcloud_json(
+        ["sql", "backups", "list", "--instance", str(args.instance), "--project", project]
+    )
+    if not isinstance(backups, list):
+        raise RolloutCheckError("backup list did not return a JSON list")
+    problems.extend(
+        check_recovery_point(
+            backups,
+            now=datetime.now(UTC),
+            max_age_hours=int(args.max_age_hours),
+        )
+    )
 
     return _report_problems(problems)
 
@@ -247,6 +264,22 @@ def _quiesced(args: argparse.Namespace) -> int:
     return _report_problems(check_writers_quiesced(value))
 
 
+def _recovery_point(args: argparse.Namespace) -> int:
+    project, _region = _require_location(args)
+    value = _gcloud_json(
+        ["sql", "backups", "list", "--instance", str(args.instance), "--project", project]
+    )
+    if not isinstance(value, list):
+        raise RolloutCheckError("backup list did not return a JSON list")
+    return _report_problems(
+        check_recovery_point(
+            value,
+            now=datetime.now(UTC),
+            max_age_hours=int(args.max_age_hours),
+        )
+    )
+
+
 def _serving_revision(args: argparse.Namespace) -> int:
     project, region = _require_location(args)
     value = _gcloud_json(
@@ -348,6 +381,8 @@ def _parser() -> argparse.ArgumentParser:
     preconditions.add_argument("--job", default=DEFAULT_JOB)
     preconditions.add_argument("--service", default=DEFAULT_SERVICE)
     preconditions.add_argument("--instance", default=DEFAULT_INSTANCE)
+    preconditions.add_argument("--max-age-hours", type=int, default=24)
+    preconditions.add_argument("--space", default="MFS")
     preconditions.set_defaults(handler=_preconditions)
 
     images = _add(commands, "images")
@@ -372,6 +407,11 @@ def _parser() -> argparse.ArgumentParser:
     strict = _add(commands, "strict")
     strict.add_argument("--service", default=DEFAULT_SERVICE)
     strict.set_defaults(handler=_strict)
+
+    recovery = _add(commands, "recovery-point")
+    recovery.add_argument("--instance", default=DEFAULT_INSTANCE)
+    recovery.add_argument("--max-age-hours", type=int, default=24)
+    recovery.set_defaults(handler=_recovery_point)
 
     quiesced = _add(commands, "writers-quiesced")
     quiesced.add_argument("--job", default="databridge-confluence-ingest")
